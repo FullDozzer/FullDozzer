@@ -117,17 +117,26 @@ class ScheduleWatcher:
             page = await context.new_page()
             await page.goto(self.settings.schedule_url, wait_until="domcontentloaded", timeout=90_000)
 
-            group_option = page.get_by_role("option", name=self.settings.group_name)
-            if await group_option.count() == 0:
-                group_item = page.get_by_text(self.settings.group_name, exact=False)
-                if await group_item.count() == 0:
-                    await browser.close()
-                    raise RuntimeError(
-                        f"Не нашёл группу '{self.settings.group_name}'. Проверь GROUP_NAME и страницу."
-                    )
-                await group_item.first.click()
-            else:
-                await group_option.first.click()
+            await page.wait_for_selector("table")
+            group_cells = page.locator("td")
+            cell_count = await group_cells.count()
+            matched_index = None
+            for i in range(cell_count):
+                cell_text = (await group_cells.nth(i).inner_text()).strip()
+                if cell_text == self.settings.group_name:
+                    matched_index = i
+                    break
+
+            if matched_index is None:
+                await context.close()
+                await browser.close()
+                raise RuntimeError(
+                    f"Не нашёл группу '{self.settings.group_name}' в ячейках таблицы <td>. "
+                    "Проверь GROUP_NAME и содержимое таблицы на странице."
+                )
+
+            await group_cells.nth(matched_index).click()
+
 
             date_input = page.locator("input[type='date'], input[name*='date'], input[id*='date']")
             if await date_input.count() > 0:
