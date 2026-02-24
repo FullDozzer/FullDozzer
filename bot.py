@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TEXT_LIMIT = 4096
 SUBSCRIBERS_FILE = Path("subscribers.json")
 
+DEFAULT_BOT_TOKEN = "7824304844:AAHkM1wxBxztZthu14MIee27mv6uXZP4a2Y"
+DEFAULT_SCHEDULE_URL = "https://ishnk.ru/students/schedule"
+DEFAULT_GROUP_NAME = "ЭС7-24"
+DEFAULT_TIMEZONE = "Europe/Moscow"
+DEFAULT_CHECK_INTERVAL_SECONDS = 1800
+DEFAULT_DATE_FORMAT = "%d.%m.%Y"
+
 
 @dataclass
 class Settings:
@@ -37,21 +44,12 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        missing = [name for name in cls.REQUIRED_ENV_VARS if not os.getenv(name)]
-        if missing:
-            vars_str = ", ".join(missing)
-            raise RuntimeError(
-                "Не найдены обязательные переменные окружения: "
-                f"{vars_str}. Создайте файл .env рядом с bot.py на основе .env.example "
-                "или задайте переменные в системе перед запуском."
-            )
-
-        token = os.environ["BOT_TOKEN"]
-        schedule_url = os.environ["SCHEDULE_URL"]
-        group_name = os.environ["GROUP_NAME"]
-        timezone = os.getenv("TIMEZONE", "Europe/Moscow")
-        check_interval_seconds = int(os.getenv("CHECK_INTERVAL_SECONDS", "1800"))
-        date_format = os.getenv("DATE_FORMAT", "%d.%m.%Y")
+        token = os.getenv("BOT_TOKEN", DEFAULT_BOT_TOKEN)
+        schedule_url = os.getenv("SCHEDULE_URL", DEFAULT_SCHEDULE_URL)
+        group_name = os.getenv("GROUP_NAME", DEFAULT_GROUP_NAME)
+        timezone = os.getenv("TIMEZONE", DEFAULT_TIMEZONE)
+        check_interval_seconds = int(os.getenv("CHECK_INTERVAL_SECONDS", str(DEFAULT_CHECK_INTERVAL_SECONDS)))
+        date_format = os.getenv("DATE_FORMAT", DEFAULT_DATE_FORMAT)
         return cls(
             token=token,
             schedule_url=schedule_url,
@@ -224,6 +222,7 @@ async def monitor_loop(bot: Bot, watcher: ScheduleWatcher, subscriber_store: Sub
 async def main():
     env_path = Path(__file__).with_name(".env")
     load_dotenv(dotenv_path=env_path)
+    logger.info("Запуск с готовыми настройками: %s | группа %s", os.getenv("SCHEDULE_URL", DEFAULT_SCHEDULE_URL), os.getenv("GROUP_NAME", DEFAULT_GROUP_NAME))
     settings = Settings.from_env()
     bot = Bot(token=settings.token)
     dp = Dispatcher()
@@ -271,7 +270,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except RuntimeError as exc:
-        logger.error(str(exc))
+    asyncio.run(main())
