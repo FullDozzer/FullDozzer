@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from typing import ClassVar
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -32,8 +33,19 @@ class Settings:
     check_interval_seconds: int = 1800
     date_format: str = "%d.%m.%Y"
 
+    REQUIRED_ENV_VARS: ClassVar[tuple[str, ...]] = ("BOT_TOKEN", "SCHEDULE_URL", "GROUP_NAME")
+
     @classmethod
     def from_env(cls) -> "Settings":
+        missing = [name for name in cls.REQUIRED_ENV_VARS if not os.getenv(name)]
+        if missing:
+            vars_str = ", ".join(missing)
+            raise RuntimeError(
+                "Не найдены обязательные переменные окружения: "
+                f"{vars_str}. Создайте файл .env рядом с bot.py на основе .env.example "
+                "или задайте переменные в системе перед запуском."
+            )
+
         token = os.environ["BOT_TOKEN"]
         schedule_url = os.environ["SCHEDULE_URL"]
         group_name = os.environ["GROUP_NAME"]
@@ -210,7 +222,8 @@ async def monitor_loop(bot: Bot, watcher: ScheduleWatcher, subscriber_store: Sub
 
 
 async def main():
-    load_dotenv()
+    env_path = Path(__file__).with_name(".env")
+    load_dotenv(dotenv_path=env_path)
     settings = Settings.from_env()
     bot = Bot(token=settings.token)
     dp = Dispatcher()
@@ -258,4 +271,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except RuntimeError as exc:
+        logger.error(str(exc))

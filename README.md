@@ -140,7 +140,12 @@ python bot.py
 python -m playwright install chromium
 ```
 
-### 3. Бот молчит
+### 3. Ошибка `Не найдены обязательные переменные окружения` или `KeyError: BOT_TOKEN`
+- Создайте файл `.env` рядом с `bot.py` (командой `copy .env.example .env` или `cp .env.example .env`)
+- Заполните минимум: `BOT_TOKEN`, `SCHEDULE_URL`, `GROUP_NAME`
+- Запускайте `python bot.py` из папки проекта
+
+### 4. Бот молчит
 - Проверьте `BOT_TOKEN`
 - Убедитесь, что вы написали боту хотя бы 1 сообщение
 
