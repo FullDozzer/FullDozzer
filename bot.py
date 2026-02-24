@@ -130,6 +130,15 @@ class ScheduleWatcher:
     def _clean_line(text: str) -> str:
         return " ".join(text.replace("\xa0", " ").split())
 
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        normalized = text.lower().replace(" ", " ")
+        normalized = normalized.replace("–", "-").replace("—", "-")
+        return " ".join(normalized.split())
+
+    def _contains_group_name(self, text: str) -> bool:
+        return self._normalize_for_match(self.settings.group_name) in self._normalize_for_match(text)
+
     def _extract_schedule_from_html(self, html: str, target_iso: str) -> str:
         soup = BeautifulSoup(html, "html.parser")
 
@@ -141,9 +150,11 @@ class ScheduleWatcher:
             fallback_text = self._clean_line(soup.get_text(" ", strip=True))
             if not fallback_text:
                 raise RuntimeError("Страница расписания загружена, но текст пустой.")
-            if self.settings.group_name not in fallback_text:
+            if not self._contains_group_name(fallback_text):
+                snippet = fallback_text[:500]
                 raise RuntimeError(
-                    f"Страница на {target_iso} загружена, но группа '{self.settings.group_name}' не найдена в тексте."
+                    f"Страница на {target_iso} загружена, но группа '{self.settings.group_name}' не найдена. "
+                    f"Фрагмент страницы: {snippet}"
                 )
             return fallback_text
 
@@ -169,9 +180,11 @@ class ScheduleWatcher:
             lines.append("")
 
         result = "\n".join(line for line in lines if line is not None).strip()
-        if self.settings.group_name not in result:
+        if not self._contains_group_name(result):
+            snippet = result[:500]
             raise RuntimeError(
-                f"Страница на {target_iso} загружена, но группа '{self.settings.group_name}' не найдена в тексте."
+                f"Страница на {target_iso} загружена, но группа '{self.settings.group_name}' не найдена. "
+                f"Фрагмент расписания: {snippet}"
             )
         return result
 
@@ -267,7 +280,7 @@ async def monitor_loop(bot: Bot, watcher: ScheduleWatcher, subscriber_store: Sub
                     "или проверьте сертификат сайта."
                 )
             for chat_id in list(subscriber_store.subscribers):
-                await bot.send_message(chat_id, f"❌ Ошибка проверки: {error_text}")
+                await bot.send_message(chat_id, f"❌ Ошибка проверки: {error_text[:3500]}")
 
         await asyncio.sleep(watcher.settings.check_interval_seconds)
 
