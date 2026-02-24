@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
@@ -125,6 +126,55 @@ class ScheduleWatcher:
 
         return f"{base_url}/{target_iso}"
 
+    @staticmethod
+    def _clean_line(text: str) -> str:
+        return " ".join(text.replace("\xa0", " ").split())
+
+    def _extract_schedule_from_html(self, html: str, target_iso: str) -> str:
+        soup = BeautifulSoup(html, "html.parser")
+
+        header = soup.select_one("div.header3")
+        header_text = self._clean_line(header.get_text(" ", strip=True)) if header else ""
+
+        cards = soup.select("div.card.myCard")
+        if not cards:
+            fallback_text = self._clean_line(soup.get_text(" ", strip=True))
+            if not fallback_text:
+                raise RuntimeError("Страница расписания загружена, но текст пустой.")
+            if self.settings.group_name not in fallback_text:
+                raise RuntimeError(
+                    f"Страница на {target_iso} загружена, но группа '{self.settings.group_name}' не найдена в тексте."
+                )
+            return fallback_text
+
+        lines: list[str] = []
+        if header_text:
+            lines.append(header_text)
+
+        for card in cards:
+            card_header = card.select_one(".card-header")
+            if card_header:
+                lines.append(self._clean_line(card_header.get_text(" ", strip=True)))
+
+            sections = card.select(".card-body .d-flex.flex-column")
+            if not sections:
+                sections = [card]
+
+            for section in sections:
+                section_lines = [self._clean_line(t) for t in section.stripped_strings]
+                for value in section_lines:
+                    if value:
+                        lines.append(value)
+
+            lines.append("")
+
+        result = "\n".join(line for line in lines if line is not None).strip()
+        if self.settings.group_name not in result:
+            raise RuntimeError(
+                f"Страница на {target_iso} загружена, но группа '{self.settings.group_name}' не найдена в тексте."
+            )
+        return result
+
     async def fetch_schedule_text(self) -> str:
         target_date = self.target_date_string()
         target_iso = self.target_date_iso()
@@ -143,20 +193,11 @@ class ScheduleWatcher:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=90_000)
             await page.wait_for_timeout(1500)
 
-            page_text = (await page.inner_text("body")).strip()
+            html = await page.content()
             await context.close()
             await browser.close()
 
-        if not page_text:
-            raise RuntimeError("Страница расписания загружена, но текст пустой.")
-
-        if self.settings.group_name not in page_text:
-            raise RuntimeError(
-                f"Страница на {target_iso} загружена, но группа '{self.settings.group_name}' не найдена в тексте."
-            )
-
-        normalized_text = "\n".join(line.strip() for line in page_text.splitlines() if line.strip())
-        return normalized_text
+        return self._extract_schedule_from_html(html, target_iso)
 
     async def check_for_updates(self) -> tuple[str, str]:
         text = await self.fetch_schedule_text()
