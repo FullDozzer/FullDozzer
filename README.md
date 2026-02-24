@@ -105,6 +105,7 @@ GROUP_NAME=точное_название_группы
 TIMEZONE=Europe/Moscow
 CHECK_INTERVAL_SECONDS=1800
 DATE_FORMAT=%d.%m.%Y
+IGNORE_HTTPS_ERRORS=true
 ```
 
 Минимально обязательно заполнить: `BOT_TOKEN`, `SCHEDULE_URL`, `GROUP_NAME`.
@@ -162,6 +163,12 @@ python -m playwright install chromium
 ### 4. Бот молчит
 - Проверьте `BOT_TOKEN`
 - Убедитесь, что вы написали боту хотя бы 1 сообщение
+
+
+### 5. Ошибка `ERR_CERT_AUTHORITY_INVALID`
+Это проблема SSL-сертификата сайта (часто на старых серверах).
+- В `.env` поставьте: `IGNORE_HTTPS_ERRORS=true`
+- В текущей версии это уже включено по умолчанию.
 
 ---
 

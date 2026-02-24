@@ -29,6 +29,7 @@ DEFAULT_GROUP_NAME = "ЭС7-24"
 DEFAULT_TIMEZONE = "Europe/Moscow"
 DEFAULT_CHECK_INTERVAL_SECONDS = 1800
 DEFAULT_DATE_FORMAT = "%d.%m.%Y"
+DEFAULT_IGNORE_HTTPS_ERRORS = True
 
 
 @dataclass
@@ -39,6 +40,7 @@ class Settings:
     timezone: str = "Europe/Moscow"
     check_interval_seconds: int = 1800
     date_format: str = "%d.%m.%Y"
+    ignore_https_errors: bool = True
 
     REQUIRED_ENV_VARS: ClassVar[tuple[str, ...]] = ("BOT_TOKEN", "SCHEDULE_URL", "GROUP_NAME")
 
@@ -50,6 +52,7 @@ class Settings:
         timezone = os.getenv("TIMEZONE", DEFAULT_TIMEZONE)
         check_interval_seconds = int(os.getenv("CHECK_INTERVAL_SECONDS", str(DEFAULT_CHECK_INTERVAL_SECONDS)))
         date_format = os.getenv("DATE_FORMAT", DEFAULT_DATE_FORMAT)
+        ignore_https_errors = os.getenv("IGNORE_HTTPS_ERRORS", str(DEFAULT_IGNORE_HTTPS_ERRORS)).lower() in {"1", "true", "yes", "on"}
         return cls(
             token=token,
             schedule_url=schedule_url,
@@ -57,6 +60,7 @@ class Settings:
             timezone=timezone,
             check_interval_seconds=check_interval_seconds,
             date_format=date_format,
+            ignore_https_errors=ignore_https_errors,
         )
 
 
@@ -109,7 +113,8 @@ class ScheduleWatcher:
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+            context = await browser.new_context(ignore_https_errors=self.settings.ignore_https_errors)
+            page = await context.new_page()
             await page.goto(self.settings.schedule_url, wait_until="domcontentloaded", timeout=90_000)
 
             group_option = page.get_by_role("option", name=self.settings.group_name)
@@ -138,6 +143,7 @@ class ScheduleWatcher:
 
             await page.wait_for_timeout(2500)
             html = await page.content()
+            await context.close()
             await browser.close()
 
         soup = BeautifulSoup(html, "html.parser")
@@ -213,8 +219,15 @@ async def monitor_loop(bot: Bot, watcher: ScheduleWatcher, subscriber_store: Sub
                 logger.info("Изменений не обнаружено")
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка проверки расписания")
+            error_text = str(exc)
+            if "ERR_CERT_AUTHORITY_INVALID" in error_text:
+                error_text = (
+                    "Ошибка SSL сертификата сайта расписания. "
+                    "Включите IGNORE_HTTPS_ERRORS=true (по умолчанию уже включено) "
+                    "или проверьте сертификат сайта."
+                )
             for chat_id in list(subscriber_store.subscribers):
-                await bot.send_message(chat_id, f"❌ Ошибка проверки: {exc}")
+                await bot.send_message(chat_id, f"❌ Ошибка проверки: {error_text}")
 
         await asyncio.sleep(watcher.settings.check_interval_seconds)
 
