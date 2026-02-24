@@ -12,7 +12,6 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
@@ -24,7 +23,7 @@ TELEGRAM_TEXT_LIMIT = 4096
 SUBSCRIBERS_FILE = Path("subscribers.json")
 
 DEFAULT_BOT_TOKEN = "7824304844:AAHkM1wxBxztZthu14MIee27mv6uXZP4a2Y"
-DEFAULT_SCHEDULE_URL = "https://ishnk.ru/students/schedule"
+DEFAULT_SCHEDULE_URL = "http://www.ishnk.ru/2025/site/schedule/group/508/2026-02-25"
 DEFAULT_GROUP_NAME = "ЭС7-24"
 DEFAULT_TIMEZONE = "Europe/Moscow"
 DEFAULT_CHECK_INTERVAL_SECONDS = 1800
@@ -107,66 +106,57 @@ class ScheduleWatcher:
         target = now + timedelta(days=1)
         return target.strftime(self.settings.date_format)
 
+    def target_date_iso(self) -> str:
+        now = datetime.now(ZoneInfo(self.settings.timezone))
+        target = now + timedelta(days=1)
+        return target.strftime("%Y-%m-%d")
+
+    def build_schedule_url(self) -> str:
+        base_url = self.settings.schedule_url.strip().rstrip("/")
+        target_iso = self.target_date_iso()
+
+        if "{date}" in base_url:
+            return base_url.format(date=target_iso)
+
+        parts = base_url.split("/")
+        if parts and len(parts[-1]) == 10 and parts[-1][4] == "-" and parts[-1][7] == "-":
+            parts[-1] = target_iso
+            return "/".join(parts)
+
+        return f"{base_url}/{target_iso}"
+
     async def fetch_schedule_text(self) -> str:
         target_date = self.target_date_string()
-        logger.info("Загружаю расписание для группы %s на %s", self.settings.group_name, target_date)
+        target_iso = self.target_date_iso()
+        target_url = self.build_schedule_url()
+        logger.info(
+            "Загружаю расписание для группы %s на %s (%s)",
+            self.settings.group_name,
+            target_date,
+            target_url,
+        )
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(ignore_https_errors=self.settings.ignore_https_errors)
             page = await context.new_page()
-            await page.goto(self.settings.schedule_url, wait_until="domcontentloaded", timeout=90_000)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=90_000)
+            await page.wait_for_timeout(1500)
 
-            await page.wait_for_selector("table")
-            group_cells = page.locator("td")
-            cell_count = await group_cells.count()
-            matched_index = None
-            for i in range(cell_count):
-                cell_text = (await group_cells.nth(i).inner_text()).strip()
-                if cell_text == self.settings.group_name:
-                    matched_index = i
-                    break
-
-            if matched_index is None:
-                await context.close()
-                await browser.close()
-                raise RuntimeError(
-                    f"Не нашёл группу '{self.settings.group_name}' в ячейках таблицы <td>. "
-                    "Проверь GROUP_NAME и содержимое таблицы на странице."
-                )
-
-            await group_cells.nth(matched_index).click()
-
-
-            date_input = page.locator("input[type='date'], input[name*='date'], input[id*='date']")
-            if await date_input.count() > 0:
-                await date_input.first.fill(
-                    (datetime.now(ZoneInfo(self.settings.timezone)) + timedelta(days=1)).strftime("%Y-%m-%d")
-                )
-                await date_input.first.press("Enter")
-            else:
-                date_field_by_text = page.get_by_placeholder("дата")
-                if await date_field_by_text.count() > 0:
-                    await date_field_by_text.first.fill(target_date)
-                    await date_field_by_text.first.press("Enter")
-
-            await page.wait_for_timeout(2500)
-            html = await page.content()
+            page_text = (await page.inner_text("body")).strip()
             await context.close()
             await browser.close()
 
-        soup = BeautifulSoup(html, "html.parser")
-        table = soup.find("table")
-        if not table:
-            clean = " ".join(soup.get_text(" ", strip=True).split())
-            if not clean:
-                raise RuntimeError("Страница загружена, но текст расписания не найден.")
-            return clean
+        if not page_text:
+            raise RuntimeError("Страница расписания загружена, но текст пустой.")
 
-        table_text = "\n".join(row.get_text(" | ", strip=True) for row in table.find_all("tr"))
-        if not table_text.strip():
-            raise RuntimeError("Таблица расписания пустая.")
-        return table_text
+        if self.settings.group_name not in page_text:
+            raise RuntimeError(
+                f"Страница на {target_iso} загружена, но группа '{self.settings.group_name}' не найдена в тексте."
+            )
+
+        normalized_text = "\n".join(line.strip() for line in page_text.splitlines() if line.strip())
+        return normalized_text
 
     async def check_for_updates(self) -> tuple[str, str]:
         text = await self.fetch_schedule_text()
