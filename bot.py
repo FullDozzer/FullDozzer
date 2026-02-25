@@ -133,12 +133,19 @@ class ScheduleWatcher:
     def _extract_schedule_from_html(self, html: str, target_iso: str) -> str:
         soup = BeautifulSoup(html, "html.parser")
 
+        raw_text = self._clean_line(soup.get_text(" ", strip=True))
+        lowered_raw = raw_text.lower()
+        if "404 not found" in lowered_raw or ("nginx" in lowered_raw and "not found" in lowered_raw):
+            raise RuntimeError(
+                f"Расписание на {target_iso} не найдено (404). Возможно, на эту дату оно ещё не опубликовано."
+            )
+
         header = soup.select_one("div.header3")
         header_text = self._clean_line(header.get_text(" ", strip=True)) if header else ""
 
         cards = soup.select("div.card.myCard")
         if not cards:
-            fallback_text = self._clean_line(soup.get_text(" ", strip=True))
+            fallback_text = raw_text
             if not fallback_text:
                 raise RuntimeError("Страница расписания загружена, но текст пустой.")
             return fallback_text
@@ -182,12 +189,18 @@ class ScheduleWatcher:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(ignore_https_errors=self.settings.ignore_https_errors)
             page = await context.new_page()
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=90_000)
+            response = await page.goto(target_url, wait_until="domcontentloaded", timeout=90_000)
             await page.wait_for_timeout(1500)
 
             html = await page.content()
             await context.close()
             await browser.close()
+
+        if response and response.status == 404:
+            raise RuntimeError(
+                f"Расписание на {target_iso} не найдено (404) по ссылке: {target_url}. "
+                "Скорее всего, расписание на эту дату ещё не опубликовано."
+            )
 
         return self._extract_schedule_from_html(html, target_iso)
 
