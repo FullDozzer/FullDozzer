@@ -35,6 +35,8 @@ DEFAULT_CHECK_INTERVAL_SECONDS = 1800
 DEFAULT_DATE_FORMAT = "%d.%m.%Y"
 DEFAULT_IGNORE_HTTPS_ERRORS = True
 
+DATE_INPUT_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+
 def _clean_text_line(text: str) -> str:
     return " ".join(text.replace("\xa0", " ").split())
 
@@ -454,19 +456,31 @@ class ScheduleWatcher:
         self.settings = settings
         self.last_hash: str | None = None
 
+    def today(self) -> datetime:
+        return datetime.now(ZoneInfo(self.settings.timezone))
+
     def target_date_string(self) -> str:
-        now = datetime.now(ZoneInfo(self.settings.timezone))
-        target = now + timedelta(days=1)
+        target = self.today() + timedelta(days=1)
         return target.strftime(self.settings.date_format)
 
     def target_date_iso(self) -> str:
-        now = datetime.now(ZoneInfo(self.settings.timezone))
-        target = now + timedelta(days=1)
+        target = self.today() + timedelta(days=1)
         return target.strftime("%Y-%m-%d")
 
-    def build_schedule_url(self) -> str:
+    def today_date_string(self) -> str:
+        return self.today().strftime(self.settings.date_format)
+
+    def today_date_iso(self) -> str:
+        return self.today().strftime("%Y-%m-%d")
+
+    def parse_input_date(self, date_text: str) -> datetime:
+        try:
+            return datetime.strptime(date_text.strip(), "%d.%m.%Y")
+        except ValueError as exc:
+            raise RuntimeError("Неверный формат даты. Используйте ДД.ММ.ГГГГ, например 25.02.2026") from exc
+
+    def build_schedule_url(self, target_iso: str) -> str:
         base_url = self.settings.schedule_url.strip().rstrip("/")
-        target_iso = self.target_date_iso()
 
         if "{date}" in base_url:
             return base_url.format(date=target_iso)
@@ -478,14 +492,12 @@ class ScheduleWatcher:
 
         return f"{base_url}/{target_iso}"
 
-    async def fetch_schedule_data(self) -> tuple[str, dict]:
-        target_date = self.target_date_string()
-        target_iso = self.target_date_iso()
-        target_url = self.build_schedule_url()
+    async def _fetch_schedule_for_iso(self, target_iso: str, target_label: str) -> tuple[str, dict]:
+        target_url = self.build_schedule_url(target_iso)
         logger.info(
             "Загружаю расписание для группы %s на %s (%s)",
             self.settings.group_name,
-            target_date,
+            target_label,
             target_url,
         )
 
@@ -502,29 +514,57 @@ class ScheduleWatcher:
 
         if response and response.status == 404:
             raise RuntimeError(
-                f"Расписание на {target_iso} не найдено (404) по ссылке: {target_url}. "
-                "Скорее всего, расписание на эту дату ещё не опубликовано."
+                f"Расписание на {target_iso} не найдено (404) по ссылке: {target_url}."
             )
 
-        return parse_schedule(html), parse_schedule_data(html)
+        text = parse_schedule(html)
+        schedule_data = parse_schedule_data(html)
+        if not schedule_data.get("pairs"):
+            raise RuntimeError(f"Расписание на {target_iso} пустое.")
+        return text, schedule_data
 
-    async def check_for_updates(self) -> tuple[str, str, dict]:
-        text, schedule_data = await self.fetch_schedule_data()
+    async def fetch_schedule_data(self) -> tuple[str, dict, str]:
+        target_iso = self.target_date_iso()
+        target_date = self.target_date_string()
+        try:
+            text, schedule_data = await self._fetch_schedule_for_iso(target_iso, target_date)
+            return text, schedule_data, target_date
+        except Exception:
+            today_iso = self.today_date_iso()
+            today_date = self.today_date_string()
+            logger.warning("Завтрашнее расписание недоступно, отправляю сегодняшнее")
+            text, schedule_data = await self._fetch_schedule_for_iso(today_iso, today_date)
+            return text, schedule_data, today_date
+
+    async def fetch_schedule_data_by_user_date(self, date_text: str) -> tuple[str, dict, str]:
+        dt = self.parse_input_date(date_text)
+        iso = dt.strftime("%Y-%m-%d")
+        label = dt.strftime(self.settings.date_format)
+        return (*await self._fetch_schedule_for_iso(iso, label), label)
+
+    async def fetch_today_schedule_data(self) -> tuple[str, dict, str]:
+        today_iso = self.today_date_iso()
+        today_date = self.today_date_string()
+        text, schedule_data = await self._fetch_schedule_for_iso(today_iso, today_date)
+        return text, schedule_data, today_date
+
+    async def check_for_updates(self) -> tuple[str, str, dict, str]:
+        text, schedule_data, target_date = await self.fetch_schedule_data()
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         if self.last_hash is None:
             self.last_hash = digest
-            return "initial", text, schedule_data
+            return "initial", text, schedule_data, target_date
 
         if digest != self.last_hash:
             self.last_hash = digest
-            return "updated", text, schedule_data
+            return "updated", text, schedule_data, target_date
 
-        return "unchanged", text, schedule_data
+        return "unchanged", text, schedule_data, target_date
 
 
 def build_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📝 Получить расписание текстом")]],
+        keyboard=[[KeyboardButton(text="📝 Получить расписание текстом")], [KeyboardButton(text="📅 Расписание по дате")]],
         resize_keyboard=True,
     )
 
@@ -567,8 +607,7 @@ async def broadcast_schedule(bot: Bot, subscribers: set[int], title: str, schedu
 async def monitor_loop(bot: Bot, watcher: ScheduleWatcher, subscriber_store: SubscriberStore):
     while True:
         try:
-            status, schedule_text, schedule_data = await watcher.check_for_updates()
-            target_date = watcher.target_date_string()
+            status, schedule_text, schedule_data, target_date = await watcher.check_for_updates()
 
             if not subscriber_store.subscribers:
                 logger.info("Нет подписчиков для рассылки")
@@ -627,8 +666,9 @@ async def main():
             f"Группа: {settings.group_name}\n"
             f"Проверка каждые {settings.check_interval_seconds // 60} мин.\n"
             "Вы подписаны на уведомления.\n"
-            "Команды: /schedule, /checknow, /scheduletext, /subscribe, /unsubscribe\n"
-            "Или нажмите кнопку ниже, чтобы получить текстовый вариант.",
+            "Команды: /schedule, /checknow, /scheduletext, /date, /subscribe, /unsubscribe\n"
+            "Формат даты: ДД.ММ.ГГГГ (например, 25.02.2026).\n"
+            "Или нажмите кнопку ниже для текстового режима/выбора даты.",
             reply_markup=build_main_keyboard(),
         )
 
@@ -645,39 +685,66 @@ async def main():
     @dp.message(Command("schedule"))
     async def schedule_handler(message: Message):
         try:
-            schedule_text, schedule_data = await watcher.fetch_schedule_data()
-            await send_schedule(bot, message.chat.id, f"📅 Расписание на {watcher.target_date_string()}", schedule_text, schedule_data)
+            schedule_text, schedule_data, target_date = await watcher.fetch_schedule_data()
+            await send_schedule(bot, message.chat.id, f"📅 Расписание на {target_date}", schedule_text, schedule_data)
         except Exception as exc:  # noqa: BLE001
             await message.answer(f"❌ Ошибка получения расписания: {exc}")
 
     @dp.message(Command("scheduletext"))
     async def schedule_text_handler(message: Message):
         try:
-            schedule_text, _ = await watcher.fetch_schedule_data()
-            await send_text_schedule(bot, message.chat.id, f"📝 Текстовое расписание на {watcher.target_date_string()}", schedule_text)
+            schedule_text, _, target_date = await watcher.fetch_schedule_data()
+            await send_text_schedule(bot, message.chat.id, f"📝 Текстовое расписание на {target_date}", schedule_text)
         except Exception as exc:  # noqa: BLE001
             await message.answer(f"❌ Ошибка получения текстового расписания: {exc}")
 
     @dp.message(lambda message: (message.text or "").strip() == "📝 Получить расписание текстом")
     async def schedule_text_button_handler(message: Message):
         try:
-            schedule_text, _ = await watcher.fetch_schedule_data()
-            await send_text_schedule(bot, message.chat.id, f"📝 Текстовое расписание на {watcher.target_date_string()}", schedule_text)
+            schedule_text, _, target_date = await watcher.fetch_schedule_data()
+            await send_text_schedule(bot, message.chat.id, f"📝 Текстовое расписание на {target_date}", schedule_text)
         except Exception as exc:  # noqa: BLE001
             await message.answer(f"❌ Ошибка получения текстового расписания: {exc}")
+
+    @dp.message(Command("date"))
+    async def date_handler(message: Message):
+        raw = (message.text or "").strip()
+        parts = raw.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer("Введите дату после команды: /date ДД.ММ.ГГГГ\nПример: /date 25.02.2026")
+            return
+        date_text = parts[1].strip()
+        try:
+            schedule_text, schedule_data, target_date = await watcher.fetch_schedule_data_by_user_date(date_text)
+            await send_schedule(bot, message.chat.id, f"📅 Расписание на {target_date}", schedule_text, schedule_data)
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"❌ Ошибка получения расписания по дате: {exc}")
+
+    @dp.message(lambda message: (message.text or "").strip() == "📅 Расписание по дате")
+    async def date_button_hint_handler(message: Message):
+        await message.answer("Напишите дату в формате ДД.ММ.ГГГГ, например: 25.02.2026")
+
+    @dp.message(lambda message: bool(DATE_INPUT_RE.match((message.text or "").strip())))
+    async def date_text_handler(message: Message):
+        try:
+            date_text = (message.text or "").strip()
+            schedule_text, schedule_data, target_date = await watcher.fetch_schedule_data_by_user_date(date_text)
+            await send_schedule(bot, message.chat.id, f"📅 Расписание на {target_date}", schedule_text, schedule_data)
+        except Exception as exc:  # noqa: BLE001
+            await message.answer(f"❌ Ошибка получения расписания по дате: {exc}")
 
     @dp.message(Command("checknow"))
     async def checknow_handler(message: Message):
         try:
-            status, schedule_text, schedule_data = await watcher.check_for_updates()
-            target_date = watcher.target_date_string()
+            status, schedule_text, schedule_data, target_date = await watcher.check_for_updates()
 
             if status == "updated":
                 await send_schedule(bot, message.chat.id, f"🆕 Новое расписание на {target_date}", schedule_text, schedule_data)
             elif status == "initial":
                 await send_schedule(bot, message.chat.id, f"📌 Текущее расписание на {target_date}", schedule_text, schedule_data)
             else:
-                await message.answer("Изменений не обнаружено.")
+                today_text, today_data, today_date = await watcher.fetch_today_schedule_data()
+                await send_schedule(bot, message.chat.id, f"ℹ️ Изменений нет, отправляю сегодняшнее расписание на {today_date}", today_text, today_data)
         except Exception as exc:  # noqa: BLE001
             await message.answer(f"❌ Ошибка проверки: {exc}")
 
