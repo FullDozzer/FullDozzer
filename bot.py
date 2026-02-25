@@ -44,10 +44,17 @@ class Settings:
 
     REQUIRED_ENV_VARS: ClassVar[tuple[str, ...]] = ("BOT_TOKEN", "SCHEDULE_URL", "GROUP_NAME")
 
+    @staticmethod
+    def normalize_schedule_url(url: str) -> str:
+        cleaned = url.strip()
+        if "ishnk.ru/students/schedule" in cleaned:
+            return DEFAULT_SCHEDULE_URL
+        return cleaned
+
     @classmethod
     def from_env(cls) -> "Settings":
         token = os.getenv("BOT_TOKEN", DEFAULT_BOT_TOKEN)
-        schedule_url = os.getenv("SCHEDULE_URL", DEFAULT_SCHEDULE_URL)
+        schedule_url = cls.normalize_schedule_url(os.getenv("SCHEDULE_URL", DEFAULT_SCHEDULE_URL))
         group_name = os.getenv("GROUP_NAME", DEFAULT_GROUP_NAME)
         timezone = os.getenv("TIMEZONE", DEFAULT_TIMEZONE)
         check_interval_seconds = int(os.getenv("CHECK_INTERVAL_SECONDS", str(DEFAULT_CHECK_INTERVAL_SECONDS)))
@@ -282,6 +289,8 @@ async def main():
     load_dotenv(dotenv_path=env_path)
     logger.info("Запуск с готовыми настройками: %s | группа %s", os.getenv("SCHEDULE_URL", DEFAULT_SCHEDULE_URL), os.getenv("GROUP_NAME", DEFAULT_GROUP_NAME))
     settings = Settings.from_env()
+    if "ishnk.ru/students/schedule" in os.getenv("SCHEDULE_URL", ""):
+        logger.warning("Обнаружен старый SCHEDULE_URL (/students/schedule). Использую прямую ссылку группы: %s", settings.schedule_url)
     bot = Bot(token=settings.token)
     dp = Dispatcher()
     watcher = ScheduleWatcher(settings)
