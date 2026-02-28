@@ -10,12 +10,18 @@ import dev.revage.revagechat.config.ConfigManager;
 import dev.revage.revagechat.filter.FilterEngine;
 import dev.revage.revagechat.log.LogManager;
 import dev.revage.revagechat.stats.StatisticsManager;
+import dev.revage.revagechat.ui.RevageChatConfigScreen;
 import java.time.Instant;
 import java.util.UUID;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
 import org.jetbrains.annotations.Nullable;
+import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,6 +44,7 @@ public final class RevageChatClient implements ClientModInitializer {
     private StatisticsManager statisticsManager;
     private LogManager logManager;
     private ChatInterceptor chatInterceptor;
+    private KeyBinding openSettingsKey;
 
     @Override
     public void onInitializeClient() {
@@ -49,6 +56,22 @@ public final class RevageChatClient implements ClientModInitializer {
         registerEvents();
 
         LOGGER.info("{} initialized", MOD_ID);
+    }
+
+    public static RevageChatClient instance() {
+        return instance;
+    }
+
+    public ConfigManager config() {
+        return configManager;
+    }
+
+    public SoundManager sound() {
+        return soundManager;
+    }
+
+    public ChannelManager channels() {
+        return channelManager;
     }
 
     public static boolean interceptIncomingFromMixin(
@@ -75,16 +98,17 @@ public final class RevageChatClient implements ClientModInitializer {
     }
 
     private void initializeManagers() {
-        // TODO: Load persisted config and user profile preferences.
         this.configManager = new ConfigManager();
+        this.configManager.load();
+
         this.channelManager = new ChannelManager(configManager);
         this.channelManager.load();
         this.filterEngine = new FilterEngine();
         this.soundManager = new SoundManager();
+        this.soundManager.setMasterVolume(configManager.masterSoundVolume());
         this.statisticsManager = new StatisticsManager();
         this.logManager = new LogManager();
 
-        // TODO: Replace with dedicated dependency graph when concrete behaviors are added.
         this.messagePipeline = new MessagePipeline(
             channelManager,
             configManager,
@@ -97,7 +121,17 @@ public final class RevageChatClient implements ClientModInitializer {
     }
 
     private void registerEvents() {
-        ClientTickEvents.END_CLIENT_TICK.register(chatInterceptor::onClientTick);
+        this.openSettingsKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+            "key.revagechat.open_settings",
+            InputUtil.Type.KEYSYM,
+            GLFW.GLFW_KEY_RIGHT_SHIFT,
+            "category.revagechat"
+        ));
+
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            chatInterceptor.onClientTick(client);
+            onClientTick(client);
+        });
 
         ClientSendMessageEvents.ALLOW_CHAT.register(message -> {
             MessageContext context = new MessageContext(
@@ -113,5 +147,14 @@ public final class RevageChatClient implements ClientModInitializer {
         });
 
         LOGGER.debug("Client events registered");
+    }
+
+    private void onClientTick(MinecraftClient client) {
+        while (openSettingsKey.wasPressed()) {
+            client.setScreen(new RevageChatConfigScreen(client.currentScreen, configManager, () -> {
+                soundManager.setMasterVolume(configManager.masterSoundVolume());
+                channelManager.save();
+            }));
+        }
     }
 }

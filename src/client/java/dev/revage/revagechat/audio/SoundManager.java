@@ -24,10 +24,13 @@ public final class SoundManager {
     private final Map<String, Path> customSoundFiles;
     private final Set<String> mutedFilterActions;
 
+    private float masterVolume;
+
     public SoundManager() {
         this.channelVolumes = new ConcurrentHashMap<>();
         this.customSoundFiles = new ConcurrentHashMap<>();
         this.mutedFilterActions = ConcurrentHashMap.newKeySet();
+        this.masterVolume = 1.0F;
 
         reloadCustomSounds();
     }
@@ -53,6 +56,14 @@ public final class SoundManager {
         } catch (IOException exception) {
             RevageChatClient.LOGGER.warn("Could not scan sound directory: {}", SOUNDS_DIR, exception);
         }
+    }
+
+    public void setMasterVolume(float masterVolume) {
+        this.masterVolume = clamp(masterVolume);
+    }
+
+    public float getMasterVolume() {
+        return masterVolume;
     }
 
     public void setChannelVolume(String channelId, float volume) {
@@ -93,7 +104,11 @@ public final class SoundManager {
             return;
         }
 
-        float volume = getChannelVolume(channelId);
+        float volume = getChannelVolume(channelId) * masterVolume;
+        if (volume <= 0.001F) {
+            return;
+        }
+
         String key = channelId == null ? "default" : channelId.toLowerCase();
 
         Path soundFile = customSoundFiles.get(key);
