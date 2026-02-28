@@ -87,6 +87,7 @@ public final class RevageChatClient implements ClientModInitializer {
         // TODO: Replace with dedicated dependency graph when concrete behaviors are added.
         this.messagePipeline = new MessagePipeline(
             channelManager,
+            configManager,
             filterEngine,
             logManager,
             soundManager,

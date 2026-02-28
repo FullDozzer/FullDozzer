@@ -3,6 +3,7 @@ package dev.revage.revagechat.chat;
 import dev.revage.revagechat.RevageChatClient;
 import dev.revage.revagechat.audio.SoundManager;
 import dev.revage.revagechat.chat.model.MessageContext;
+import dev.revage.revagechat.config.ConfigManager;
 import dev.revage.revagechat.filter.FilterEngine;
 import dev.revage.revagechat.log.LogManager;
 import dev.revage.revagechat.stats.StatisticsManager;
@@ -14,6 +15,7 @@ import java.util.List;
  */
 public final class MessagePipeline {
     private final ChannelManager channelManager;
+    private final ConfigManager configManager;
     private final FilterEngine filterEngine;
     private final LogManager logManager;
     private final SoundManager soundManager;
@@ -25,12 +27,14 @@ public final class MessagePipeline {
 
     public MessagePipeline(
         ChannelManager channelManager,
+        ConfigManager configManager,
         FilterEngine filterEngine,
         LogManager logManager,
         SoundManager soundManager,
         StatisticsManager statisticsManager
     ) {
         this.channelManager = channelManager;
+        this.configManager = configManager;
         this.filterEngine = filterEngine;
         this.logManager = logManager;
         this.soundManager = soundManager;
@@ -68,17 +72,29 @@ public final class MessagePipeline {
                 continue;
             }
 
-            String formattedText = applyTransformers(context, channel);
-
-            MessageContext routedContext = context;
-            if (!formattedText.equals(context.formattedText())) {
-                routedContext = new MessageContext(
+            String colorizedText = applyColor(context, channel);
+            MessageContext withColor = context;
+            if (!colorizedText.equals(context.formattedText())) {
+                withColor = new MessageContext(
                     context.originalText(),
-                    formattedText,
+                    colorizedText,
                     context.senderName(),
                     context.uuid(),
                     context.timestamp(),
                     context.messageType()
+                );
+            }
+
+            String transformedText = applyTransformers(withColor, channel);
+            MessageContext routedContext = withColor;
+            if (!transformedText.equals(withColor.formattedText())) {
+                routedContext = new MessageContext(
+                    withColor.originalText(),
+                    transformedText,
+                    withColor.senderName(),
+                    withColor.uuid(),
+                    withColor.timestamp(),
+                    withColor.messageType()
                 );
             }
 
@@ -108,13 +124,35 @@ public final class MessagePipeline {
         List<ChatChannel> targets = routing.targetChannels();
         for (int i = 0, size = targets.size(); i < size; i++) {
             ChatChannel channel = targets.get(i);
-            logManager.appendOutgoing(context, channel.id());
+            String colored = applyColor(context, channel);
+            MessageContext channelContext = colored.equals(context.formattedText())
+                ? context
+                : new MessageContext(
+                    context.originalText(),
+                    colored,
+                    context.senderName(),
+                    context.uuid(),
+                    context.timestamp(),
+                    context.messageType()
+                );
+
+            logManager.appendOutgoing(channelContext, channel.id());
         }
 
         runPostActions(context, targets, routing.hideFromDefaultChat());
         statisticsManager.markOutgoingProcessed();
 
         return true;
+    }
+
+    private String applyColor(MessageContext context, ChatChannel channel) {
+        Integer fallbackColor = channel.hasCustomColor() ? channel.color() : configManager.globalColorRgb();
+
+        return ColorParser.toMinecraftFormatting(
+            context.formattedText(),
+            fallbackColor,
+            configManager.overrideExistingColors()
+        );
     }
 
     private boolean passesPreFilters(MessageContext context, List<ChatChannel> targets) {

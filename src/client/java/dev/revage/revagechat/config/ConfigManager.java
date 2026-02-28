@@ -9,6 +9,13 @@ import java.util.List;
  * Owns loading/saving mod configuration data.
  */
 public final class ConfigManager {
+    private boolean overrideExistingColors;
+    private int globalColorRgb;
+
+    public ConfigManager() {
+        this.overrideExistingColors = false;
+        this.globalColorRgb = 0xFFFFFF;
+    }
 
     public void load() {
         // TODO: Read JSON config from Fabric config directory.
@@ -25,5 +32,21 @@ public final class ConfigManager {
 
     public void saveChannels(Collection<ChatChannel> channels) {
         // TODO: Serialize channel definitions and flush to config file.
+    }
+
+    public boolean overrideExistingColors() {
+        return overrideExistingColors;
+    }
+
+    public void setOverrideExistingColors(boolean overrideExistingColors) {
+        this.overrideExistingColors = overrideExistingColors;
+    }
+
+    public int globalColorRgb() {
+        return globalColorRgb;
+    }
+
+    public void setGlobalColorRgb(int globalColorRgb) {
+        this.globalColorRgb = globalColorRgb;
     }
 }

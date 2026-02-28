@@ -3,9 +3,9 @@ package dev.revage.revagechat.chat;
 import dev.revage.revagechat.chat.model.MessageContext;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Deque;
-import java.util.Collection;
 import java.util.List;
 
 /**
@@ -17,6 +17,7 @@ public final class ChatChannel {
     private final String id;
     private String name;
     private int color;
+    private boolean customColor;
     private float opacity;
     private float volume;
     private final List<ChatFilter> filters;
@@ -27,6 +28,7 @@ public final class ChatChannel {
         this.id = id;
         this.name = name;
         this.color = color;
+        this.customColor = false;
         this.opacity = opacity;
         this.volume = volume;
         this.windowState = windowState;
@@ -52,6 +54,15 @@ public final class ChatChannel {
 
     public void setColor(int color) {
         this.color = color;
+        this.customColor = true;
+    }
+
+    public boolean hasCustomColor() {
+        return customColor;
+    }
+
+    public void clearCustomColor() {
+        this.customColor = false;
     }
 
     public float opacity() {
