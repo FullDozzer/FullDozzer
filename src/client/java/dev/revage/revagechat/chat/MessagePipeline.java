@@ -120,6 +120,7 @@ public final class MessagePipeline {
             channel.appendHistory(routedContext);
             windowManager.appendMessage(channel.id(), routedContext.formattedText());
             logManager.appendIncoming(routedContext, channel.id());
+            soundManager.setChannelVolume(channel.id(), channel.volume());
             soundManager.playIncomingCue(channel.id(), FilterActionStore.tag(context));
 
             if (FilterActionStore.autoReply(context) != null) {

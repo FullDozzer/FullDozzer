@@ -108,4 +108,41 @@ public final class ChannelWindowManager {
         }
         windowsByChannelId.clear();
     }
+
+    public Map<String, WindowLayout> snapshotLayouts() {
+        Map<String, WindowLayout> layouts = new LinkedHashMap<>();
+        for (Map.Entry<String, ChannelWindow> entry : windowsByChannelId.entrySet()) {
+            ChannelWindow window = entry.getValue();
+            layouts.put(entry.getKey(), new WindowLayout(
+                window.x(),
+                window.y(),
+                window.width(),
+                window.height(),
+                window.opacity(),
+                window.minimized()
+            ));
+        }
+        return layouts;
+    }
+
+    public void applyLayouts(Map<String, WindowLayout> layouts) {
+        if (layouts == null || layouts.isEmpty()) {
+            return;
+        }
+
+        for (Map.Entry<String, WindowLayout> entry : layouts.entrySet()) {
+            WindowLayout layout = entry.getValue();
+            if (layout == null) {
+                continue;
+            }
+
+            ChannelWindow window = getOrCreate(entry.getKey(), layout.x(), layout.y(), layout.width(), layout.height());
+            window.setBounds(layout.x(), layout.y(), layout.width(), layout.height());
+            window.setOpacity(layout.opacity());
+            window.setMinimized(layout.minimized());
+        }
+    }
+
+    public record WindowLayout(int x, int y, int width, int height, float opacity, boolean minimized) {
+    }
 }

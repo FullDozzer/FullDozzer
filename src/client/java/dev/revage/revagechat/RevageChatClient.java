@@ -13,6 +13,7 @@ import dev.revage.revagechat.filter.FilterEngine;
 import dev.revage.revagechat.log.LogManager;
 import dev.revage.revagechat.stats.StatisticsManager;
 import dev.revage.revagechat.ui.RevageChatConfigScreen;
+import dev.revage.revagechat.ui.RevageChatStudioScreen;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -57,6 +58,7 @@ public final class RevageChatClient implements ClientModInitializer {
     private ChannelWindowManager windowManager;
     private KeyBinding openSettingsKey;
     private KeyBinding openWindowKey;
+    private KeyBinding openStudioKey;
 
     @Override
     public void onInitializeClient() {
@@ -91,6 +93,28 @@ public final class RevageChatClient implements ClientModInitializer {
         return windowManager;
     }
 
+    public FilterEngine filterEngine() {
+        return filterEngine;
+    }
+
+
+    public boolean onWindowMouseDown(double mouseX, double mouseY, int button) {
+        return windowManager.onMouseDown(mouseX, mouseY, button);
+    }
+
+    public boolean onWindowMouseDrag(double mouseX, double mouseY, int button) {
+        return windowManager.onMouseDrag(mouseX, mouseY, button);
+    }
+
+    public boolean onWindowMouseUp(int button) {
+        return windowManager.onMouseUp(button);
+    }
+
+    public boolean onWindowMouseScroll(double mouseX, double mouseY, double amount) {
+        return windowManager.onMouseScroll(mouseX, mouseY, amount);
+    }
+
+
     public static boolean interceptIncomingFromMixin(
         String originalText,
         String formattedText,
@@ -122,12 +146,14 @@ public final class RevageChatClient implements ClientModInitializer {
         this.channelManager.load();
         this.filterEngine = new FilterEngine();
         this.filterEngine.setEnabled(configManager.filtersEnabled());
+        this.filterEngine.applyPersistedStates(configManager.channelFilterStates());
         this.soundManager = new SoundManager();
         this.soundManager.setMasterVolume(configManager.masterSoundVolume());
         this.statisticsManager = new StatisticsManager();
         this.logManager = new LogManager();
         this.windowManager = new ChannelWindowManager();
         this.windowManager.getOrCreateDefault("default");
+        this.windowManager.applyLayouts(configManager.windowLayouts());
 
         this.messagePipeline = new MessagePipeline(
             channelManager,
@@ -153,6 +179,13 @@ public final class RevageChatClient implements ClientModInitializer {
             "key.revagechat.open_default_window",
             InputUtil.Type.KEYSYM,
             GLFW.GLFW_KEY_GRAVE_ACCENT,
+            "category.revagechat"
+        ));
+
+        this.openStudioKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+            "key.revagechat.open_studio",
+            InputUtil.Type.KEYSYM,
+            GLFW.GLFW_KEY_RIGHT_CONTROL,
             "category.revagechat"
         ));
 
@@ -199,6 +232,11 @@ public final class RevageChatClient implements ClientModInitializer {
                     ctx.getSource().sendFeedback(Text.literal("RevageChat: default window opened"));
                     return 1;
                 }))
+                .then(literal("studio").executes(ctx -> {
+                    MinecraftClient client = MinecraftClient.getInstance();
+                    client.setScreen(new RevageChatStudioScreen(client.currentScreen, configManager, filterEngine, windowManager, this::applyConfigAtRuntime));
+                    return 1;
+                }))
                 .then(literal("stats")
                     .then(literal("export").executes(ctx -> {
                         exportStats(ctx.getSource().getClient());
@@ -206,6 +244,10 @@ public final class RevageChatClient implements ClientModInitializer {
                         return 1;
                     })))
                 .then(literal("filter")
+                    .executes(ctx -> {
+                        ctx.getSource().sendFeedback(Text.literal("RevageChat filters: " + (filterEngine.isEnabled() ? "ON" : "OFF")));
+                        return 1;
+                    })
                     .then(argument("enabled", BoolArgumentType.bool()).executes(ctx -> {
                         boolean enabled = BoolArgumentType.getBool(ctx, "enabled");
                         filterEngine.setEnabled(enabled);
@@ -220,7 +262,22 @@ public final class RevageChatClient implements ClientModInitializer {
     private void applyConfigAtRuntime() {
         soundManager.setMasterVolume(configManager.masterSoundVolume());
         filterEngine.setEnabled(configManager.filtersEnabled());
+
+        var channels = channelManager.getChannels();
+        var channelIds = new java.util.ArrayList<String>(channels.size());
+        for (var channel : channels) {
+            channelIds.add(channel.id());
+        }
+
+        for (var channelEntry : filterEngine.snapshotStates(channelIds).entrySet()) {
+            for (var filterEntry : channelEntry.getValue().entrySet()) {
+                configManager.setChannelFilterState(channelEntry.getKey(), filterEntry.getKey(), filterEntry.getValue());
+            }
+        }
+
+        configManager.saveWindowLayouts(windowManager.snapshotLayouts());
         channelManager.save();
+        configManager.save();
     }
 
     private void onClientTick(MinecraftClient client) {
@@ -230,6 +287,10 @@ public final class RevageChatClient implements ClientModInitializer {
 
         while (openWindowKey.wasPressed()) {
             windowManager.getOrCreateDefault("default");
+        }
+
+        while (openStudioKey.wasPressed()) {
+            client.setScreen(new RevageChatStudioScreen(client.currentScreen, configManager, filterEngine, windowManager, this::applyConfigAtRuntime));
         }
     }
 

@@ -20,14 +20,28 @@ public final class ChannelFilterRegistry {
         filtersByChannel.remove(channelId);
     }
 
+
+    public List<ChatFilter> filters(String channelId) {
+        List<ChatFilter> filters = activeFilters(channelId);
+        return filters == null ? List.of() : List.copyOf(filters);
+    }
+
     public void setEnabled(String channelId, ChatFilter filter, boolean enabled) {
         if (filter instanceof ChannelScopedFilter scoped) {
             scoped.setEnabledForChannel(channelId, enabled);
         }
     }
 
-    public boolean apply(String channelId, MessageContext context) {
+    private List<ChatFilter> activeFilters(String channelId) {
         List<ChatFilter> filters = filtersByChannel.get(channelId);
+        if (filters == null || filters.isEmpty()) {
+            filters = filtersByChannel.get("default");
+        }
+        return filters;
+    }
+
+    public boolean apply(String channelId, MessageContext context) {
+        List<ChatFilter> filters = activeFilters(channelId);
         if (filters == null || filters.isEmpty()) {
             return true;
         }

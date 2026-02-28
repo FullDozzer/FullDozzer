@@ -1,5 +1,6 @@
 package dev.revage.revagechat.ui;
 
+import dev.revage.revagechat.RevageChatClient;
 import dev.revage.revagechat.config.ConfigManager;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
@@ -24,9 +25,6 @@ public final class RevageChatConfigScreen extends Screen {
     private final Runnable onSave;
 
     private TextFieldWidget colorHexField;
-    private ButtonWidget overrideButton;
-    private ButtonWidget filtersButton;
-    private VolumeSlider volumeSlider;
 
     public RevageChatConfigScreen(Screen parent, ConfigManager config, Runnable onSave) {
         super(Text.literal("RevageChat Settings"));
@@ -45,17 +43,17 @@ public final class RevageChatConfigScreen extends Screen {
         this.colorHexField.setTooltip(Tooltip.of(Text.literal("Global message color (#RRGGBB)")));
         addDrawableChild(colorHexField);
 
-        this.overrideButton = addDrawableChild(ButtonWidget.builder(buttonText(), button -> {
+        addDrawableChild(ButtonWidget.builder(buttonText(), button -> {
             config.setOverrideExistingColors(!config.overrideExistingColors());
             button.setMessage(buttonText());
         }).dimensions(panelX + 140, panelY + 46, 180, 20).build());
 
-        this.filtersButton = addDrawableChild(ButtonWidget.builder(filtersText(), button -> {
+        addDrawableChild(ButtonWidget.builder(filtersText(), button -> {
             config.setFiltersEnabled(!config.filtersEnabled());
             button.setMessage(filtersText());
         }).dimensions(panelX + 20, panelY + 82, 300, 20).build());
 
-        this.volumeSlider = addDrawableChild(new VolumeSlider(
+        addDrawableChild(new VolumeSlider(
             panelX + 20,
             panelY + 108,
             300,
@@ -65,11 +63,17 @@ public final class RevageChatConfigScreen extends Screen {
         ));
 
         addDrawableChild(ButtonWidget.builder(Text.literal("Save"), button -> saveAndClose())
-            .dimensions(panelX + 20, panelY + 150, 145, 22)
+            .dimensions(panelX + 20, panelY + 150, 105, 22)
             .build());
 
+        addDrawableChild(ButtonWidget.builder(Text.literal("Studio"), button -> {
+            if (client != null) {
+                client.setScreen(new RevageChatStudioScreen(this, config, RevageChatClient.instance().filterEngine(), RevageChatClient.instance().windows(), onSave));
+            }
+        }).dimensions(panelX + 132, panelY + 150, 105, 22).build());
+
         addDrawableChild(ButtonWidget.builder(Text.literal("Cancel"), button -> close())
-            .dimensions(panelX + 175, panelY + 150, 145, 22)
+            .dimensions(panelX + 245, panelY + 150, 75, 22)
             .build());
     }
 
@@ -108,7 +112,6 @@ public final class RevageChatConfigScreen extends Screen {
             try {
                 config.setGlobalColorRgb(Integer.parseInt(value.substring(1), 16));
             } catch (NumberFormatException ignored) {
-                // keep old color
             }
         }
 

@@ -72,6 +72,22 @@ public final class ChannelWindow {
         return channelId;
     }
 
+    public int x() {
+        return x;
+    }
+
+    public int y() {
+        return y;
+    }
+
+    public int width() {
+        return width;
+    }
+
+    public int height() {
+        return height;
+    }
+
     public void setOpacity(float opacity) {
         this.opacity = Math.max(0.05F, Math.min(1.0F, opacity));
     }
@@ -87,6 +103,14 @@ public final class ChannelWindow {
 
     public boolean minimized() {
         return minimized;
+    }
+
+    public void setBounds(int x, int y, int width, int height) {
+        this.x = x;
+        this.y = y;
+        this.width = Math.max(width, MIN_WIDTH);
+        this.height = Math.max(height, MIN_HEIGHT);
+        invalidateLayout();
     }
 
     public void setDraggable(boolean draggable) {

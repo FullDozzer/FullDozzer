@@ -5,14 +5,16 @@ import com.google.gson.GsonBuilder;
 import dev.revage.revagechat.RevageChatClient;
 import dev.revage.revagechat.chat.ChatChannel;
 import dev.revage.revagechat.chat.WindowState;
-import java.io.IOException;
+import dev.revage.revagechat.chat.window.ChannelWindowManager;
 import java.io.Reader;
 import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import net.fabricmc.loader.api.FabricLoader;
 
 /**
@@ -28,6 +30,8 @@ public final class ConfigManager {
     private float masterSoundVolume;
     private boolean filtersEnabled;
     private final List<ChatChannel> channels;
+    private final Map<String, Map<String, Boolean>> channelFilterStates;
+    private final Map<String, ChannelWindowManager.WindowLayout> windowLayouts;
 
     public ConfigManager() {
         this.overrideExistingColors = false;
@@ -35,12 +39,14 @@ public final class ConfigManager {
         this.masterSoundVolume = 1.0F;
         this.filtersEnabled = true;
         this.channels = new ArrayList<>();
+        this.channelFilterStates = new LinkedHashMap<>();
+        this.windowLayouts = new LinkedHashMap<>();
     }
 
     public void load() {
         try {
             Files.createDirectories(CONFIG_DIR);
-        } catch (IOException exception) {
+        } catch (Exception exception) {
             RevageChatClient.LOGGER.warn("Could not create config directory", exception);
             return;
         }
@@ -61,6 +67,9 @@ public final class ConfigManager {
             this.masterSoundVolume = clamp01(data.masterSoundVolume);
             this.filtersEnabled = data.filtersEnabled;
             this.channels.clear();
+            this.channelFilterStates.clear();
+            this.windowLayouts.clear();
+
             if (data.channels != null) {
                 for (ChannelData channelData : data.channels) {
                     ChatChannel channel = new ChatChannel(
@@ -77,6 +86,29 @@ public final class ConfigManager {
                     this.channels.add(channel);
                 }
             }
+
+            if (data.channelFilterStates != null) {
+                for (Map.Entry<String, Map<String, Boolean>> entry : data.channelFilterStates.entrySet()) {
+                    channelFilterStates.put(entry.getKey(), new LinkedHashMap<>(entry.getValue()));
+                }
+            }
+
+            if (data.windowLayouts != null) {
+                for (Map.Entry<String, WindowLayoutData> entry : data.windowLayouts.entrySet()) {
+                    WindowLayoutData layout = entry.getValue();
+                    if (layout == null) {
+                        continue;
+                    }
+                    windowLayouts.put(entry.getKey(), new ChannelWindowManager.WindowLayout(
+                        layout.x,
+                        layout.y,
+                        layout.width,
+                        layout.height,
+                        clamp01(layout.opacity),
+                        layout.minimized
+                    ));
+                }
+            }
         } catch (Exception exception) {
             RevageChatClient.LOGGER.warn("Could not read config file", exception);
         }
@@ -91,6 +123,8 @@ public final class ConfigManager {
             data.masterSoundVolume = masterSoundVolume;
             data.filtersEnabled = filtersEnabled;
             data.channels = new ArrayList<>(channels.size());
+            data.channelFilterStates = new LinkedHashMap<>(channelFilterStates);
+            data.windowLayouts = new LinkedHashMap<>();
 
             for (ChatChannel channel : channels) {
                 ChannelData channelData = new ChannelData();
@@ -102,6 +136,18 @@ public final class ConfigManager {
                 channelData.volume = channel.volume();
                 channelData.windowState = channel.windowState().name();
                 data.channels.add(channelData);
+            }
+
+            for (Map.Entry<String, ChannelWindowManager.WindowLayout> entry : windowLayouts.entrySet()) {
+                ChannelWindowManager.WindowLayout layout = entry.getValue();
+                WindowLayoutData layoutData = new WindowLayoutData();
+                layoutData.x = layout.x();
+                layoutData.y = layout.y();
+                layoutData.width = layout.width();
+                layoutData.height = layout.height();
+                layoutData.opacity = layout.opacity();
+                layoutData.minimized = layout.minimized();
+                data.windowLayouts.put(entry.getKey(), layoutData);
             }
 
             try (Writer writer = Files.newBufferedWriter(CONFIG_FILE)) {
@@ -120,6 +166,27 @@ public final class ConfigManager {
         this.channels.clear();
         this.channels.addAll(channels);
         save();
+    }
+
+    public Map<String, Map<String, Boolean>> channelFilterStates() {
+        Map<String, Map<String, Boolean>> copy = new LinkedHashMap<>();
+        for (Map.Entry<String, Map<String, Boolean>> entry : channelFilterStates.entrySet()) {
+            copy.put(entry.getKey(), new LinkedHashMap<>(entry.getValue()));
+        }
+        return copy;
+    }
+
+    public void setChannelFilterState(String channelId, String filterId, boolean enabled) {
+        channelFilterStates.computeIfAbsent(channelId, ignored -> new LinkedHashMap<>()).put(filterId, enabled);
+    }
+
+    public Map<String, ChannelWindowManager.WindowLayout> windowLayouts() {
+        return new LinkedHashMap<>(windowLayouts);
+    }
+
+    public void saveWindowLayouts(Map<String, ChannelWindowManager.WindowLayout> layouts) {
+        this.windowLayouts.clear();
+        this.windowLayouts.putAll(layouts);
     }
 
     public boolean overrideExistingColors() {
@@ -172,6 +239,8 @@ public final class ConfigManager {
         private float masterSoundVolume = 1.0F;
         private boolean filtersEnabled = true;
         private List<ChannelData> channels;
+        private Map<String, Map<String, Boolean>> channelFilterStates;
+        private Map<String, WindowLayoutData> windowLayouts;
     }
 
     private static final class ChannelData {
@@ -182,5 +251,14 @@ public final class ConfigManager {
         private float opacity;
         private float volume;
         private String windowState;
+    }
+
+    private static final class WindowLayoutData {
+        private int x;
+        private int y;
+        private int width;
+        private int height;
+        private float opacity = 1.0F;
+        private boolean minimized;
     }
 }

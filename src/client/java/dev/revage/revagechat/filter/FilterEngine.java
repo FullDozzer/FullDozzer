@@ -2,6 +2,9 @@ package dev.revage.revagechat.filter;
 
 import dev.revage.revagechat.chat.MessageType;
 import dev.revage.revagechat.chat.model.MessageContext;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -9,10 +12,12 @@ import java.util.Set;
  */
 public final class FilterEngine {
     private final ChannelFilterRegistry registry;
+    private final Map<String, ChatFilter> namedDefaults;
     private volatile boolean enabled;
 
     public FilterEngine() {
         this.registry = new ChannelFilterRegistry();
+        this.namedDefaults = new LinkedHashMap<>();
         this.enabled = true;
 
         bootstrapDefaults();
@@ -42,11 +47,65 @@ public final class FilterEngine {
         return registry;
     }
 
+    public Set<String> defaultFilterIds() {
+        return namedDefaults.keySet();
+    }
+
+    public boolean isFilterEnabled(String channelId, String filterId) {
+        ChatFilter filter = namedDefaults.get(filterId);
+        if (filter instanceof ChannelScopedFilter scoped) {
+            return scoped.isEnabledForChannel(channelId);
+        }
+        return false;
+    }
+
+    public void setFilterEnabled(String channelId, String filterId, boolean enabled) {
+        ChatFilter filter = namedDefaults.get(filterId);
+        if (filter == null) {
+            return;
+        }
+        registry.setEnabled(channelId, filter, enabled);
+    }
+
+    public void applyPersistedStates(Map<String, Map<String, Boolean>> states) {
+        if (states == null || states.isEmpty()) {
+            return;
+        }
+
+        for (Map.Entry<String, Map<String, Boolean>> channelEntry : states.entrySet()) {
+            String channelId = channelEntry.getKey();
+            Map<String, Boolean> filterStates = channelEntry.getValue();
+            if (filterStates == null) {
+                continue;
+            }
+
+            for (Map.Entry<String, Boolean> filterEntry : filterStates.entrySet()) {
+                setFilterEnabled(channelId, filterEntry.getKey(), Boolean.TRUE.equals(filterEntry.getValue()));
+            }
+        }
+    }
+
+    public Map<String, Map<String, Boolean>> snapshotStates(Collection<String> channelIds) {
+        Map<String, Map<String, Boolean>> states = new LinkedHashMap<>();
+        for (String channelId : channelIds) {
+            Map<String, Boolean> oneChannel = new LinkedHashMap<>();
+            for (String filterId : namedDefaults.keySet()) {
+                oneChannel.put(filterId, isFilterEnabled(channelId, filterId));
+            }
+            states.put(channelId, oneChannel);
+        }
+        return states;
+    }
+
     private void bootstrapDefaults() {
-        // conservative defaults for ready-to-use experience
-        registry.register("default", new AntiCapsFilter(0.80F));
-        registry.register("default", new DuplicateMergeFilter());
-        registry.register("default", new LengthFilter(1, 400));
-        registry.register("default", new MessageTypeFilter(Set.of(MessageType.SYSTEM)));
+        addDefault("anti_caps", new AntiCapsFilter(0.80F));
+        addDefault("duplicate_merge", new DuplicateMergeFilter());
+        addDefault("length", new LengthFilter(1, 400));
+        addDefault("hide_system", new MessageTypeFilter(Set.of(MessageType.SYSTEM)));
+    }
+
+    private void addDefault(String id, ChatFilter filter) {
+        namedDefaults.put(id, filter);
+        registry.register("default", filter);
     }
 }

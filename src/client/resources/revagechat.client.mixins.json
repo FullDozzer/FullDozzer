@@ -3,7 +3,8 @@
   "package": "dev.revage.revagechat.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "ChatHudMixin"
+    "ChatHudMixin",
+    "ChatScreenMixin"
   ],
   "injectors": {
     "defaultRequire": 1
