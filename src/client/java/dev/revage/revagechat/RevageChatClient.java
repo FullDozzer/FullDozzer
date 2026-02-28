@@ -77,7 +77,8 @@ public final class RevageChatClient implements ClientModInitializer {
     private void initializeManagers() {
         // TODO: Load persisted config and user profile preferences.
         this.configManager = new ConfigManager();
-        this.channelManager = new ChannelManager();
+        this.channelManager = new ChannelManager(configManager);
+        this.channelManager.load();
         this.filterEngine = new FilterEngine();
         this.soundManager = new SoundManager();
         this.statisticsManager = new StatisticsManager();
