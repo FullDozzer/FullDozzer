@@ -67,4 +67,13 @@ public final class FilterActionStore {
     public static String autoCommand(MessageContext ctx) {
         return autoCommand.get(ctx);
     }
+
+    public static void clear(MessageContext ctx) {
+        overrideText.remove(ctx);
+        blocked.remove(ctx);
+        tag.remove(ctx);
+        recolor.remove(ctx);
+        autoReply.remove(ctx);
+        autoCommand.remove(ctx);
+    }
 }

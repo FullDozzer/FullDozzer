@@ -26,12 +26,14 @@ public final class ConfigManager {
     private boolean overrideExistingColors;
     private int globalColorRgb;
     private float masterSoundVolume;
+    private boolean filtersEnabled;
     private final List<ChatChannel> channels;
 
     public ConfigManager() {
         this.overrideExistingColors = false;
         this.globalColorRgb = 0xFFFFFF;
         this.masterSoundVolume = 1.0F;
+        this.filtersEnabled = true;
         this.channels = new ArrayList<>();
     }
 
@@ -57,6 +59,7 @@ public final class ConfigManager {
             this.overrideExistingColors = data.overrideExistingColors;
             this.globalColorRgb = data.globalColorRgb;
             this.masterSoundVolume = clamp01(data.masterSoundVolume);
+            this.filtersEnabled = data.filtersEnabled;
             this.channels.clear();
             if (data.channels != null) {
                 for (ChannelData channelData : data.channels) {
@@ -86,6 +89,7 @@ public final class ConfigManager {
             data.overrideExistingColors = overrideExistingColors;
             data.globalColorRgb = globalColorRgb;
             data.masterSoundVolume = masterSoundVolume;
+            data.filtersEnabled = filtersEnabled;
             data.channels = new ArrayList<>(channels.size());
 
             for (ChatChannel channel : channels) {
@@ -142,6 +146,14 @@ public final class ConfigManager {
         this.masterSoundVolume = clamp01(masterSoundVolume);
     }
 
+    public boolean filtersEnabled() {
+        return filtersEnabled;
+    }
+
+    public void setFiltersEnabled(boolean filtersEnabled) {
+        this.filtersEnabled = filtersEnabled;
+    }
+
     private static WindowState parseWindowState(String value) {
         try {
             return WindowState.valueOf(value);
@@ -158,6 +170,7 @@ public final class ConfigManager {
         private boolean overrideExistingColors;
         private int globalColorRgb;
         private float masterSoundVolume = 1.0F;
+        private boolean filtersEnabled = true;
         private List<ChannelData> channels;
     }
 

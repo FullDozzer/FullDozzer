@@ -18,23 +18,20 @@ public final class ChatInterceptor {
     }
 
     public void onClientTick(MinecraftClient client) {
-        // TODO: Flush deferred chat tasks that should run on the client thread.
+        // reserved for deferred actions
     }
 
     public boolean onIncomingMessage(MessageContext context) {
-        statisticsManager.recordIncoming();
-
         try {
             return messagePipeline.handleIncoming(context);
         } catch (Throwable throwable) {
+            statisticsManager.recordHiddenMessage();
             RevageChatClient.LOGGER.error("Incoming pipeline failed, allowing vanilla render", throwable);
             return true;
         }
     }
 
     public boolean onOutgoingMessage(MessageContext context) {
-        statisticsManager.recordOutgoing();
-
         try {
             return messagePipeline.handleOutgoing(context);
         } catch (Throwable throwable) {

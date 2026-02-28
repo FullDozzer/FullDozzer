@@ -1,34 +1,44 @@
 package dev.revage.revagechat;
 
+import com.mojang.brigadier.arguments.BoolArgumentType;
 import dev.revage.revagechat.audio.SoundManager;
 import dev.revage.revagechat.chat.ChannelManager;
 import dev.revage.revagechat.chat.ChatInterceptor;
 import dev.revage.revagechat.chat.MessagePipeline;
 import dev.revage.revagechat.chat.MessageType;
 import dev.revage.revagechat.chat.model.MessageContext;
+import dev.revage.revagechat.chat.window.ChannelWindowManager;
 import dev.revage.revagechat.config.ConfigManager;
 import dev.revage.revagechat.filter.FilterEngine;
 import dev.revage.revagechat.log.LogManager;
 import dev.revage.revagechat.stats.StatisticsManager;
 import dev.revage.revagechat.ui.RevageChatConfigScreen;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.UUID;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
+import net.minecraft.text.Text;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument;
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
+
 /**
  * Client entrypoint for RevageChat.
- *
- * <p>This class wires high-level collaborators and registers Fabric client events.
  */
 public final class RevageChatClient implements ClientModInitializer {
     public static final String MOD_ID = "revagechat";
@@ -44,7 +54,9 @@ public final class RevageChatClient implements ClientModInitializer {
     private StatisticsManager statisticsManager;
     private LogManager logManager;
     private ChatInterceptor chatInterceptor;
+    private ChannelWindowManager windowManager;
     private KeyBinding openSettingsKey;
+    private KeyBinding openWindowKey;
 
     @Override
     public void onInitializeClient() {
@@ -54,6 +66,7 @@ public final class RevageChatClient implements ClientModInitializer {
 
         initializeManagers();
         registerEvents();
+        registerCommands();
 
         LOGGER.info("{} initialized", MOD_ID);
     }
@@ -72,6 +85,10 @@ public final class RevageChatClient implements ClientModInitializer {
 
     public ChannelManager channels() {
         return channelManager;
+    }
+
+    public ChannelWindowManager windows() {
+        return windowManager;
     }
 
     public static boolean interceptIncomingFromMixin(
@@ -104,10 +121,13 @@ public final class RevageChatClient implements ClientModInitializer {
         this.channelManager = new ChannelManager(configManager);
         this.channelManager.load();
         this.filterEngine = new FilterEngine();
+        this.filterEngine.setEnabled(configManager.filtersEnabled());
         this.soundManager = new SoundManager();
         this.soundManager.setMasterVolume(configManager.masterSoundVolume());
         this.statisticsManager = new StatisticsManager();
         this.logManager = new LogManager();
+        this.windowManager = new ChannelWindowManager();
+        this.windowManager.getOrCreateDefault("default");
 
         this.messagePipeline = new MessagePipeline(
             channelManager,
@@ -115,7 +135,8 @@ public final class RevageChatClient implements ClientModInitializer {
             filterEngine,
             logManager,
             soundManager,
-            statisticsManager
+            statisticsManager,
+            windowManager
         );
         this.chatInterceptor = new ChatInterceptor(messagePipeline, statisticsManager);
     }
@@ -128,9 +149,25 @@ public final class RevageChatClient implements ClientModInitializer {
             "category.revagechat"
         ));
 
+        this.openWindowKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+            "key.revagechat.open_default_window",
+            InputUtil.Type.KEYSYM,
+            GLFW.GLFW_KEY_GRAVE_ACCENT,
+            "category.revagechat"
+        ));
+
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             chatInterceptor.onClientTick(client);
             onClientTick(client);
+            windowManager.tick(client, 1.0F);
+        });
+
+        HudRenderCallback.EVENT.register((drawContext, tickCounter) -> {
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (client == null || client.options.hudHidden) {
+                return;
+            }
+            windowManager.renderAll(drawContext, client);
         });
 
         ClientSendMessageEvents.ALLOW_CHAT.register(message -> {
@@ -149,12 +186,65 @@ public final class RevageChatClient implements ClientModInitializer {
         LOGGER.debug("Client events registered");
     }
 
+    private void registerCommands() {
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> dispatcher.register(
+            literal("rc")
+                .then(literal("menu").executes(ctx -> {
+                    MinecraftClient client = MinecraftClient.getInstance();
+                    client.setScreen(new RevageChatConfigScreen(client.currentScreen, configManager, this::applyConfigAtRuntime));
+                    return 1;
+                }))
+                .then(literal("window").executes(ctx -> {
+                    windowManager.getOrCreateDefault("default");
+                    ctx.getSource().sendFeedback(Text.literal("RevageChat: default window opened"));
+                    return 1;
+                }))
+                .then(literal("stats")
+                    .then(literal("export").executes(ctx -> {
+                        exportStats(ctx.getSource().getClient());
+                        ctx.getSource().sendFeedback(Text.literal("RevageChat: stats exported"));
+                        return 1;
+                    })))
+                .then(literal("filter")
+                    .then(argument("enabled", BoolArgumentType.bool()).executes(ctx -> {
+                        boolean enabled = BoolArgumentType.getBool(ctx, "enabled");
+                        filterEngine.setEnabled(enabled);
+                        configManager.setFiltersEnabled(enabled);
+                        configManager.save();
+                        ctx.getSource().sendFeedback(Text.literal("RevageChat filters: " + (enabled ? "ON" : "OFF")));
+                        return 1;
+                    })))
+        ));
+    }
+
+    private void applyConfigAtRuntime() {
+        soundManager.setMasterVolume(configManager.masterSoundVolume());
+        filterEngine.setEnabled(configManager.filtersEnabled());
+        channelManager.save();
+    }
+
     private void onClientTick(MinecraftClient client) {
         while (openSettingsKey.wasPressed()) {
-            client.setScreen(new RevageChatConfigScreen(client.currentScreen, configManager, () -> {
-                soundManager.setMasterVolume(configManager.masterSoundVolume());
-                channelManager.save();
-            }));
+            client.setScreen(new RevageChatConfigScreen(client.currentScreen, configManager, this::applyConfigAtRuntime));
+        }
+
+        while (openWindowKey.wasPressed()) {
+            windowManager.getOrCreateDefault("default");
+        }
+    }
+
+    private void exportStats(MinecraftClient client) {
+        Path dir = FabricLoader.getInstance().getConfigDir().resolve("revagechat");
+        Path file = dir.resolve("stats-export.json");
+
+        try {
+            Files.createDirectories(dir);
+            Files.writeString(file, statisticsManager.exportJson(25, 50));
+        } catch (IOException exception) {
+            LOGGER.warn("Could not export stats", exception);
+            if (client.player != null) {
+                client.player.sendMessage(Text.literal("RevageChat: failed to export stats"), false);
+            }
         }
     }
 }

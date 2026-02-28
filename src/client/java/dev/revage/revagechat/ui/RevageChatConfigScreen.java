@@ -25,6 +25,7 @@ public final class RevageChatConfigScreen extends Screen {
 
     private TextFieldWidget colorHexField;
     private ButtonWidget overrideButton;
+    private ButtonWidget filtersButton;
     private VolumeSlider volumeSlider;
 
     public RevageChatConfigScreen(Screen parent, ConfigManager config, Runnable onSave) {
@@ -37,7 +38,7 @@ public final class RevageChatConfigScreen extends Screen {
     @Override
     protected void init() {
         int panelX = this.width / 2 - 170;
-        int panelY = this.height / 2 - 95;
+        int panelY = this.height / 2 - 110;
 
         this.colorHexField = new TextFieldWidget(textRenderer, panelX + 20, panelY + 46, 110, 20, Text.literal("Global color"));
         this.colorHexField.setText(String.format("#%06X", config.globalColorRgb()));
@@ -49,9 +50,14 @@ public final class RevageChatConfigScreen extends Screen {
             button.setMessage(buttonText());
         }).dimensions(panelX + 140, panelY + 46, 180, 20).build());
 
+        this.filtersButton = addDrawableChild(ButtonWidget.builder(filtersText(), button -> {
+            config.setFiltersEnabled(!config.filtersEnabled());
+            button.setMessage(filtersText());
+        }).dimensions(panelX + 20, panelY + 82, 300, 20).build());
+
         this.volumeSlider = addDrawableChild(new VolumeSlider(
             panelX + 20,
-            panelY + 82,
+            panelY + 108,
             300,
             20,
             config.masterSoundVolume(),
@@ -59,11 +65,11 @@ public final class RevageChatConfigScreen extends Screen {
         ));
 
         addDrawableChild(ButtonWidget.builder(Text.literal("Save"), button -> saveAndClose())
-            .dimensions(panelX + 20, panelY + 126, 145, 22)
+            .dimensions(panelX + 20, panelY + 150, 145, 22)
             .build());
 
         addDrawableChild(ButtonWidget.builder(Text.literal("Cancel"), button -> close())
-            .dimensions(panelX + 175, panelY + 126, 145, 22)
+            .dimensions(panelX + 175, panelY + 150, 145, 22)
             .build());
     }
 
@@ -79,9 +85,9 @@ public final class RevageChatConfigScreen extends Screen {
         renderBackground(context, mouseX, mouseY, delta);
 
         int panelX = this.width / 2 - 170;
-        int panelY = this.height / 2 - 95;
+        int panelY = this.height / 2 - 110;
         int panelW = 340;
-        int panelH = 190;
+        int panelH = 220;
 
         context.fill(0, 0, width, height, BG);
         context.fill(panelX, panelY, panelX + panelW, panelY + panelH, PANEL);
@@ -90,7 +96,8 @@ public final class RevageChatConfigScreen extends Screen {
 
         context.drawText(textRenderer, Text.literal("RevageChat Settings"), panelX + 12, panelY + 9, 0xFFFFFFFF, false);
         context.drawText(textRenderer, Text.literal("Global Color"), panelX + 20, panelY + 34, MUTED, false);
-        context.drawText(textRenderer, Text.literal("Master UI Volume"), panelX + 20, panelY + 70, MUTED, false);
+        context.drawText(textRenderer, Text.literal("Filters"), panelX + 20, panelY + 70, MUTED, false);
+        context.drawText(textRenderer, Text.literal("Master UI Volume"), panelX + 20, panelY + 96, MUTED, false);
 
         super.render(context, mouseX, mouseY, delta);
     }
@@ -112,6 +119,10 @@ public final class RevageChatConfigScreen extends Screen {
 
     private Text buttonText() {
         return Text.literal("Override existing colors: " + (config.overrideExistingColors() ? "ON" : "OFF"));
+    }
+
+    private Text filtersText() {
+        return Text.literal("Filters: " + (config.filtersEnabled() ? "ON" : "OFF"));
     }
 
     @FunctionalInterface

@@ -22,8 +22,17 @@ public final class ChannelWindowManager {
         return windowsByChannelId.computeIfAbsent(channelId, ignored -> new ChannelWindow(channelId, x, y, width, height));
     }
 
+    public ChannelWindow getOrCreateDefault(String channelId) {
+        int index = Math.max(0, windowsByChannelId.size());
+        return getOrCreate(channelId, 10 + (index * 14), 20 + (index * 14), 280, 150);
+    }
+
     public Optional<ChannelWindow> get(String channelId) {
         return Optional.ofNullable(windowsByChannelId.get(channelId));
+    }
+
+    public void appendMessage(String channelId, String text) {
+        getOrCreateDefault(channelId).addMessage(text);
     }
 
     public void remove(String channelId) {
