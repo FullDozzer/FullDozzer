@@ -53,7 +53,7 @@ def _shorten_teacher(name: str) -> str:
 
 def _extract_pair_header(card_header) -> tuple[str, str]:
     title_tag = card_header.select_one("span.h3")
-    pair_title = f"{_clean_text_line(title_tag.get_text(strip=True))} пара" if title_tag else "Пара"
+    pair_title = f"{_clean_text_line(title_tag.get_text(strip=True))} пара" if title_tag else ""
 
     time_tag = card_header.select_one("span.h4")
     pair_time = ""
@@ -168,6 +168,9 @@ def parse_schedule_data(html: str) -> dict:
     header = soup.select_one("div.header3")
     header_text = _clean_text_line(header.get_text(" ", strip=True)) if header else "Расписание"
 
+    if "не опубликовано" in header_text.lower():
+        raise RuntimeError(header_text)
+
     group = DEFAULT_GROUP_NAME
     if "группы" in header_text.lower() and "на " in header_text.lower():
         try:
@@ -200,6 +203,8 @@ def parse_schedule_data(html: str) -> dict:
 
         pair_title, pair_time = _extract_pair_header(card_header)
         pair_number = pair_title.replace(" пара", "").strip()
+        if not re.fullmatch(r"[IVX]+", pair_number):
+            continue
 
         subgroup1 = card.select_one("div.subGroup1")
         subgroup2 = card.select_one("div.subGroup2")
@@ -215,6 +220,9 @@ def parse_schedule_data(html: str) -> dict:
             entries.append(_build_entry(body))
 
         pairs.append({"number": pair_number, "time": pair_time, "entries": entries})
+
+    if not pairs:
+        raise RuntimeError("Расписание не опубликовано или не найдено валидных карточек пар на странице.")
 
     return {
         "title": f"📚 Расписание на {day_date}",
