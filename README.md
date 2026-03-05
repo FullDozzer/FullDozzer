@@ -192,6 +192,11 @@ python -m playwright install chromium
 - Укажите путь к шрифту с кириллицей в `.env`: `SCHEDULE_FONT_PATH=C:/Windows/Fonts/arial.ttf`
 - Linux пример: `SCHEDULE_FONT_PATH=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`
 
+### 8. Ошибка `BrowserType.launch: Timeout ...`
+Бот теперь умеет резервно загружать страницу без Playwright (через обычный HTTP-запрос), поэтому даже при проблемах запуска Chromium расписание должно приходить.
+Если ошибка повторяется — проверьте доступ к сайту из браузера и firewall/антивирус.
+
+
 ---
 
 ## Команды бота

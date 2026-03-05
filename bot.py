@@ -4,7 +4,9 @@ import json
 import logging
 import os
 import re
+import ssl
 import tempfile
+import urllib.request
 from dataclasses import dataclass
 from typing import ClassVar
 from datetime import datetime, timedelta
@@ -501,21 +503,39 @@ class ScheduleWatcher:
             target_url,
         )
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(ignore_https_errors=self.settings.ignore_https_errors)
-            page = await context.new_page()
-            response = await page.goto(target_url, wait_until="domcontentloaded", timeout=90_000)
-            await page.wait_for_timeout(1500)
+        html = ""
+        response_status: int | None = None
 
-            html = await page.content()
-            await context.close()
-            await browser.close()
-
-        if response and response.status == 404:
-            raise RuntimeError(
-                f"Расписание на {target_iso} не найдено (404) по ссылке: {target_url}."
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, timeout=30_000)
+                context = await browser.new_context(ignore_https_errors=self.settings.ignore_https_errors)
+                page = await context.new_page()
+                response = await page.goto(target_url, wait_until="domcontentloaded", timeout=45_000)
+                await page.wait_for_timeout(500)
+                html = await page.content()
+                response_status = response.status if response else None
+                await context.close()
+                await browser.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Playwright недоступен (%s). Пробую получить страницу без браузера.", exc)
+            request = urllib.request.Request(
+                target_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             )
+            ssl_context = ssl._create_unverified_context() if self.settings.ignore_https_errors else None
+            try:
+                with urllib.request.urlopen(request, timeout=30, context=ssl_context) as resp:
+                    response_status = getattr(resp, "status", None)
+                    html = resp.read().decode("utf-8", errors="replace")
+            except Exception as fallback_exc:  # noqa: BLE001
+                raise RuntimeError(
+                    "Не удалось загрузить расписание: браузер Playwright не запустился, "
+                    "и резервный HTTP-запрос тоже завершился ошибкой."
+                ) from fallback_exc
+
+        if response_status == 404:
+            raise RuntimeError(f"Расписание на {target_iso} не найдено (404) по ссылке: {target_url}.")
 
         text = parse_schedule(html)
         schedule_data = parse_schedule_data(html)
