@@ -107,7 +107,7 @@ BOT_TOKEN=ваш_токен_от_BotFather
 SCHEDULE_URL=http://www.ishnk.ru/2025/site/schedule/group/508/2026-02-25
 GROUP_NAME=точное_название_группы
 TIMEZONE=Europe/Moscow
-CHECK_INTERVAL_SECONDS=1800
+CHECK_INTERVAL_SECONDS=300
 DATE_FORMAT=%d.%m.%Y
 IGNORE_HTTPS_ERRORS=true
 SCHEDULE_FONT_PATH=
@@ -203,7 +203,7 @@ python -m playwright install chromium
 - `/start` — показать статус и подписаться на уведомления
 - `/subscribe` — подписаться на рассылку
 - `/unsubscribe` — отписаться от рассылки
-- `/schedule` — показать расписание (по умолчанию на завтра, если пусто — на сегодня)
+- `/schedule` — показать расписание (по умолчанию на завтра, если нет валидных пар — на сегодня)
 - `/checknow` — немедленно проверить изменения (если изменений нет, отправит сегодняшнее расписание)
 - `/scheduletext` — получить расписание обычным текстом
 - `/date ДД.ММ.ГГГГ` — получить расписание на конкретную дату (пример: `/date 25.02.2026`)

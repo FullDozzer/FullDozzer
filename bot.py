@@ -33,7 +33,7 @@ DEFAULT_BOT_TOKEN = "7824304844:AAHkM1wxBxztZthu14MIee27mv6uXZP4a2Y"
 DEFAULT_SCHEDULE_URL = "http://www.ishnk.ru/2025/site/schedule/group/508/2026-02-25"
 DEFAULT_GROUP_NAME = "ЭС7-24"
 DEFAULT_TIMEZONE = "Europe/Moscow"
-DEFAULT_CHECK_INTERVAL_SECONDS = 1800
+DEFAULT_CHECK_INTERVAL_SECONDS = 300
 DEFAULT_DATE_FORMAT = "%d.%m.%Y"
 DEFAULT_IGNORE_HTTPS_ERRORS = True
 
@@ -51,19 +51,25 @@ def _shorten_teacher(name: str) -> str:
     return f"{words[0]} {initials}".strip()
 
 
-def _extract_pair_header(card_header) -> tuple[str, str]:
-    title_tag = card_header.select_one("span.h3")
-    pair_title = f"{_clean_text_line(title_tag.get_text(strip=True))} пара" if title_tag else "Пара"
+def _extract_pair_header(card_header) -> tuple[str, str] | None:
+    """Возвращает только валидные пары вида `I Пара 08:30-09:50`.
 
-    time_tag = card_header.select_one("span.h4")
-    pair_time = ""
-    if time_tag:
-        raw_time = _clean_text_line(time_tag.get_text(" ", strip=True))
-        nums = re.findall(r"\d{1,2}", raw_time)
-        if len(nums) >= 4:
-            pair_time = f"{int(nums[0]):02d}:{int(nums[1]):02d}–{int(nums[2]):02d}:{int(nums[3]):02d}"
-        else:
-            pair_time = raw_time.replace("-", "–")
+    Если в header нет римского номера пары и времени — это не пара, пропускаем.
+    """
+    header_text = _clean_text_line(card_header.get_text(" ", strip=True))
+
+    roman_match = re.search(r"\b(X|IX|IV|V?I{1,3})\b", header_text)
+    time_match = re.search(r"(\d{1,2})\D?(\d{2})\s*[-–]\s*(\d{1,2})\D?(\d{2})", header_text)
+
+    if not roman_match or not time_match:
+        return None
+
+    pair_number = roman_match.group(1)
+    pair_title = f"{pair_number} пара"
+    pair_time = (
+        f"{int(time_match.group(1)):02d}:{time_match.group(2)}–"
+        f"{int(time_match.group(3)):02d}:{time_match.group(4)}"
+    )
     return pair_title, pair_time
 
 
@@ -176,7 +182,10 @@ def parse_schedule_data(html: str) -> dict:
         if not card_header:
             continue
 
-        pair_title, pair_time = _extract_pair_header(card_header)
+        pair_header = _extract_pair_header(card_header)
+        if pair_header is None:
+            continue
+        pair_title, pair_time = pair_header
         pair_number = pair_title.replace(" пара", "").strip()
 
         subgroups = [
@@ -207,7 +216,11 @@ def parse_schedule_data(html: str) -> dict:
                 }
             )
 
-        pairs.append({"number": pair_number, "time": pair_time, "entries": entries})
+        valid_entries = [entry for entry in entries if _clean_text_line(entry.get("subject", ""))]
+        if not valid_entries:
+            continue
+
+        pairs.append({"number": pair_number, "time": pair_time, "entries": valid_entries})
 
     return {
         "title": f"📚 Расписание на {day_date}",
