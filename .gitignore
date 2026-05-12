@@ -1,0 +1,12 @@
+.gradle/
+build/
+out/
+*.class
+
+# Fabric
+run/
+
+# IDE
+.idea/
+*.iml
+.vscode/

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "revagechat",
+  "version": "${version}",
+  "name": "RevageChat",
+  "description": "Client-side chat framework skeleton for Fabric 1.21.1.",
+  "authors": [
+    "Revage"
+  ],
+  "license": "All-Rights-Reserved",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.revage.revagechat.RevageChatClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.7",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "mixins": [
+    "revagechat.client.mixins.json"
+  ]
+}
