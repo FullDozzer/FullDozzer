@@ -1,25 +1,16 @@
-FROM python:3.12-bookworm
-
-# Не создавать .pyc
-ENV PYTHONDONTWRITEBYTECODE=1
-
-# Логи сразу выводятся в консоль
-ENV PYTHONUNBUFFERED=1
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Системные зависимости и Python-пакеты
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
 COPY requirements.txt .
 
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt \
-    && python -m playwright install --with-deps chromium
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем приложение
 COPY bot.py .
 
-# Папка для постоянных данных
 RUN mkdir -p /app/data /app/data/images
 
-# Запуск
 CMD ["python", "-u", "bot.py"]
