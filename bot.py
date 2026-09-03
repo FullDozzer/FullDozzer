@@ -161,7 +161,11 @@ async def fetch_html(date_value):
         timeout=timeout
     ) as session:
 
-        async with session.get(url) as response:
+        async with session.get(
+            url,
+            ssl=False
+        ) as response:
+
             response.raise_for_status()
 
             html = await response.text(
