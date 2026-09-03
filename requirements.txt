@@ -1,0 +1,5 @@
+aiogram==3.31.0
+beautifulsoup4==4.14.2
+python-dotenv==1.2.1
+Pillow==11.3.0
+playwright==1.61.0
