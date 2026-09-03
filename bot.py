@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from bs4 import BeautifulSoup, UnicodeDammit
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
@@ -18,31 +18,68 @@ from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 
 
-# =========================
-# CONFIG
-# =========================
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
 SCHEDULE_URL = os.getenv(
     "SCHEDULE_URL",
     "https://www.ishnk.ru/2025/site/schedule/group/508"
 ).rstrip("/")
 
-GROUP_NAME = os.getenv("GROUP_NAME", "ЭС7-24")
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))
-DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
-TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
+GROUP_NAME = os.getenv(
+    "GROUP_NAME",
+    "ЭС7-24"
+)
+
+CHECK_INTERVAL = int(
+    os.getenv("CHECK_INTERVAL", "1800")
+)
+
+DATA_DIR = Path(
+    os.getenv("DATA_DIR", "data")
+)
+
+TIMEZONE_NAME = os.getenv(
+    "TIMEZONE",
+    "Europe/Moscow"
+)
 
 TZ = ZoneInfo(TIMEZONE_NAME)
 
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-IMAGE_DIR = DATA_DIR / "images"
-IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
-SUBSCRIBERS_FILE = DATA_DIR / "subscribers.json"
-CACHE_FILE = DATA_DIR / "schedule_cache.json"
+# ============================================================
+# ПАПКИ
+# ============================================================
+
+DATA_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+IMAGE_DIR = DATA_DIR / "images"
+
+IMAGE_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+SUBSCRIBERS_FILE = (
+    DATA_DIR / "subscribers.json"
+)
+
+CACHE_FILE = (
+    DATA_DIR / "schedule_cache.json"
+)
+
+
+# ============================================================
+# ЛОГИ
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,39 +89,71 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# ПРОВЕРКА ТОКЕНА
+# ============================================================
+
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не указан в .env")
+    raise RuntimeError(
+        "BOT_TOKEN не указан в .env"
+    )
 
 
-# =========================
-# FILE STORAGE
-# =========================
+# ============================================================
+# JSON
+# ============================================================
 
-def load_json(path: Path, default):
+def load_json(path, default):
     if not path.exists():
         return default
 
     try:
-        with path.open("r", encoding="utf-8") as f:
+        with path.open(
+            "r",
+            encoding="utf-8"
+        ) as f:
             return json.load(f)
+
     except Exception:
-        logger.exception("Ошибка чтения %s", path)
+        logger.exception(
+            "Ошибка чтения %s",
+            path
+        )
+
         return default
 
 
-def save_json(path: Path, data):
+def save_json(path, data):
     tmp = path.with_suffix(".tmp")
 
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    with tmp.open(
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
 
     tmp.replace(path)
 
 
+# ============================================================
+# ПОДПИСЧИКИ
+# ============================================================
+
 def load_subscribers():
+    data = load_json(
+        SUBSCRIBERS_FILE,
+        []
+    )
+
     return set(
         str(x)
-        for x in load_json(SUBSCRIBERS_FILE, [])
+        for x in data
     )
 
 
@@ -95,76 +164,140 @@ def save_subscribers(subscribers):
     )
 
 
-# =========================
-# DATE / URL
-# =========================
+# ============================================================
+# ДАТА
+# ============================================================
 
-def today():
+def local_today():
     return datetime.now(TZ).date()
 
 
 def build_schedule_url(date_value):
     """
-    Например:
+    Формирует:
 
     https://www.ishnk.ru/2025/site/schedule/group/508/2026-09-03
     """
 
-    return f"{SCHEDULE_URL}/{date_value.isoformat()}"
+    return (
+        f"{SCHEDULE_URL}/"
+        f"{date_value.isoformat()}"
+    )
 
 
 def parse_user_date(value):
     value = value.strip()
 
     formats = [
-        "%Y-%m-%d",
         "%d.%m.%Y",
+        "%Y-%m-%d",
         "%d-%m-%Y",
     ]
 
     for fmt in formats:
         try:
-            return datetime.strptime(value, fmt).date()
+            return datetime.strptime(
+                value,
+                fmt
+            ).date()
+
         except ValueError:
-            pass
+            continue
 
     return None
 
 
-# =========================
+# ============================================================
+# ОЧИСТКА ТЕКСТА
+# ============================================================
+
+def clean_text(text):
+    if not text:
+        return ""
+
+    text = text.replace(
+        "\xa0",
+        " "
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+def normalize_text(text):
+    """
+    Убирает лишние пробелы и разделители.
+    """
+
+    text = clean_text(text)
+
+    text = re.sub(
+        r"\s*\|\s*",
+        " | ",
+        text
+    )
+
+    return text.strip()
+
+
+# ============================================================
 # HTTP
-# =========================
+# ============================================================
 
 async def fetch_html(date_value):
-    url = build_schedule_url(date_value)
+    url = build_schedule_url(
+        date_value
+    )
 
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 "
             "(KHTML, like Gecko) "
             "Chrome/120.0 Safari/537.36"
         ),
+
         "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,*/*;q=0.8"
+            "text/html,"
+            "application/xhtml+xml,"
+            "application/xml;q=0.9,"
+            "*/*;q=0.8"
         ),
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+
+        "Accept-Language": (
+            "ru-RU,ru;q=0.9,en;q=0.8"
+        ),
+
         "Connection": "keep-alive",
     }
 
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(
+        total=30
+    )
 
-    logger.info("Получаю расписание: %s", url)
+    logger.info(
+        "Запрашиваю: %s",
+        url
+    )
 
     async with aiohttp.ClientSession(
         headers=headers,
         timeout=timeout
     ) as session:
 
+        # ВАЖНО:
+        # ssl=False нужен потому, что у сайта
+        # некорректный/самоподписанный сертификат.
         async with session.get(
             url,
-            ssl=False
+            ssl=False,
+            allow_redirects=True
         ) as response:
 
             response.raise_for_status()
@@ -172,191 +305,480 @@ async def fetch_html(date_value):
             raw = await response.read()
 
             logger.info(
-                "Получено %s байт, HTTP %s",
-                len(raw),
-                response.status
+                "HTTP %s, получено %s байт",
+                response.status,
+                len(raw)
             )
 
-            # Пытаемся определить реальную кодировку страницы.
-            dammit = UnicodeDammit(
-                raw,
-                ["utf-8", "windows-1251", "cp1251"]
-            )
-
-            html = dammit.unicode_markup
-
-            if html is None:
-                # Последний резервный вариант.
-                html = raw.decode(
-                    "windows-1251",
-                    errors="replace"
+            if not raw:
+                raise RuntimeError(
+                    "Сайт вернул пустую страницу"
                 )
 
-            logger.info(
-                "Кодировка страницы: %s",
-                dammit.original_encoding
-            )
-
-            return html
+            return raw
 
 
-# =========================
-# PARSER
-# =========================
+# ============================================================
+# ПАРСИНГ
+# ============================================================
 
 TIME_RE = re.compile(
-    r"\b([01]?\d|2[0-3]):[0-5]\d\b"
+    r"\b(?:[01]?\d|2[0-3])"
+    r":"
+    r"[0-5]\d"
+)
+
+PAIR_RE = re.compile(
+    r"\b(?:I|II|III|IV|V|VI|VII|VIII|IX|X)"
+    r"\s*пара\b",
+    re.IGNORECASE
 )
 
 
-def clean_text(text):
-    return re.sub(
-        r"\s+",
-        " ",
-        text
-    ).strip()
+def remove_duplicate_texts(items):
+    result = []
+    seen = set()
+
+    for item in items:
+        item = normalize_text(item)
+
+        if not item:
+            continue
+
+        # Удаляем совсем короткий мусор.
+        if len(item) < 3:
+            continue
+
+        key = item.lower()
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(item)
+
+    return result
 
 
-def parse_schedule(html):
-    soup = BeautifulSoup(html, "html.parser")
+def parse_schedule(raw):
+    """
+    ВАЖНО:
 
-    rows = []
+    Мы передаём BeautifulSoup СЫРЫЕ БАЙТЫ,
+    а не декодируем их вручную как UTF-8.
 
-    # 1. Сначала таблицы
+    BeautifulSoup сам определяет кодировку страницы.
+    Это исправляет ситуацию с Windows-1251 / CP1251.
+    """
+
+    soup = BeautifulSoup(
+        raw,
+        "html.parser"
+    )
+
+    logger.info(
+        "Определённая кодировка HTML: %s",
+        soup.original_encoding
+    )
+
+    # --------------------------------------------------------
+    # ВАРИАНТ 1. Таблица
+    # --------------------------------------------------------
+
+    table_rows = []
+
     for table in soup.find_all("table"):
+
         for tr in table.find_all("tr"):
+
             cells = []
 
-            for cell in tr.find_all(["th", "td"], recursive=False):
-                text = clean_text(
-                    cell.get_text(" ", strip=True)
+            for cell in tr.find_all(
+                ["th", "td"],
+                recursive=False
+            ):
+
+                text = normalize_text(
+                    cell.get_text(
+                        " ",
+                        strip=True
+                    )
                 )
 
                 if text:
                     cells.append(text)
 
             if cells:
-                rows.append(cells)
+                table_rows.append(
+                    " | ".join(cells)
+                )
 
-    if rows:
-        return remove_duplicate_rows(rows)
+    table_rows = remove_duplicate_texts(
+        table_rows
+    )
 
-    # 2. Если таблиц нет — ищем крупные блоки расписания.
-    # Не берём все вложенные div подряд.
+    if table_rows:
+        logger.info(
+            "Найдено строк таблицы: %s",
+            len(table_rows)
+        )
+
+        return table_rows
+
+
+    # --------------------------------------------------------
+    # ВАРИАНТ 2. Ищем блоки с временем
+    # --------------------------------------------------------
+
     candidates = []
 
     for element in soup.find_all(
-        ["article", "section", "li"]
+        ["article", "section", "li", "div"]
     ):
-        text = clean_text(
-            element.get_text(" ", strip=True)
+
+        text = normalize_text(
+            element.get_text(
+                " ",
+                strip=True
+            )
         )
 
         if not text:
             continue
 
-        if TIME_RE.search(text):
-            candidates.append(text)
-
-    # Убираем вложенные дубликаты.
-    for text in candidates:
-        if any(
-            text != other and text in other
-            for other in candidates
-        ):
+        # Нас интересуют блоки, где есть время.
+        if not TIME_RE.search(text):
             continue
 
-        rows.append([text])
+        # Ограничиваем слишком огромные контейнеры.
+        # Например, весь body нам не нужен.
+        if len(text) > 1500:
+            continue
 
-    return remove_duplicate_rows(rows)
-
-
-def remove_duplicate_rows(rows):
-    result = []
-    seen = set()
-
-    for row in rows:
-        key = " | ".join(
-            clean_text(str(x))
-            for x in row
+        candidates.append(
+            (element, text)
         )
 
-        if not key:
+
+    # --------------------------------------------------------
+    # Удаляем вложенные дубликаты
+    # --------------------------------------------------------
+
+    selected = []
+
+    for element, text in candidates:
+
+        is_inside_larger = False
+
+        for other_element, other_text in candidates:
+
+            if element is other_element:
+                continue
+
+            if len(other_text) <= len(text):
+                continue
+
+            if text not in other_text:
+                continue
+
+            # Если наш текст находится внутри
+            # другого блока, обычно берём более крупный блок.
+            is_inside_larger = True
+            break
+
+        if not is_inside_larger:
+            selected.append(text)
+
+
+    selected = remove_duplicate_texts(
+        selected
+    )
+
+
+    if selected:
+        logger.info(
+            "Найдено блоков расписания: %s",
+            len(selected)
+        )
+
+        return selected
+
+
+    # --------------------------------------------------------
+    # ВАРИАНТ 3. Резервный режим:
+    # берём текст страницы построчно
+    # --------------------------------------------------------
+
+    lines = []
+
+    for line in soup.stripped_strings:
+
+        line = normalize_text(
+            line
+        )
+
+        if not line:
             continue
 
-        if key in seen:
-            continue
-
-        seen.add(key)
-        result.append(row)
-
-    return result
+        if TIME_RE.search(line):
+            lines.append(line)
 
 
-def schedule_to_text(rows, date_value):
+    lines = remove_duplicate_texts(
+        lines
+    )
+
+    logger.info(
+        "Резервный парсинг: %s строк",
+        len(lines)
+    )
+
+    return lines
+
+
+# ============================================================
+# ПРЕОБРАЗОВАНИЕ РАСПИСАНИЯ В ТЕКСТ
+# ============================================================
+
+def schedule_to_text(
+    rows,
+    date_value
+):
+    header = (
+        f"📅 {date_value.strftime('%d.%m.%Y')}\n"
+        f"🎓 Группа: {GROUP_NAME}\n"
+    )
+
     if not rows:
         return (
-            f"📅 {date_value.strftime('%d.%m.%Y')}\n"
-            f"🎓 Группа: {GROUP_NAME}\n\n"
-            "Расписание не найдено."
+            header +
+            "\n❌ Расписание не найдено."
         )
 
     lines = [
-        f"📅 {date_value.strftime('%d.%m.%Y')}",
-        f"🎓 Группа: {GROUP_NAME}",
-        ""
+        header
     ]
 
-    for row in rows:
-        lines.append(" | ".join(row))
+    for index, row in enumerate(rows, 1):
+
+        row = normalize_text(
+            row
+        )
+
+        if not row:
+            continue
+
+        lines.append(
+            f"{row}"
+        )
 
     return "\n".join(lines)
 
 
-# =========================
-# IMAGE
-# =========================
+# ============================================================
+# ШРИФТЫ
+# ============================================================
 
-def get_font(size):
-    possible_fonts = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    ]
+def get_font(size, bold=False):
 
-    for font_path in possible_fonts:
-        if Path(font_path).exists():
+    if bold:
+        fonts = [
+            "/usr/share/fonts/truetype/dejavu/"
+            "DejaVuSans-Bold.ttf",
+
+            "/usr/share/fonts/truetype/liberation2/"
+            "LiberationSans-Bold.ttf",
+        ]
+
+    else:
+        fonts = [
+            "/usr/share/fonts/truetype/dejavu/"
+            "DejaVuSans.ttf",
+
+            "/usr/share/fonts/truetype/liberation2/"
+            "LiberationSans-Regular.ttf",
+        ]
+
+    for font_path in fonts:
+
+        path = Path(font_path)
+
+        if path.exists():
             return ImageFont.truetype(
-                font_path,
+                str(path),
                 size
             )
 
     return ImageFont.load_default()
 
 
-def render_schedule(rows, date_value):
-    title_font = get_font(32)
-    normal_font = get_font(22)
+# ============================================================
+# ПЕРЕНОС ДЛИННЫХ СТРОК
+# ============================================================
 
-    lines = [
-        f"Расписание — {GROUP_NAME}",
-        date_value.strftime("%d.%m.%Y"),
-        ""
-    ]
+def wrap_text(
+    draw,
+    text,
+    font,
+    max_width
+):
+    words = text.split()
+
+    if not words:
+        return [""]
+
+    lines = []
+    current = ""
+
+    for word in words:
+
+        test = (
+            word
+            if not current
+            else current + " " + word
+        )
+
+        bbox = draw.textbbox(
+            (0, 0),
+            test,
+            font=font
+        )
+
+        width = (
+            bbox[2] - bbox[0]
+        )
+
+        if width <= max_width:
+            current = test
+
+        else:
+
+            if current:
+                lines.append(
+                    current
+                )
+
+            current = word
+
+    if current:
+        lines.append(
+            current
+        )
+
+    return lines
+
+
+# ============================================================
+# СОЗДАНИЕ КАРТИНКИ
+# ============================================================
+
+def render_schedule(
+    rows,
+    date_value
+):
+    width = 1400
+
+    title_font = get_font(
+        42,
+        bold=True
+    )
+
+    date_font = get_font(
+        30,
+        bold=True
+    )
+
+    text_font = get_font(
+        25
+    )
+
+    max_text_width = (
+        width - 100
+    )
+
+    prepared_lines = []
+
+    # Заголовок
+    prepared_lines.append(
+        ("title", f"Расписание — {GROUP_NAME}")
+    )
+
+    prepared_lines.append(
+        (
+            "date",
+            date_value.strftime(
+                "%d.%m.%Y"
+            )
+        )
+    )
+
+    prepared_lines.append(
+        ("empty", "")
+    )
 
     if not rows:
-        lines.append("Расписание не найдено.")
+
+        prepared_lines.append(
+            (
+                "text",
+                "Расписание не найдено."
+            )
+        )
+
     else:
+
         for row in rows:
-            lines.append(" | ".join(row))
 
-    padding = 40
-    line_height = 34
+            wrapped = wrap_text(
+                None if False else ImageDraw.Draw(
+                    Image.new(
+                        "RGB",
+                        (1, 1)
+                    )
+                ),
+                normalize_text(row),
+                text_font,
+                max_text_width
+            )
 
-    width = 1400
+            for line in wrapped:
+                prepared_lines.append(
+                    ("text", line)
+                )
+
+            prepared_lines.append(
+                ("empty", "")
+            )
+
+
+    # --------------------------------------------------------
+    # Высота
+    # --------------------------------------------------------
+
+    line_heights = {
+        "title": 58,
+        "date": 45,
+        "text": 40,
+        "empty": 18,
+    }
+
+    padding = 50
+
+    height = padding * 2
+
+    for kind, _ in prepared_lines:
+        height += line_heights[kind]
+
+
     height = max(
-        300,
-        padding * 2 + len(lines) * line_height
+        height,
+        350
     )
+
+
+    # --------------------------------------------------------
+    # Картинка
+    # --------------------------------------------------------
 
     image = Image.new(
         "RGB",
@@ -364,45 +786,67 @@ def render_schedule(rows, date_value):
         "white"
     )
 
-    draw = ImageDraw.Draw(image)
+    draw = ImageDraw.Draw(
+        image
+    )
 
     y = padding
 
-    for index, line in enumerate(lines):
+    for kind, text in prepared_lines:
 
-        font = (
-            title_font
-            if index == 0
-            else normal_font
-        )
+        if kind == "title":
+            font = title_font
 
-        draw.text(
-            (padding, y),
-            line,
-            fill="black",
-            font=font
-        )
+        elif kind == "date":
+            font = date_font
 
-        y += line_height
+        else:
+            font = text_font
+
+
+        if text:
+            draw.text(
+                (padding, y),
+                text,
+                fill="black",
+                font=font
+            )
+
+
+        y += line_heights[kind]
+
 
     filename = (
         IMAGE_DIR /
         f"schedule_{date_value.isoformat()}.png"
     )
 
-    image.save(filename)
+    image.save(
+        filename,
+        "PNG"
+    )
+
+    logger.info(
+        "Создана картинка: %s",
+        filename
+    )
 
     return filename
 
 
-# =========================
-# GET SCHEDULE
-# =========================
+# ============================================================
+# ПОЛУЧЕНИЕ РАСПИСАНИЯ
+# ============================================================
 
 async def get_schedule(date_value):
-    html = await fetch_html(date_value)
 
-    rows = parse_schedule(html)
+    raw = await fetch_html(
+        date_value
+    )
+
+    rows = parse_schedule(
+        raw
+    )
 
     text = schedule_to_text(
         rows,
@@ -419,258 +863,444 @@ async def get_schedule(date_value):
         "rows": rows,
         "text": text,
         "image": image,
-        "html": html,
+        "raw": raw,
     }
 
 
-# =========================
-# BOT
-# =========================
+# ============================================================
+# TELEGRAM
+# ============================================================
 
-bot = Bot(BOT_TOKEN)
+bot = Bot(
+    token=BOT_TOKEN
+)
+
 dp = Dispatcher()
 
 
+# ============================================================
+# /start
+# ============================================================
+
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(
+    message: Message
+):
+
     await message.answer(
-        f"👋 Бот расписания группы {GROUP_NAME}\n\n"
-        "/schedule — расписание на сегодня\n"
-        "/scheduletext — расписание текстом\n"
-        "/tomorrow — расписание на завтра\n"
-        "/date 04.09.2026 — расписание на дату\n"
-        "/subscribe — получать обновления\n"
-        "/unsubscribe — отключить обновления\n"
-        "/checknow — проверить расписание"
+        f"📚 Расписание группы {GROUP_NAME}\n\n"
+
+        "Команды:\n"
+        "📅 /schedule — сегодня\n"
+        "📝 /scheduletext — сегодня текстом\n"
+        "➡️ /tomorrow — завтра\n"
+        "📆 /date 04.09.2026 — нужная дата\n\n"
+
+        "🔔 /subscribe — получать обновления\n"
+        "🔕 /unsubscribe — отключить обновления\n"
+        "🔄 /checknow — проверить сейчас"
     )
 
 
+# ============================================================
+# /schedule
+# ============================================================
+
 @dp.message(Command("schedule"))
-async def cmd_schedule(message: Message):
+async def cmd_schedule(
+    message: Message
+):
+
+    date_value = local_today()
+
     try:
-        data = await get_schedule(today())
+
+        data = await get_schedule(
+            date_value
+        )
 
         await message.answer_photo(
-            FSInputFile(data["image"]),
+            photo=FSInputFile(
+                data["image"]
+            ),
+
             caption=(
-                f"📅 {data['date'].strftime('%d.%m.%Y')}\n"
+                f"📅 "
+                f"{date_value.strftime('%d.%m.%Y')}\n"
                 f"🎓 {GROUP_NAME}"
             )
         )
 
     except Exception as e:
-        logger.exception("Ошибка /schedule")
+
+        logger.exception(
+            "Ошибка /schedule"
+        )
 
         await message.answer(
-            f"❌ Не удалось получить расписание.\n"
+            "❌ Не удалось получить расписание.\n\n"
             f"{e}"
         )
 
 
+# ============================================================
+# /scheduletext
+# ============================================================
+
 @dp.message(Command("scheduletext"))
-async def cmd_scheduletext(message: Message):
+async def cmd_scheduletext(
+    message: Message
+):
+
+    date_value = local_today()
+
     try:
-        data = await get_schedule(today())
+
+        data = await get_schedule(
+            date_value
+        )
 
         text = data["text"]
 
+        # Telegram ограничивает длину сообщения.
         if len(text) > 4000:
-            text = text[:3900] + "\n\n..."
-
-        await message.answer(text)
-
-    except Exception as e:
-        logger.exception("Ошибка /scheduletext")
+            text = (
+                text[:3900] +
+                "\n\n..."
+            )
 
         await message.answer(
-            f"❌ Не удалось получить расписание.\n"
+            text
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Ошибка /scheduletext"
+        )
+
+        await message.answer(
+            "❌ Не удалось получить расписание.\n\n"
             f"{e}"
         )
 
+
+# ============================================================
+# /tomorrow
+# ============================================================
 
 @dp.message(Command("tomorrow"))
-async def cmd_tomorrow(message: Message):
-    date_value = today() + timedelta(days=1)
+async def cmd_tomorrow(
+    message: Message
+):
+
+    date_value = (
+        local_today() +
+        timedelta(days=1)
+    )
 
     try:
-        data = await get_schedule(date_value)
+
+        data = await get_schedule(
+            date_value
+        )
 
         await message.answer_photo(
-            FSInputFile(data["image"]),
+            photo=FSInputFile(
+                data["image"]
+            ),
+
             caption=(
-                f"📅 {date_value.strftime('%d.%m.%Y')}\n"
+                f"📅 "
+                f"{date_value.strftime('%d.%m.%Y')}\n"
                 f"🎓 {GROUP_NAME}"
             )
         )
 
     except Exception as e:
-        logger.exception("Ошибка /tomorrow")
+
+        logger.exception(
+            "Ошибка /tomorrow"
+        )
 
         await message.answer(
-            f"❌ Не удалось получить расписание.\n"
+            "❌ Не удалось получить расписание.\n\n"
             f"{e}"
         )
 
+
+# ============================================================
+# /date
+# ============================================================
 
 @dp.message(Command("date"))
-async def cmd_date(message: Message):
-    parts = message.text.split(maxsplit=1)
+async def cmd_date(
+    message: Message
+):
+
+    parts = message.text.split(
+        maxsplit=1
+    )
 
     if len(parts) < 2:
+
         await message.answer(
-            "Использование:\n"
+            "Использование:\n\n"
             "/date 04.09.2026\n\n"
-            "Также можно:\n"
+            "или:\n"
             "/date 2026-09-04"
         )
+
         return
 
-    date_value = parse_user_date(parts[1])
+
+    date_value = parse_user_date(
+        parts[1]
+    )
 
     if date_value is None:
+
         await message.answer(
-            "❌ Неверная дата.\n"
-            "Пример: /date 04.09.2026"
+            "❌ Неверный формат даты.\n\n"
+            "Пример:\n"
+            "/date 04.09.2026"
         )
+
         return
 
+
     try:
-        data = await get_schedule(date_value)
+
+        data = await get_schedule(
+            date_value
+        )
 
         await message.answer_photo(
-            FSInputFile(data["image"]),
+            photo=FSInputFile(
+                data["image"]
+            ),
+
             caption=(
-                f"📅 {date_value.strftime('%d.%m.%Y')}\n"
+                f"📅 "
+                f"{date_value.strftime('%d.%m.%Y')}\n"
                 f"🎓 {GROUP_NAME}"
             )
         )
 
     except Exception as e:
-        logger.exception("Ошибка /date")
+
+        logger.exception(
+            "Ошибка /date"
+        )
 
         await message.answer(
-            f"❌ Не удалось получить расписание.\n"
+            "❌ Не удалось получить расписание.\n\n"
             f"{e}"
         )
 
 
+# ============================================================
+# /subscribe
+# ============================================================
+
 @dp.message(Command("subscribe"))
-async def cmd_subscribe(message: Message):
+async def cmd_subscribe(
+    message: Message
+):
+
     subscribers = load_subscribers()
 
-    subscribers.add(str(message.chat.id))
-
-    save_subscribers(subscribers)
-
-    await message.answer(
-        "✅ Подписка включена.\n"
-        "Я буду проверять изменения расписания."
+    subscribers.add(
+        str(message.chat.id)
     )
 
+    save_subscribers(
+        subscribers
+    )
+
+    await message.answer(
+        "🔔 Подписка включена.\n\n"
+        "Бот будет автоматически проверять "
+        "расписание на завтра."
+    )
+
+
+# ============================================================
+# /unsubscribe
+# ============================================================
 
 @dp.message(Command("unsubscribe"))
-async def cmd_unsubscribe(message: Message):
+async def cmd_unsubscribe(
+    message: Message
+):
+
     subscribers = load_subscribers()
 
-    subscribers.discard(str(message.chat.id))
+    subscribers.discard(
+        str(message.chat.id)
+    )
 
-    save_subscribers(subscribers)
+    save_subscribers(
+        subscribers
+    )
 
     await message.answer(
-        "✅ Подписка отключена."
+        "🔕 Подписка отключена."
     )
 
 
+# ============================================================
+# /checknow
+# ============================================================
+
 @dp.message(Command("checknow"))
-async def cmd_checknow(message: Message):
+async def cmd_checknow(
+    message: Message
+):
+
     try:
-        await check_schedule(
+
+        changed = await check_schedule(
             force=True
         )
 
-        await message.answer(
-            "✅ Проверка выполнена."
-        )
+        if changed:
+            await message.answer(
+                "✅ Проверка выполнена.\n"
+                "Обновление найдено."
+            )
+
+        else:
+            await message.answer(
+                "✅ Проверка выполнена.\n"
+                "Изменений нет."
+            )
 
     except Exception as e:
-        logger.exception("Ошибка /checknow")
+
+        logger.exception(
+            "Ошибка /checknow"
+        )
 
         await message.answer(
-            f"❌ Ошибка проверки:\n{e}"
+            "❌ Ошибка проверки:\n"
+            f"{e}"
         )
 
 
-# =========================
-# AUTO CHECK
-# =========================
+# ============================================================
+# ПОДПИСЧИКИ — ПРОВЕРКА РАСПИСАНИЯ
+# ============================================================
 
 def make_signature(data):
-    content = data["text"]
-
     return hashlib.sha256(
-        content.encode("utf-8")
+        data["text"].encode(
+            "utf-8"
+        )
     ).hexdigest()
 
 
-async def check_schedule(force=False):
+async def check_schedule(
+    force=False
+):
     """
-    Проверяем расписание на завтра.
-
-    Если оно изменилось — отправляем подписчикам.
+    Автоматически проверяем расписание
+    на следующий день.
     """
 
-    date_value = today() + timedelta(days=1)
+    date_value = (
+        local_today() +
+        timedelta(days=1)
+    )
 
-    data = await get_schedule(date_value)
+    data = await get_schedule(
+        date_value
+    )
 
-    signature = make_signature(data)
+    signature = make_signature(
+        data
+    )
 
     cache = load_json(
         CACHE_FILE,
         {}
     )
 
-    cache_key = date_value.isoformat()
+    cache_key = (
+        date_value.isoformat()
+    )
 
-    old_signature = cache.get(cache_key)
+    old_signature = cache.get(
+        cache_key
+    )
 
-    if not force and old_signature == signature:
+    changed = (
+        old_signature != signature
+    )
+
+    # Если ничего не изменилось
+    # и это не принудительная проверка.
+    if not force and not changed:
+
         logger.info(
             "Изменений нет: %s",
             date_value
         )
-        return
 
+        return False
+
+
+    # Сохраняем новый хэш.
     cache[cache_key] = signature
 
-    # Не раздуваем cache бесконечно.
+
+    # Храним только последние 30 дат.
     if len(cache) > 30:
-        keys = sorted(cache.keys())
+
+        keys = sorted(
+            cache.keys()
+        )
 
         for key in keys[:-30]:
             del cache[key]
+
 
     save_json(
         CACHE_FILE,
         cache
     )
 
+
     subscribers = load_subscribers()
 
     if not subscribers:
+
         logger.info(
             "Подписчиков нет."
         )
-        return
+
+        return changed
+
+
+    # При force=True не рассылаем сообщение всем.
+    # Это предотвращает случайный спам через /checknow.
+    if force:
+
+        return changed
+
 
     caption = (
         "🔔 Обновление расписания!\n\n"
-        f"📅 {date_value.strftime('%d.%m.%Y')}\n"
+        f"📅 "
+        f"{date_value.strftime('%d.%m.%Y')}\n"
         f"🎓 {GROUP_NAME}"
     )
 
+
     for chat_id in subscribers:
+
         try:
+
             await bot.send_photo(
                 chat_id=int(chat_id),
                 photo=FSInputFile(
@@ -679,23 +1309,38 @@ async def check_schedule(force=False):
                 caption=caption
             )
 
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(
+                0.05
+            )
 
         except Exception:
+
             logger.exception(
-                "Не удалось отправить %s",
+                "Ошибка отправки пользователю %s",
                 chat_id
             )
 
 
+    return True
+
+
+# ============================================================
+# АВТОМАТИЧЕСКИЙ ЦИКЛ
+# ============================================================
+
 async def scheduler_loop():
+
+    # Небольшая задержка после запуска.
     await asyncio.sleep(10)
 
     while True:
+
         try:
+
             await check_schedule()
 
         except Exception:
+
             logger.exception(
                 "Ошибка автоматической проверки"
             )
@@ -705,13 +1350,18 @@ async def scheduler_loop():
         )
 
 
-# =========================
+# ============================================================
 # MAIN
-# =========================
+# ============================================================
 
 async def main():
+
     logger.info(
-        "Бот запускается..."
+        "================================"
+    )
+
+    logger.info(
+        "Бот запускается"
     )
 
     logger.info(
@@ -720,8 +1370,15 @@ async def main():
     )
 
     logger.info(
-        "URL: %s/<YYYY-MM-DD>",
+        "Базовый URL: %s",
         SCHEDULE_URL
+    )
+
+    logger.info(
+        "Пример URL: %s",
+        build_schedule_url(
+            local_today()
+        )
     )
 
     logger.info(
@@ -730,16 +1387,44 @@ async def main():
     )
 
     logger.info(
-        "Интервал проверки: %s сек.",
+        "Интервал: %s секунд",
         CHECK_INTERVAL
     )
 
+    logger.info(
+        "SSL verification: OFF для сайта расписания"
+    )
+
+    logger.info(
+        "================================"
+    )
+
+
+    # Запускаем автоматическую проверку.
     asyncio.create_task(
         scheduler_loop()
     )
 
-    await dp.start_polling(bot)
 
+    # Запускаем Telegram.
+    await dp.start_polling(
+        bot
+    )
+
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
-    asyncio.run(main())
+
+    try:
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        logger.info(
+            "Бот остановлен."
+        )
