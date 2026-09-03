@@ -736,13 +736,20 @@ def find_font(bold=False):
     )
 
 
-def get_font(size, bold=False):
-    path = find_font(bold)
+def get_font(size: int, bold: bool = False):
+    base_dir = Path(__file__).resolve().parent
+    fonts_dir = base_dir / "fonts"
 
-    return ImageFont.truetype(
-        path,
-        size=size
-    )
+    font_name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    font_path = fonts_dir / font_name
+
+    if not font_path.exists():
+        raise RuntimeError(
+            f"Шрифт не найден: {font_path}. "
+            f"Положи {font_name} в папку fonts/"
+        )
+
+    return ImageFont.truetype(str(font_path), size)
 
 
 # ============================================================
