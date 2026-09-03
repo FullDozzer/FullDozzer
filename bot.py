@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, UnicodeDammit
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
@@ -140,7 +140,7 @@ async def fetch_html(date_value):
 
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) "
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 "
             "(KHTML, like Gecko) "
             "Chrome/120.0 Safari/537.36"
@@ -150,6 +150,7 @@ async def fetch_html(date_value):
             "application/xml;q=0.9,*/*;q=0.8"
         ),
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "Connection": "keep-alive",
     }
 
     timeout = aiohttp.ClientTimeout(total=30)
@@ -168,15 +169,32 @@ async def fetch_html(date_value):
 
             response.raise_for_status()
 
-            html = await response.text(
-                encoding="utf-8",
-                errors="ignore"
-            )
+            raw = await response.read()
 
             logger.info(
                 "Получено %s байт, HTTP %s",
-                len(html),
+                len(raw),
                 response.status
+            )
+
+            # Пытаемся определить реальную кодировку страницы.
+            dammit = UnicodeDammit(
+                raw,
+                ["utf-8", "windows-1251", "cp1251"]
+            )
+
+            html = dammit.unicode_markup
+
+            if html is None:
+                # Последний резервный вариант.
+                html = raw.decode(
+                    "windows-1251",
+                    errors="replace"
+                )
+
+            logger.info(
+                "Кодировка страницы: %s",
+                dammit.original_encoding
             )
 
             return html
@@ -204,43 +222,67 @@ def parse_schedule(html):
 
     rows = []
 
-    # Сначала пробуем таблицы.
+    # 1. Сначала таблицы
     for table in soup.find_all("table"):
         for tr in table.find_all("tr"):
-            cells = [
-                clean_text(cell.get_text(" ", strip=True))
-                for cell in tr.find_all(["th", "td"])
-            ]
+            cells = []
 
-            cells = [
-                x for x in cells
-                if x
-            ]
+            for cell in tr.find_all(["th", "td"], recursive=False):
+                text = clean_text(
+                    cell.get_text(" ", strip=True)
+                )
+
+                if text:
+                    cells.append(text)
 
             if cells:
                 rows.append(cells)
 
-    # Если таблиц нет — пробуем блоки.
-    if not rows:
-        for element in soup.find_all(
-            ["div", "li", "article", "section"]
+    if rows:
+        return remove_duplicate_rows(rows)
+
+    # 2. Если таблиц нет — ищем крупные блоки расписания.
+    # Не берём все вложенные div подряд.
+    candidates = []
+
+    for element in soup.find_all(
+        ["article", "section", "li"]
+    ):
+        text = clean_text(
+            element.get_text(" ", strip=True)
+        )
+
+        if not text:
+            continue
+
+        if TIME_RE.search(text):
+            candidates.append(text)
+
+    # Убираем вложенные дубликаты.
+    for text in candidates:
+        if any(
+            text != other and text in other
+            for other in candidates
         ):
-            text = clean_text(
-                element.get_text(" ", strip=True)
-            )
+            continue
 
-            if not text:
-                continue
+        rows.append([text])
 
-            if TIME_RE.search(text):
-                rows.append([text])
+    return remove_duplicate_rows(rows)
 
-    # Удаляем дубликаты.
+
+def remove_duplicate_rows(rows):
     result = []
     seen = set()
 
     for row in rows:
-        key = " | ".join(row)
+        key = " | ".join(
+            clean_text(str(x))
+            for x in row
+        )
+
+        if not key:
+            continue
 
         if key in seen:
             continue
