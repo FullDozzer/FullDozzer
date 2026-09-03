@@ -5,13 +5,14 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+# Cyrillic fonts + certificate support + fontconfig
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
         fonts-dejavu \
         fontconfig \
-        ca-certificates && \
-    fc-cache -f -v && \
-    rm -rf /var/lib/apt/lists/*
+        ca-certificates \
+    && fc-cache -f -v \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 
