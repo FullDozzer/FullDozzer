@@ -31,7 +31,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
     CallbackQuery,
+    ChatMemberUpdated,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -168,8 +172,105 @@ def get_today() -> date:
     return datetime.now(TZ).date()
 
 
+def is_day_off(value: date) -> bool:
+    """Воскресенье — выходной, расписания в этот день не бывает."""
+    return value.weekday() == 6
+
+
+def next_study_day(value: date) -> date:
+    """Ближайший учебный день, начиная со следующего за value.
+
+    Если следующий день — воскресенье, берём понедельник.
+    """
+    candidate = value + timedelta(days=1)
+    while is_day_off(candidate):
+        candidate += timedelta(days=1)
+    return candidate
+
+
 def get_tomorrow() -> date:
-    return get_today() + timedelta(days=1)
+    """«Завтра» с пропуском воскресенья (тогда это понедельник)."""
+    return next_study_day(get_today())
+
+
+MONTH_NAMES = {
+    "январ": 1, "феврал": 2, "март": 3, "апрел": 4,
+    "ма": 5, "июн": 6, "июл": 7, "август": 8,
+    "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
+}
+
+# Поддерживаемые числовые форматы даты.
+_DATE_PATTERNS = (
+    "%Y-%m-%d",
+    "%d.%m.%Y",
+    "%d.%m.%y",
+    "%d/%m/%Y",
+    "%d-%m-%Y",
+    "%d.%m",
+    "%d/%m",
+)
+
+
+def parse_user_date(raw: str):
+    """Разбирает дату, введённую пользователем. Возвращает date или None.
+
+    Понимает: 2026-09-04, 04.09.2026, 4.9, «сегодня», «завтра»,
+    «вчера», «4 сентября», «4 сентября 2026».
+    """
+    text = clean_text(raw).lower().replace(",", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if not text:
+        return None
+
+    today = get_today()
+
+    # Ключевые слова.
+    if text in ("сегодня", "today"):
+        return today
+    if text in ("завтра", "tomorrow"):
+        return get_tomorrow()
+    if text in ("послезавтра",):
+        return today + timedelta(days=2)
+    if text in ("вчера", "yesterday"):
+        return today - timedelta(days=1)
+
+    # День недели: «понедельник» -> ближайший такой день (включая сегодня).
+    for index, name in enumerate(WEEKDAYS):
+        if text == name.lower():
+            delta = (index - today.weekday()) % 7
+            return today + timedelta(days=delta)
+
+    # Числовые форматы.
+    for pattern in _DATE_PATTERNS:
+        try:
+            parsed = datetime.strptime(text, pattern)
+        except ValueError:
+            continue
+        if "%Y" not in pattern and "%y" not in pattern:
+            parsed = parsed.replace(year=today.year)
+        return parsed.date()
+
+    # Текстовый месяц: «4 сентября» / «4 сентября 2026».
+    match = re.fullmatch(r"(\d{1,2}) ([а-яё]+)(?: (\d{4}))?", text)
+    if match:
+        day_num = int(match.group(1))
+        month_word = match.group(2)
+        year = int(match.group(3)) if match.group(3) else today.year
+
+        month = None
+        for stem, number in MONTH_NAMES.items():
+            if month_word.startswith(stem):
+                month = number
+                break
+
+        if month is not None:
+            try:
+                return date(year, month, day_num)
+            except ValueError:
+                return None
+
+    return None
 
 
 def format_date_full(value: date) -> str:
@@ -475,6 +576,12 @@ async def get_schedule_with_fallback(target: date):
     3. Нет занятий -> взять сегодняшнее; если есть — вернуть его (fallback=True).
     4. И сегодня пусто -> вернуть пустое расписание.
     """
+    if is_day_off(target):
+        # В воскресенье занятий не бывает — сразу показываем сегодняшний день.
+        today_schedule = await get_schedule(get_today())
+        today_schedule.fallback = True
+        return today_schedule
+
     schedule = await get_schedule(target)
 
     if schedule.lessons:
@@ -532,6 +639,23 @@ def init_db() -> None:
                 )
                 """
             )
+
+            # Миграция: поддержка групповых чатов.
+            existing = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(subscribers)")
+            }
+            if "chat_type" not in existing:
+                conn.execute(
+                    "ALTER TABLE subscribers ADD COLUMN chat_type TEXT"
+                    " NOT NULL DEFAULT 'private'"
+                )
+            if "title" not in existing:
+                conn.execute(
+                    "ALTER TABLE subscribers ADD COLUMN title TEXT"
+                    " NOT NULL DEFAULT ''"
+                )
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schedule_state (
@@ -546,17 +670,31 @@ def init_db() -> None:
         logger.exception("Ошибка инициализации SQLite")
 
 
-def subscribe_user(user_id: int) -> bool:
-    """Добавляет подписчика. True если добавлен, False если уже был."""
+def subscribe_user(
+    user_id: int, chat_type: str = "private", title: str = ""
+) -> bool:
+    """Добавляет подписчика (ЛС или групповой чат).
+
+    True если добавлен, False если уже был.
+    """
     created = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
     try:
         with db_connect() as conn:
             cur = conn.execute(
-                "INSERT OR IGNORE INTO subscribers (user_id, created_at)"
-                " VALUES (?, ?)",
-                (user_id, created),
+                "INSERT OR IGNORE INTO subscribers"
+                " (user_id, created_at, chat_type, title)"
+                " VALUES (?, ?, ?, ?)",
+                (user_id, created, chat_type, title or ""),
             )
-            return cur.rowcount > 0
+            if cur.rowcount == 0:
+                # Обновляем название чата, оно могло измениться.
+                conn.execute(
+                    "UPDATE subscribers SET chat_type = ?, title = ?"
+                    " WHERE user_id = ?",
+                    (chat_type, title or "", user_id),
+                )
+                return False
+            return True
     except Exception:
         logger.exception("Ошибка SQLite (subscribe)")
         return False
@@ -950,6 +1088,7 @@ def main_keyboard(is_subscribed: bool) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="ℹ️ Статус", callback_data="status"),
             ],
             [
+                InlineKeyboardButton(text="🔎 По дате", callback_data="date"),
                 InlineKeyboardButton(text="🆘 Помощь", callback_data="help"),
             ],
         ]
@@ -1006,7 +1145,20 @@ async def _send_text(destination, text: str) -> None:
 
 async def _handle_today(destination):
     try:
-        schedule = await get_schedule(get_today())
+        today = get_today()
+
+        if is_day_off(today):
+            await _send_text(
+                destination,
+                f"📅 <b>Расписание на сегодня</b>\n\n"
+                f"Группа: <b>{GROUP_NAME}</b>\n"
+                f"{format_date_full(today)}\n\n"
+                "☕ Воскресенье — занятий нет.\n"
+                "Расписание на понедельник: /tomorrow",
+            )
+            return
+
+        schedule = await get_schedule(today)
         heading = f"📅 <b>Расписание на сегодня</b>\n\n"
         if not schedule.lessons:
             await _send_text(
@@ -1033,16 +1185,21 @@ async def _handle_tomorrow(destination):
         schedule = await get_schedule_with_fallback(target)
 
         if schedule.fallback:
+            label = (
+                "на понедельник"
+                if target.weekday() == 0 and get_today().weekday() == 5
+                else "на завтра"
+            )
             await _send_text(
                 destination,
-                f"ℹ️ На завтра ({format_date_full(target)}) расписание "
+                f"ℹ️ Расписание {label} ({format_date_full(target)}) "
                 "не опубликовано — показываю расписание на сегодня.",
             )
 
         if not schedule.lessons:
             await _send_text(
                 destination,
-                f"➡️ <b>Расписание на завтра</b>\n\n"
+                f"➡️ <b>Расписание: {format_date_header(target)}</b>\n\n"
                 f"Группа: <b>{GROUP_NAME}</b>\n"
                 f"{format_date_full(target)}\n\n☕ Занятий нет.",
             )
@@ -1060,19 +1217,56 @@ async def _handle_tomorrow(destination):
         logger.exception("Ошибка /tomorrow")
 
 
-async def _status_text(user_id: int) -> str:
-    created = subscriber_info(user_id)
+async def _handle_date(destination, target: date):
+    """Показывает расписание на конкретную дату (без подстановки «сегодня»)."""
+    try:
+        if is_day_off(target):
+            await _send_text(
+                destination,
+                f"📅 <b>{format_date_header(target)}</b>\n\n"
+                f"Группа: <b>{GROUP_NAME}</b>\n"
+                f"{format_date_full(target)}\n\n"
+                "☕ Воскресенье — занятий нет.",
+            )
+            return
+
+        schedule = await get_schedule(target)
+
+        if not schedule.lessons:
+            await _send_text(
+                destination,
+                f"📅 <b>{format_date_header(target)}</b>\n\n"
+                f"Группа: <b>{GROUP_NAME}</b>\n"
+                f"{format_date_full(target)}\n\n"
+                "☕ Занятий нет или расписание ещё не опубликовано.",
+            )
+            return
+
+        ok = await _send_photo(destination, schedule)
+        if not ok:
+            await _send_text(destination, "Не удалось отправить расписание.")
+    except ScheduleUnavailable:
+        await _send_text(
+            destination,
+            "😔 Не удалось получить расписание. Сайт недоступен, попробуй позже.",
+        )
+    except Exception:
+        logger.exception("Ошибка /date")
+
+
+async def _status_text(chat_id: int) -> str:
+    created = subscriber_info(chat_id)
     total = len(load_subscribers())
     lines = [
         f"📚 <b>{GROUP_NAME}</b>",
         "—" * 18,
     ]
     if created:
-        lines.append("🔔 Вы подписаны на уведомления.")
+        lines.append("🔔 Этот чат подписан на уведомления.")
         lines.append(f"Подписка оформлена: <i>{created}</i>")
     else:
-        lines.append("🔕 Вы не подписаны на уведомления.")
-    lines.append(f"Всего подписчиков: <b>{total}</b>")
+        lines.append("🔕 Этот чат не подписан на уведомления.")
+    lines.append(f"Всего подписок: <b>{total}</b>")
     lines.append(f"Проверка изменений каждые {CHECK_INTERVAL // 60} мин.")
     return "\n".join(lines)
 
@@ -1088,23 +1282,45 @@ def _is_subscribed(user_id: int) -> bool:
     return subscriber_info(user_id) is not None
 
 
+async def _is_group_admin(message: Message) -> bool:
+    """Проверяет, что автор сообщения — админ/создатель группы."""
+    if message.chat.type not in ("group", "supergroup"):
+        return True
+
+    if message.from_user is None:
+        # Анонимный админ / сообщение от имени канала.
+        return True
+
+    try:
+        member = await message.bot.get_chat_member(
+            message.chat.id, message.from_user.id
+        )
+        return member.status in ("creator", "administrator")
+    except Exception:
+        logger.exception("Не удалось проверить права администратора")
+        return False
+
+
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
-    user_id = message.from_user.id
+    chat_id = message.chat.id
     text = (
         f"👋 Привет!\n\n"
         f"Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
         f"Доступные действия:\n"
         f"📅 <b>Сегодня</b> — /schedule\n"
         f"➡️ <b>Завтра</b> — /tomorrow\n"
+        f"🔎 <b>Поиск по дате</b> — /date 04.09.2026\n"
         f"🔔 <b>Уведомления</b> — /subscribe\n"
         f"🔕 <b>Отключить уведомления</b> — /unsubscribe\n"
         f"ℹ️ <b>Статус</b> — /status\n"
         f"🆘 <b>Помощь</b> — /help\n\n"
         f"🔔 Подписчики автоматически получают обновлённое "
-        f"расписание при его изменении."
+        f"расписание при его изменении.\n"
+        f"👥 Меня можно добавить в группу — админ включает "
+        f"рассылку в чат командой /subscribe."
     )
-    await message.answer(text, reply_markup=main_keyboard(_is_subscribed(user_id)))
+    await message.answer(text, reply_markup=main_keyboard(_is_subscribed(chat_id)))
 
 
 @dp.message(Command("schedule"))
@@ -1117,32 +1333,118 @@ async def cmd_tomorrow(message: Message):
     await _handle_tomorrow(message)
 
 
+@dp.message(Command("date"))
+async def cmd_date(message: Message):
+    """Поиск расписания по дате: /date 04.09.2026"""
+    parts = (message.text or "").split(maxsplit=1)
+    argument = parts[1] if len(parts) > 1 else ""
+
+    if not argument.strip():
+        await message.answer(
+            "🔎 <b>Поиск расписания по дате</b>\n\n"
+            "Использование: <code>/date ДАТА</code>\n\n"
+            "Примеры:\n"
+            "• <code>/date 04.09.2026</code>\n"
+            "• <code>/date 2026-09-04</code>\n"
+            "• <code>/date 4 сентября</code>\n"
+            "• <code>/date понедельник</code>\n"
+            "• <code>/date завтра</code>"
+        )
+        return
+
+    target = parse_user_date(argument)
+
+    if target is None:
+        await message.answer(
+            "❌ Не понял дату.\n\n"
+            "Попробуй так: <code>/date 04.09.2026</code>, "
+            "<code>/date 4 сентября</code> или <code>/date завтра</code>."
+        )
+        return
+
+    await _handle_date(message, target)
+
+
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(message: Message):
-    user_id = message.from_user.id
-    if subscribe_user(user_id):
+    chat = message.chat
+    is_group = chat.type in ("group", "supergroup")
+
+    if is_group and not await _is_group_admin(message):
         await message.answer(
-            "🔔 <b>Уведомления включены.</b>\n\n"
-            "Я буду автоматически проверять изменения расписания "
-            f"и присылать новые картинки.\n\n"
+            "⛔ Подписывать группу на расписание могут только администраторы чата."
+        )
+        return
+
+    title = chat.title or chat.full_name or ""
+
+    if subscribe_user(chat.id, chat_type=chat.type, title=title):
+        where = "Этот чат" if is_group else "Вы"
+        await message.answer(
+            f"🔔 <b>Уведомления включены.</b>\n\n"
+            f"{where} будет получать обновлённое расписание "
+            f"при его изменении.\n\n"
             f"Отключить: /unsubscribe"
         )
     else:
-        await message.answer("🔔 Вы уже подписаны на уведомления.")
+        await message.answer(
+            "🔔 Этот чат уже подписан на уведомления."
+            if is_group
+            else "🔔 Вы уже подписаны на уведомления."
+        )
 
 
 @dp.message(Command("unsubscribe"))
 async def cmd_unsubscribe(message: Message):
-    user_id = message.from_user.id
-    if unsubscribe_user(user_id):
+    chat = message.chat
+    is_group = chat.type in ("group", "supergroup")
+
+    if is_group and not await _is_group_admin(message):
+        await message.answer(
+            "⛔ Отписывать группу могут только администраторы чата."
+        )
+        return
+
+    if unsubscribe_user(chat.id):
         await message.answer("🔕 <b>Уведомления отключены.</b>")
     else:
-        await message.answer("Вы не были подписаны на уведомления.")
+        await message.answer(
+            "Этот чат не был подписан на уведомления."
+            if is_group
+            else "Вы не были подписаны на уведомления."
+        )
 
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
-    await message.answer(await _status_text(message.from_user.id))
+    await message.answer(await _status_text(message.chat.id))
+
+
+@dp.my_chat_member()
+async def on_chat_member_update(event: ChatMemberUpdated):
+    """Приветствие при добавлении в группу и автоочистка при удалении."""
+    chat = event.chat
+
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    new_status = event.new_chat_member.status
+
+    if new_status in ("member", "administrator"):
+        await event.bot.send_message(
+            chat.id,
+            f"👋 Привет! Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
+            f"• /schedule — на сегодня\n"
+            f"• /tomorrow — на завтра\n"
+            f"• /date ДАТА — поиск по дате\n"
+            f"• /subscribe — присылать расписание в этот чат "
+            f"при изменениях\n"
+            f"• /unsubscribe — отключить\n\n"
+            f"ℹ️ Подписать чат может администратор командой /subscribe.",
+        )
+    elif new_status in ("left", "kicked"):
+        unsubscribe_user(chat.id)
+        logger.info("Бот удалён из чата %s, подписка снята.", chat.id)
 
 
 # ============================================================
@@ -1164,29 +1466,43 @@ async def cb_tomorrow(callback: CallbackQuery):
 @dp.callback_query(F.data == "subscribe")
 async def cb_subscribe(callback: CallbackQuery):
     await callback.answer()
-    user_id = callback.from_user.id
-    if subscribe_user(user_id):
-        await callback.message.answer(
-            "🔔 <b>Уведомления включены.</b>"
-        )
+    chat = callback.message.chat
+    if subscribe_user(
+        chat.id, chat_type=chat.type, title=chat.title or ""
+    ):
+        await callback.message.answer("🔔 <b>Уведомления включены.</b>")
     else:
-        await callback.message.answer("🔔 Вы уже подписаны.")
+        await callback.message.answer("🔔 Этот чат уже подписан.")
 
 
 @dp.callback_query(F.data == "unsubscribe")
 async def cb_unsubscribe(callback: CallbackQuery):
     await callback.answer()
-    user_id = callback.from_user.id
-    if unsubscribe_user(user_id):
+    if unsubscribe_user(callback.message.chat.id):
         await callback.message.answer("🔕 <b>Уведомления отключены.</b>")
     else:
-        await callback.message.answer("Вы не были подписаны.")
+        await callback.message.answer("Этот чат не был подписан.")
 
 
 @dp.callback_query(F.data == "status")
 async def cb_status(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.answer(await _status_text(callback.from_user.id))
+    await callback.message.answer(await _status_text(callback.message.chat.id))
+
+
+@dp.callback_query(F.data == "date")
+async def cb_date(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "🔎 <b>Поиск расписания по дате</b>\n\n"
+        "Отправь команду <code>/date ДАТА</code>.\n\n"
+        "Примеры:\n"
+        "• <code>/date 04.09.2026</code>\n"
+        "• <code>/date 2026-09-04</code>\n"
+        "• <code>/date 4 сентября</code>\n"
+        "• <code>/date понедельник</code>\n"
+        "• <code>/date завтра</code>"
+    )
 
 
 @dp.callback_query(F.data == "help")
@@ -1197,10 +1513,14 @@ async def cb_help(callback: CallbackQuery):
         f"Я показываю расписание группы <b>{GROUP_NAME}</b> "
         f"на сегодня и на завтра.\n\n"
         f"• /schedule — сегодня\n"
-        f"• /tomorrow — завтра (если пусто — сегодня)\n"
+        f"• /tomorrow — завтра (воскресенье пропускается)\n"
+        f"• /date ДАТА — расписание на любую дату\n"
         f"• /subscribe — уведомления об изменениях\n"
         f"• /unsubscribe — отключить уведомления\n"
-        f"• /status — ваш статус"
+        f"• /status — статус чата\n\n"
+        f"Примеры /date: <code>04.09.2026</code>, "
+        f"<code>2026-09-04</code>, <code>4 сентября</code>, "
+        f"<code>понедельник</code>."
     )
 
 
@@ -1231,9 +1551,25 @@ async def _notify_changed(bot: Bot, schedule: Schedule, day: date) -> None:
                 )
                 await asyncio.sleep(0.08)
             except Exception as error:
-                logger.warning(
-                    "Не удалось уведомить %s: %s", user_id, error
-                )
+                text = str(error).lower()
+                if any(
+                    marker in text
+                    for marker in (
+                        "bot was blocked",
+                        "bot was kicked",
+                        "chat not found",
+                        "user is deactivated",
+                        "group chat was upgraded",
+                    )
+                ):
+                    unsubscribe_user(user_id)
+                    logger.info(
+                        "Чат %s недоступен — подписка снята.", user_id
+                    )
+                else:
+                    logger.warning(
+                        "Не удалось уведомить %s: %s", user_id, error
+                    )
     finally:
         try:
             image_path.unlink(missing_ok=True)
@@ -1243,6 +1579,10 @@ async def _notify_changed(bot: Bot, schedule: Schedule, day: date) -> None:
 
 async def _check_date(bot: Bot, day: date) -> None:
     date_key = day.isoformat()
+
+    if is_day_off(day):
+        logger.info("Проверка %s: воскресенье, пропускаем.", date_key)
+        return
 
     try:
         schedule = await get_schedule(day)
@@ -1290,9 +1630,9 @@ async def schedule_monitor(bot: Bot) -> None:
 
     while True:
         try:
-            # Проверяем сегодня
+            # Проверяем сегодня (воскресенье пропускается внутри)
             await _check_date(bot, get_today())
-            # Проверяем завтра (появление нового расписания = изменение)
+            # Проверяем следующий учебный день: в субботу это понедельник.
             await _check_date(bot, get_tomorrow())
         except Exception:
             logger.exception("Ошибка в цикле мониторинга")
@@ -1303,6 +1643,31 @@ async def schedule_monitor(bot: Bot) -> None:
 # ============================================================
 # MAIN
 # ============================================================
+
+COMMANDS = [
+    BotCommand(command="schedule", description="Расписание на сегодня"),
+    BotCommand(command="tomorrow", description="Расписание на завтра"),
+    BotCommand(command="date", description="Поиск расписания по дате"),
+    BotCommand(command="subscribe", description="Включить уведомления"),
+    BotCommand(command="unsubscribe", description="Отключить уведомления"),
+    BotCommand(command="status", description="Статус подписки"),
+    BotCommand(command="help", description="Помощь"),
+]
+
+
+async def _setup_commands(bot: Bot) -> None:
+    """Регистрирует меню команд в ЛС и в группах."""
+    try:
+        await bot.set_my_commands(
+            COMMANDS, scope=BotCommandScopeAllPrivateChats()
+        )
+        await bot.set_my_commands(
+            COMMANDS, scope=BotCommandScopeAllGroupChats()
+        )
+        logger.info("Меню команд зарегистрировано.")
+    except Exception:
+        logger.exception("Не удалось зарегистрировать меню команд")
+
 
 async def main() -> None:
     logger.info("=" * 60)
@@ -1331,6 +1696,8 @@ async def main() -> None:
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+
+    await _setup_commands(bot)
 
     monitor_task = asyncio.create_task(schedule_monitor(bot))
 
