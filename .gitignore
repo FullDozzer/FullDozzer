@@ -1,0 +1,16 @@
+# Секреты
+.env
+
+# Данные, создаваемые ботом (SQLite, временные PNG)
+data/*
+!data/.gitkeep
+
+# Локальные превью сгенерированных картинок (не часть проекта)
+_preview/
+preview_sample.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
