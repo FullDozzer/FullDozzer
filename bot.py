@@ -1154,7 +1154,7 @@ async def _handle_today(destination):
                 f"Группа: <b>{GROUP_NAME}</b>\n"
                 f"{format_date_full(today)}\n\n"
                 "☕ Воскресенье — занятий нет.\n"
-                "Расписание на понедельник: /tomorrow",
+                "Расписание на понедельник: /schedule",
             )
             return
 
@@ -1179,7 +1179,8 @@ async def _handle_today(destination):
         logger.exception("Ошибка /schedule")
 
 
-async def _handle_tomorrow(destination):
+async def _handle_schedule(destination):
+    """Расписание по умолчанию: на завтра, а если его нет — на сегодня."""
     try:
         target = get_tomorrow()
         schedule = await get_schedule_with_fallback(target)
@@ -1214,7 +1215,7 @@ async def _handle_tomorrow(destination):
             "😔 Не удалось получить расписание. Сайт недоступен, попробуй позже.",
         )
     except Exception:
-        logger.exception("Ошибка /tomorrow")
+        logger.exception("Ошибка /schedule")
 
 
 async def _handle_date(destination, target: date):
@@ -1308,8 +1309,7 @@ async def cmd_start(message: Message):
         f"👋 Привет!\n\n"
         f"Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
         f"Доступные действия:\n"
-        f"📅 <b>Сегодня</b> — /schedule\n"
-        f"➡️ <b>Завтра</b> — /tomorrow\n"
+        f"📅 <b>Расписание</b> (завтра, если нет — сегодня) — /schedule\n"
         f"🔎 <b>Поиск по дате</b> — /date 04.09.2026\n"
         f"🔔 <b>Уведомления</b> — /subscribe\n"
         f"🔕 <b>Отключить уведомления</b> — /unsubscribe\n"
@@ -1325,12 +1325,7 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("schedule"))
 async def cmd_schedule(message: Message):
-    await _handle_today(message)
-
-
-@dp.message(Command("tomorrow"))
-async def cmd_tomorrow(message: Message):
-    await _handle_tomorrow(message)
+    await _handle_schedule(message)
 
 
 @dp.message(Command("date"))
@@ -1434,8 +1429,7 @@ async def on_chat_member_update(event: ChatMemberUpdated):
         await event.bot.send_message(
             chat.id,
             f"👋 Привет! Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
-            f"• /schedule — на сегодня\n"
-            f"• /tomorrow — на завтра\n"
+            f"• /schedule — на завтра (если его нет — на сегодня)\n"
             f"• /date ДАТА — поиск по дате\n"
             f"• /subscribe — присылать расписание в этот чат "
             f"при изменениях\n"
@@ -1460,7 +1454,7 @@ async def cb_today(callback: CallbackQuery):
 @dp.callback_query(F.data == "tomorrow")
 async def cb_tomorrow(callback: CallbackQuery):
     await callback.answer()
-    await _handle_tomorrow(callback)
+    await _handle_schedule(callback)
 
 
 @dp.callback_query(F.data == "subscribe")
@@ -1512,8 +1506,8 @@ async def cb_help(callback: CallbackQuery):
         f"🆘 <b>Помощь</b>\n\n"
         f"Я показываю расписание группы <b>{GROUP_NAME}</b> "
         f"на сегодня и на завтра.\n\n"
-        f"• /schedule — сегодня\n"
-        f"• /tomorrow — завтра (воскресенье пропускается)\n"
+        f"• /schedule — завтра, если его нет — сегодня "
+        f"(воскресенье пропускается)\n"
         f"• /date ДАТА — расписание на любую дату\n"
         f"• /subscribe — уведомления об изменениях\n"
         f"• /unsubscribe — отключить уведомления\n"
@@ -1645,8 +1639,10 @@ async def schedule_monitor(bot: Bot) -> None:
 # ============================================================
 
 COMMANDS = [
-    BotCommand(command="schedule", description="Расписание на сегодня"),
-    BotCommand(command="tomorrow", description="Расписание на завтра"),
+    BotCommand(
+        command="schedule",
+        description="Расписание на завтра (если нет — на сегодня)",
+    ),
     BotCommand(command="date", description="Поиск расписания по дате"),
     BotCommand(command="subscribe", description="Включить уведомления"),
     BotCommand(command="unsubscribe", description="Отключить уведомления"),
