@@ -1073,11 +1073,13 @@ def render_schedule_image(schedule: Schedule) -> Path:
 # ============================================================
 
 def main_keyboard(is_subscribed: bool) -> InlineKeyboardMarkup:
+    """Одна кнопка «Расписание»: завтра, а если его нет — сегодня."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="📅 Сегодня", callback_data="today"),
-                InlineKeyboardButton(text="➡️ Завтра", callback_data="tomorrow"),
+                InlineKeyboardButton(
+                    text="📅 Расписание", callback_data="schedule"
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -1198,11 +1200,13 @@ async def _handle_schedule(destination):
             )
 
         if not schedule.lessons:
+            day = schedule.date
             await _send_text(
                 destination,
-                f"➡️ <b>Расписание: {format_date_header(target)}</b>\n\n"
+                f"📅 <b>Расписание: {format_date_header(day)}</b>\n\n"
                 f"Группа: <b>{GROUP_NAME}</b>\n"
-                f"{format_date_full(target)}\n\n☕ Занятий нет.",
+                f"{format_date_full(day)}\n\n"
+                "☕ Занятий нет или расписание ещё не опубликовано.",
             )
             return
 
@@ -1309,8 +1313,9 @@ async def cmd_start(message: Message):
         f"👋 Привет!\n\n"
         f"Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
         f"Доступные действия:\n"
-        f"📅 <b>Расписание</b> (завтра, если нет — сегодня) — /schedule\n"
-        f"🔎 <b>Поиск по дате</b> — /date 04.09.2026\n"
+        f"📅 <b>Расписание</b> — кнопка ниже или /schedule\n"
+        f"    (по умолчанию на завтра, если его нет — на сегодня)\n"
+        f"🔎 <b>Поиск по дате</b> — /date 04.09.2026 или /date сегодня\n"
         f"🔔 <b>Уведомления</b> — /subscribe\n"
         f"🔕 <b>Отключить уведомления</b> — /unsubscribe\n"
         f"ℹ️ <b>Статус</b> — /status\n"
@@ -1430,7 +1435,7 @@ async def on_chat_member_update(event: ChatMemberUpdated):
             chat.id,
             f"👋 Привет! Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
             f"• /schedule — на завтра (если его нет — на сегодня)\n"
-            f"• /date ДАТА — поиск по дате\n"
+            f"• /date ДАТА — поиск по дате (например /date сегодня)\n"
             f"• /subscribe — присылать расписание в этот чат "
             f"при изменениях\n"
             f"• /unsubscribe — отключить\n\n"
@@ -1445,16 +1450,26 @@ async def on_chat_member_update(event: ChatMemberUpdated):
 # INLINE-КНОПКИ
 # ============================================================
 
-@dp.callback_query(F.data == "today")
-async def cb_today(callback: CallbackQuery):
-    await callback.answer()
-    await _handle_today(callback)
-
-
-@dp.callback_query(F.data == "tomorrow")
-async def cb_tomorrow(callback: CallbackQuery):
+@dp.callback_query(F.data == "schedule")
+async def cb_schedule(callback: CallbackQuery):
+    """Кнопка «Расписание» = команда /schedule."""
     await callback.answer()
     await _handle_schedule(callback)
+
+
+@dp.callback_query(F.data.in_(["today", "tomorrow"]))
+async def cb_legacy_days(callback: CallbackQuery):
+    """Старые кнопки «Сегодня»/«Завтра» из ранее отправленных сообщений.
+
+    В клавиатуре осталась одна кнопка «Расписание», но у пользователей
+    в истории ещё лежат старые сообщения — обрабатываем их, чтобы
+    нажатие не «зависало».
+    """
+    await callback.answer()
+    if callback.data == "today":
+        await _handle_today(callback)
+    else:
+        await _handle_schedule(callback)
 
 
 @dp.callback_query(F.data == "subscribe")
@@ -1504,15 +1519,15 @@ async def cb_help(callback: CallbackQuery):
     await callback.answer()
     await callback.message.answer(
         f"🆘 <b>Помощь</b>\n\n"
-        f"Я показываю расписание группы <b>{GROUP_NAME}</b> "
-        f"на сегодня и на завтра.\n\n"
-        f"• /schedule — завтра, если его нет — сегодня "
-        f"(воскресенье пропускается)\n"
-        f"• /date ДАТА — расписание на любую дату\n"
+        f"Я показываю расписание группы <b>{GROUP_NAME}</b>.\n\n"
+        f"• Кнопка «📅 Расписание» или /schedule — расписание на завтра, "
+        f"а если его нет — на сегодня (воскресенье пропускается)\n"
+        f"• /date ДАТА — расписание на любую дату "
+        f"(например <code>/date сегодня</code>)\n"
         f"• /subscribe — уведомления об изменениях\n"
         f"• /unsubscribe — отключить уведомления\n"
         f"• /status — статус чата\n\n"
-        f"Примеры /date: <code>04.09.2026</code>, "
+        f"Примеры /date: <code>сегодня</code>, <code>04.09.2026</code>, "
         f"<code>2026-09-04</code>, <code>4 сентября</code>, "
         f"<code>понедельник</code>."
     )
