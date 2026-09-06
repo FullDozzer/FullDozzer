@@ -15,10 +15,12 @@ Telegram-бот расписания группы ЭС7-24 (Институт н�
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
 import sqlite3
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -116,7 +118,7 @@ ROMAN_PAIRS = {
 
 @dataclass
 class Lesson:
-    """Одно занятие."""
+    """Одно занятие / одна подгруппа в рамках пары."""
 
     pair: str          # римский номер, например "I"
     time: str          # "08:30 - 09:50"
@@ -125,20 +127,107 @@ class Lesson:
     room: str
     start: str = ""    # "08:30"
     end: str = ""      # "09:50"
+    subgroup: Optional[str] = None  # "1", "2" или None (обычное занятие)
+    break_duration: str = ""        # например "15 мин"
+
+    @property
+    def key(self) -> tuple:
+        """Устойчивый ключ для сопоставления старого и нового расписания."""
+        return (clean_text(self.pair).upper(), clean_text(self.subgroup) or None)
+
+
+@dataclass
+class Pair:
+    """Одна пара, которая может содержать несколько занятий/подгрупп."""
+
+    number: str
+    start: str
+    end: str
+    break_duration: str
+    lessons: list
+
+
+@dataclass
+class ScheduleChange:
+    """Одно изменение расписания (добавление, удаление или изменение)."""
+
+    kind: str               # "added", "removed", "changed"
+    pair: str
+    subgroup: Optional[str]
+    old: Optional[dict]
+    new: Optional[dict]
+    details: list           # для changed: [{"field","label","old","new"}]
+
+    @property
+    def key(self) -> tuple:
+        return (clean_text(self.pair).upper(), clean_text(self.subgroup) or None)
 
 
 @dataclass
 class Schedule:
-    """Расписание на конкретный день."""
+    """Расписание на конкретный день.
+
+    `lessons` остаётся плоским списком всех занятий/подгрупп (Это удобно
+    для подписи/хэша и совместимости), а `pairs` собирает их в пары.
+    """
 
     date: date
     group: str
     lessons: list
     fallback: bool = False
 
+    @property
+    def pairs(self) -> list:
+        """Группировка flat-списка занятий в пары."""
+        return group_into_pairs(self.lessons)
+
 
 class ScheduleUnavailable(Exception):
     """Сайт недоступен / сеть не работает."""
+
+
+def group_into_pairs(lessons: list) -> list:
+    """Группирует flat-список занятий в пары.
+
+    Порядок пар сохраняет порядок первого появления / порядок по номеру.
+    Внутри пары занятия сортируются по подгруппе (None идёт первым).
+    """
+    groups = OrderedDict()
+    for lesson in lessons:
+        key = (
+            clean_text(lesson.pair).upper(),
+            clean_text(lesson.start) or "",
+            clean_text(lesson.end) or "",
+        )
+        groups.setdefault(key, []).append(lesson)
+
+    result = []
+    for key, group in groups.items():
+        number, start, end = key
+        group.sort(key=lambda item: _subgroup_sort_key(item.subgroup))
+        result.append(
+            Pair(
+                number=number,
+                start=start or (group[0].start or ""),
+                end=end or (group[0].end or ""),
+                break_duration=getattr(group[0], "break_duration", "") or "",
+                lessons=list(group),
+            )
+        )
+
+    # Сортировка по римскому номеру пары.
+    result.sort(key=lambda pair: ROMAN_PAIRS.get(pair.number, 99))
+    return result
+
+
+def _subgroup_sort_key(subgroup) -> tuple:
+    if subgroup is None or subgroup == "":
+        return (0, "", "")
+    try:
+        number = int(subgroup)
+        return (1, f"{number:010d}", "")
+    except (TypeError, ValueError):
+        return (1, "", clean_text(subgroup))
 
 
 # ============================================================
@@ -524,7 +613,11 @@ def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
 # ПАРСИНГ HTML
 # ============================================================
 
-def _find_room(card) -> str:
+_SUBGROUP_CLASS_RE = re.compile(r"\bsubGroup\d+\b", re.IGNORECASE)
+_SUBGROUP_TEXT_RE = re.compile(r"(\d{1,2})\s*п/гр\.?", re.IGNORECASE)
+
+
+def _find_room(node) -> str:
     """
     Аудитория в элементе с текстом «ауд.»:
 
@@ -533,7 +626,7 @@ def _find_room(card) -> str:
     Возвращает только номер (УК107). Если нет — "".
     """
     # Способ 1: элемент .h5 рядом с текстом «ауд.»
-    for text_node in card.find_all(string=True):
+    for text_node in node.find_all(string=True):
         if text_node and "ауд." in text_node:
             parent = text_node.parent
             if parent is None:
@@ -546,16 +639,222 @@ def _find_room(card) -> str:
                     return value
 
     # Способ 2: regex по очищенному тексту карточки
-    card_text = clean_text(card.get_text(" ", strip=True))
+    text = clean_text(node.get_text(" ", strip=True))
     match = re.search(
         r"ауд\.\s*([A-Za-zА-Яа-я0-9№.\-()/]+)",
-        card_text,
+        text,
         re.IGNORECASE,
     )
     if match:
         return clean_text(match.group(1))
 
     return ""
+
+
+def _find_subject(node) -> str:
+    """Предмет из карточки / блока подгруппы."""
+    selectors = (
+        ".d-md-none.text-center.text-truncate",
+        ".d-none.d-md-block b",
+        ".d-none.d-md-block",
+        "b",
+        "strong",
+    )
+    for selector in selectors:
+        el = node.select_one(selector)
+        if el is not None:
+            value = clean_text(el.get_text(" ", strip=True))
+            if value:
+                return value
+
+    # Иногда предмет может быть выделен классом, но не ловится выше.
+    for el in node.select(".subject, .discipline, [class*=subject], [class*=Subject]"):
+        value = clean_text(el.get_text(" ", strip=True))
+        if value and "ауд." not in value.lower():
+            return value
+
+    return ""
+
+
+def _find_teacher(node) -> str:
+    """Преподаватель из видимого текста / title."""
+    staff = node.select_one(".Staff")
+    if staff is not None:
+        teacher = clean_text(staff.get_text(" ", strip=True))
+        if not teacher and staff.get("title"):
+            teacher = clean_text(staff.get("title"))
+        return teacher
+
+    for el in node.select(
+        ".teacher, [class*=teacher], [class*=Teacher], .staff, [class*=staff]"
+    ):
+        value = clean_text(el.get_text(" ", strip=True))
+        if value and "ауд." not in value.lower():
+            return value
+        if el.get("title"):
+            value = clean_text(el.get("title"))
+            if value:
+                return value
+
+    return ""
+
+
+def _find_break_duration(header) -> str:
+    """«перемена 15 мин» из заголовка пары."""
+    for node in header.select("span"):
+        text = clean_text(node.get_text(" ", strip=True))
+        match = re.search(
+            r"перемена\s+(\d+)\s*(мин|минуты|минут)?",
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            minutes = match.group(1)
+            unit = clean_text(match.group(2) or "мин")
+            return f"{minutes} {unit}"
+    return ""
+
+
+def _find_subgroup(node, css_class: str = "") -> Optional[str]:
+    """Номер подгруппы.
+
+    Приоритет — текст «N п/гр.» (самый надёжный источник). Если его нет,
+    берём номер из CSS-класса `.subGroupN`. Если нет ни того, ни другого,
+    возвращаем None — подгруппу НЕ придумываем.
+    """
+    text = clean_text(node.get_text(" ", strip=True))
+    match = _SUBGROUP_TEXT_RE.search(text)
+    if match:
+        return match.group(1)
+
+    class_match = _SUBGROUP_CLASS_RE.search(css_class or "")
+    if class_match:
+        return re.search(r"\d+", class_match.group(0)).group(0)
+
+    return None
+
+
+def _extract_fallback_subject(node, room: str, teacher: str, subgroup) -> str:
+    """Fallback для предмета, если в блоке нет стандартных классов.
+
+    Аккуратно убирает известные служебные части (аудитория, преподаватель,
+    «N п/гр.», «ауд.») и оставляет то, что похоже на предмет.
+    """
+    text = clean_text(node.get_text(" ", strip=True))
+    if not text:
+        return ""
+
+    if subgroup:
+        text = re.sub(
+            rf"\b{re.escape(subgroup)}\s*п/гр\.?",
+            " ",
+            text,
+            flags=re.IGNORECASE,
+        )
+    text = re.sub(r"\bп/гр\.?\b", " ", text, flags=re.IGNORECASE)
+    if room:
+        text = text.replace(room, " ")
+    if teacher:
+        text = text.replace(teacher, " ")
+    text = re.sub(r"ауд\.", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"(Перемена[а-яё]*|[1-5]\s*пар[а-яё]*|Пара\s*[IVX]+)", " ", text,
+                  flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _looks_like_teacher(value: str) -> bool:
+    """«Мурзабулатова Ф.Ф.», «Иванов И.И.» — эвристика для plain-text HTML."""
+    text = clean_text(value)
+    if not text or len(text) < 4:
+        return False
+    if re.fullmatch(
+        r"[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?\s*[А-ЯЁ]\.\s*[А-ЯЁ]\.?",
+        text,
+    ):
+        return True
+    return False
+
+
+def _text_fragments(node, room: str, subgroup) -> list:
+    """Строки блока без аудитории / подгруппы (запасной источник данных)."""
+    fragments = []
+    for raw in node.get_text("\n", strip=True).split("\n"):
+        line = clean_text(raw)
+        if not line:
+            continue
+        lowered = line.lower()
+        if "ауд." in lowered:
+            continue
+        if subgroup and re.fullmatch(
+            rf"{re.escape(subgroup)}\s*п/гр\.?", line, re.IGNORECASE
+        ):
+            continue
+        if room and room.lower() in lowered:
+            continue
+        fragments.append(line)
+    return fragments
+
+
+def _parse_lesson_from_node(
+    node,
+    pair: str,
+    start: str,
+    end: str,
+    time_str: str,
+    break_duration: str,
+    css_class: str = "",
+) -> Optional[Lesson]:
+    subject = _find_subject(node)
+    teacher = _find_teacher(node)
+    room = _find_room(node)
+    subgroup = _find_subgroup(node, css_class=css_class)
+
+    # Запасная эвристика для plain-text HTML без классов .Staff/.d-md-none:
+    # преподавателя ищем по паттерну «Фамилия И.О.».
+    if not teacher:
+        fragments = _text_fragments(node, room, subgroup)
+        for fragment in fragments:
+            if _looks_like_teacher(fragment):
+                teacher = clean_text(fragment)
+                break
+
+    if not subject:
+        subject = _extract_fallback_subject(node, room, teacher, subgroup)
+
+    if not subject and not teacher and not room:
+        return None
+
+    return Lesson(
+        pair=pair,
+        time=time_str,
+        start=start,
+        end=end,
+        subject=subject or "Предмет не указан",
+        teacher=teacher or "—",
+        room=room or "—",
+        subgroup=subgroup,
+        break_duration=break_duration,
+    )
+
+
+def _iter_subgroup_blocks(body):
+    """Все блоки подгрупп внутри card-body.
+
+    Классы могут быть `.subGroup1`, `.subGroup2`, `.subGroup3` и т.д.
+    Архитектура не ограничена двумя подгруппами.
+    """
+    candidates = []
+    for el in body.find_all(class_=_SUBGROUP_CLASS_RE):
+        # Исключаем вложенные элементы, если родитель тоже подгруппа.
+        parent = el.parent
+        if parent is not None and parent.get("class"):
+            classes = " ".join(str(c) for c in parent.get("class"))
+            if _SUBGROUP_CLASS_RE.search(classes):
+                continue
+        candidates.append(el)
+
+    return candidates
 
 
 def parse_schedule(html: str, day: date) -> Schedule:
@@ -613,74 +912,81 @@ def parse_schedule(html: str, day: date) -> Schedule:
         start = f"{h1}:{m1}"
         end = f"{h2}:{m2}"
         time_str = f"{start} - {end}"
+        break_duration = _find_break_duration(header)
 
-        # Предмет: основной селектор (мобильная вёрстка)
-        subject = ""
-        subject_node = card.select_one(".d-md-none.text-center.text-truncate")
+        body = card.select_one(".card-body") or card
+        subgroup_blocks = _iter_subgroup_blocks(body)
 
-        # fallback: .d-none.d-md-block b
-        if subject_node is None:
-            bold_node = card.select_one(".d-none.d-md-block b")
-            if bold_node is not None:
-                subject_node = bold_node
-
-        if subject_node is not None:
-            subject = clean_text(subject_node.get_text(" ", strip=True))
-
-        if not subject:
-            fallback = card.select_one(".d-none.d-md-block")
-            if fallback is not None:
-                subject = clean_text(fallback.get_text(" ", strip=True))
-
-        # Преподаватель: .Staff (видимый текст; иначе атрибут title)
-        teacher = ""
-        staff = card.select_one(".Staff")
-        if staff is not None:
-            teacher = clean_text(staff.get_text(" ", strip=True))
-            if not teacher and staff.get("title"):
-                teacher = clean_text(staff.get("title"))
-
-        if not teacher and not subject:
-            # если тело карточки вообще пустое — это не занятие
-            continue
-
-        room = _find_room(card) or "—"
-
-        lessons.append(
-            Lesson(
+        # Если в паре есть подгруппы — каждая из них становится своим
+        # занятием. Ни в коем случае не оставляем только первую.
+        if subgroup_blocks:
+            for block in subgroup_blocks:
+                css_classes = " ".join(
+                    str(c) for c in (block.get("class") or [])
+                )
+                lesson = _parse_lesson_from_node(
+                    block,
+                    pair=pair,
+                    start=start,
+                    end=end,
+                    time_str=time_str,
+                    break_duration=break_duration,
+                    css_class=css_classes,
+                )
+                if lesson is not None:
+                    lessons.append(lesson)
+        else:
+            lesson = _parse_lesson_from_node(
+                body,
                 pair=pair,
-                time=time_str,
                 start=start,
                 end=end,
-                subject=subject or "Предмет не указан",
-                teacher=teacher or "—",
-                room=room,
+                time_str=time_str,
+                break_duration=break_duration,
             )
-        )
+            if lesson is not None:
+                lessons.append(lesson)
 
-    logger.info("Найдено подходящих карточек: %s", len(lessons))
+    logger.info("Найдено подходящих карточек: %s", len(cards))
 
-    # Убираем дубликаты и сортируем по номеру пары
+    # Убираем дубликаты и сортируем по номеру пары и подгруппе.
     unique: list = []
     seen = set()
 
     for lesson in lessons:
-        key = (lesson.pair, lesson.time, lesson.subject,
-               lesson.teacher, lesson.room)
+        key = (
+            lesson.pair,
+            lesson.time,
+            lesson.subject,
+            lesson.teacher,
+            lesson.room,
+            lesson.subgroup,
+        )
         if key in seen:
             continue
         seen.add(key)
         unique.append(lesson)
 
-    unique.sort(key=lambda x: ROMAN_PAIRS.get(x.pair, 99))
+    unique.sort(
+        key=lambda x: (
+            ROMAN_PAIRS.get(x.pair, 99),
+            _subgroup_sort_key(x.subgroup),
+            clean_text(x.subject).casefold(),
+        )
+    )
 
     logger.info("Найдено занятий: %s", len(unique))
 
     for lesson in unique:
+        subgroup_s = f" | {lesson.subgroup} п/гр." if lesson.subgroup else ""
         logger.info(
-            "Пара %s | %s | %s | %s | %s",
-            lesson.pair, lesson.time,
-            lesson.room, lesson.teacher, lesson.subject,
+            "Пара %s%s | %s | %s | %s | %s",
+            lesson.pair,
+            subgroup_s,
+            lesson.time,
+            lesson.room,
+            lesson.teacher,
+            lesson.subject,
         )
 
     return Schedule(
@@ -710,25 +1016,245 @@ async def get_schedule(day: date) -> Schedule:
 
 
 # ============================================================
-# ХЭШ РАСПИСАНИЯ
+# НОРМАЛИЗАЦИЯ, ХЭШ И СРАВНЕНИЕ РАСПИСАНИЙ
 # ============================================================
+
+LESSON_FIELDS = ("pair", "start", "end", "subgroup", "subject", "room", "teacher")
+FIELD_LABELS = {
+    "subject": "Предмет",
+    "room": "Аудитория",
+    "teacher": "Преподаватель",
+    "time": "Время",
+}
+
+
+def _split_time(lesson) -> tuple:
+    start = clean_text(getattr(lesson, "start", ""))
+    end = clean_text(getattr(lesson, "end", ""))
+    if not start or not end:
+        match = re.search(
+            r"(\d{2}:\d{2})\s*[-–—]\s*(\d{2}:\d{2})",
+            clean_text(getattr(lesson, "time", "")),
+        )
+        if match:
+            start = start or match.group(1)
+            end = end or match.group(2)
+    return start, end
+
+
+def normalize_value(value) -> str:
+    if value is None:
+        return ""
+    return clean_text(str(value))
+
+
+def normalize_schedule(schedule) -> list:
+    """Нормализованный список занятий для сравнения/хранения.
+
+    Убирает лишние пробелы и неоднозначное форматирование. Сравнение
+    дополнительно использует кейс-независимые ключи (см. _field_key).
+    """
+    items = []
+    for lesson in schedule.lessons:
+        start, end = _split_time(lesson)
+        subgroup = normalize_value(lesson.subgroup) or None
+        pair = normalize_value(lesson.pair).upper()
+        item = {
+            "pair": pair,
+            "start": start,
+            "end": end,
+            "subgroup": subgroup,
+            "subject": normalize_value(lesson.subject),
+            "room": normalize_value(lesson.room),
+            "teacher": normalize_value(lesson.teacher),
+        }
+        items.append(item)
+
+    items.sort(
+        key=lambda x: (
+            ROMAN_PAIRS.get(x["pair"], 99),
+            _subgroup_sort_key(x["subgroup"]),
+            x["subject"].casefold(),
+        )
+    )
+    return items
+
+
+def _field_key(value: str) -> str:
+    return normalize_value(value).casefold().strip()
+
+
+def schedule_from_storage(stored, day: date) -> Schedule:
+    """Восстанавливает Schedule из JSON в БД (значения display-нормализованы)."""
+    if stored is None:
+        return Schedule(date=day, group=GROUP_NAME, lessons=[])
+    if isinstance(stored, str):
+        try:
+            stored = json.loads(stored)
+        except (ValueError, TypeError):
+            return Schedule(date=day, group=GROUP_NAME, lessons=[])
+    if isinstance(stored, dict):
+        stored = stored.get("lessons") or []
+
+    lessons = []
+    for item in stored or []:
+        if not isinstance(item, dict):
+            continue
+        pair = clean_text(item.get("pair", "")).upper()
+        subgroup = clean_text(item.get("subgroup") or "") or None
+        start = clean_text(item.get("start", ""))
+        end = clean_text(item.get("end", ""))
+        subject = clean_text(item.get("subject", "")) or "Предмет не указан"
+        teacher = clean_text(item.get("teacher", "")) or "—"
+        room = clean_text(item.get("room", "")) or "—"
+        lessons.append(
+            Lesson(
+                pair=pair,
+                time=f"{start} - {end}" if start and end else "",
+                subject=subject,
+                teacher=teacher,
+                room=room,
+                start=start,
+                end=end,
+                subgroup=subgroup,
+            )
+        )
+    return Schedule(date=day, group=GROUP_NAME, lessons=lessons)
+
 
 def schedule_signature(schedule: Schedule) -> str:
     """
-    Стабильная подпись, зависящая от: даты, пары, времени, предмета,
-    преподавателя и аудитории.
-    """
-    parts = [schedule.date.isoformat(), schedule.group]
+    Стабильная подпись, зависящая от: даты, пары, времени, подгруппы,
+    предмета, преподавателя и аудитории.
 
-    for lesson in schedule.lessons:
+    Пробелы и регистр не влияют на подпись — это защищает от ложных
+    изменений при косметических правках на сайте.
+    """
+    parts = [schedule.date.isoformat(), normalize_value(schedule.group)]
+    for item in normalize_schedule(schedule):
         parts.extend(
-            [lesson.pair, lesson.time,
-             lesson.subject, lesson.teacher, lesson.room]
+            [
+                item["pair"],
+                item["start"],
+                item["end"],
+                item["subgroup"] or "",
+                _field_key(item["subject"]),
+                _field_key(item["room"]),
+                _field_key(item["teacher"]),
+            ]
         )
 
     data = "\n".join(parts).encode("utf-8")
-
     return hashlib.sha256(data).hexdigest()
+
+
+def compare_schedules(old_schedule, new_schedule) -> list:
+    """Возвращает список ScheduleChange.
+
+    Сопоставление идёт по устойчивому ключу «пара + подгруппа»:
+    - совпал ключ  -> сравниваются предмет/аудитория/преподаватель/время;
+    - появился ключ -> добавлено занятие/подгруппа;
+    - пропал ключ   -> удалено занятие/подгруппа.
+    """
+    old_items = normalize_schedule(old_schedule)
+    new_items = normalize_schedule(new_schedule)
+
+    old_by_key = {}
+    for item in old_items:
+        old_by_key.setdefault((item["pair"], item["subgroup"]), item)
+    new_by_key = {}
+    for item in new_items:
+        new_by_key.setdefault((item["pair"], item["subgroup"]), item)
+
+    changes = []
+    all_keys = sorted(set(old_by_key) | set(new_by_key))
+
+    for key in all_keys:
+        pair, subgroup = key
+        old_item = old_by_key.get(key)
+        new_item = new_by_key.get(key)
+
+        if old_item is not None and new_item is None:
+            changes.append(
+                ScheduleChange(
+                    kind="removed",
+                    pair=pair,
+                    subgroup=subgroup,
+                    old=old_item,
+                    new=None,
+                    details=[],
+                )
+            )
+            continue
+
+        if old_item is None and new_item is not None:
+            changes.append(
+                ScheduleChange(
+                    kind="added",
+                    pair=pair,
+                    subgroup=subgroup,
+                    old=None,
+                    new=new_item,
+                    details=[],
+                )
+            )
+            continue
+
+        details = []
+        for key_name, label in (
+            ("subject", FIELD_LABELS["subject"]),
+            ("room", FIELD_LABELS["room"]),
+            ("teacher", FIELD_LABELS["teacher"]),
+        ):
+            old_val = normalize_value(old_item.get(key_name))
+            new_val = normalize_value(new_item.get(key_name))
+            if old_val != new_val and _field_key(old_val) != _field_key(new_val):
+                details.append(
+                    {
+                        "field": key_name,
+                        "label": label,
+                        "old": old_val,
+                        "new": new_val,
+                    }
+                )
+
+        old_start = normalize_value(old_item.get("start"))
+        old_end = normalize_value(old_item.get("end"))
+        new_start = normalize_value(new_item.get("start"))
+        new_end = normalize_value(new_item.get("end"))
+        if (old_start, old_end) != (new_start, new_end):
+            details.append(
+                {
+                    "field": "time",
+                    "label": FIELD_LABELS["time"],
+                    "old": f"{old_start} - {old_end}" if old_start or old_end else "",
+                    "new": f"{new_start} - {new_end}" if new_start or new_end else "",
+                }
+            )
+
+        if details:
+            changes.append(
+                ScheduleChange(
+                    kind="changed",
+                    pair=pair,
+                    subgroup=subgroup,
+                    old=old_item,
+                    new=new_item,
+                    details=details,
+                )
+            )
+
+    changes.sort(key=_schedule_change_sort_key)
+    return changes
+
+
+def _schedule_change_sort_key(change):
+    pair = clean_text(change.pair).upper()
+    return (
+        ROMAN_PAIRS.get(pair, 99),
+        _subgroup_sort_key(change.subgroup),
+        clean_text(change.kind),
+    )
 
 
 # ============================================================
@@ -790,10 +1316,23 @@ def init_db() -> None:
                 CREATE TABLE IF NOT EXISTS schedule_state (
                     date       TEXT PRIMARY KEY,
                     hash       TEXT NOT NULL,
+                    data       TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+
+            # 2.1.4: в состоянии храним не только hash, но и нормализованные
+            # данные — без них невозможно показать «было -> стало».
+            state_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(schedule_state)")
+            }
+            if "data" not in state_columns:
+                conn.execute(
+                    "ALTER TABLE schedule_state ADD COLUMN data TEXT"
+                    " NOT NULL DEFAULT ''"
+                )
 
             # 2.1.4: фактическая доставка расписания каждому подписчику
             # (комбинация «подписчик + дата»), чтобы не отправлять
@@ -927,12 +1466,31 @@ def mark_changelog_notified(user_id: int, version: str) -> bool:
 
 
 def load_state() -> dict:
+    """Состояние расписания: {date: {hash, data}}.
+
+    `data` — JSON-строка с нормализованным списком занятий (для сравнения
+    «было -> стало»). Совместимо со старыми базами без колонки data.
+    """
     try:
         with db_connect() as conn:
             rows = conn.execute(
-                "SELECT date, hash FROM schedule_state"
+                "SELECT date, hash, data, updated_at FROM schedule_state"
             ).fetchall()
-            return {row["date"]: row["hash"] for row in rows}
+            result = {}
+            for row in rows:
+                raw = row["data"] or ""
+                payload = None
+                if raw:
+                    try:
+                        payload = json.loads(raw)
+                    except (ValueError, TypeError):
+                        payload = None
+                result[row["date"]] = {
+                    "hash": row["hash"],
+                    "data": payload,
+                    "updated_at": row["updated_at"] or "",
+                }
+            return result
     except Exception:
         logger.exception("Ошибка SQLite (load state)")
         return {}
@@ -942,11 +1500,20 @@ def save_state(state: dict) -> None:
     try:
         now = now_local().strftime("%Y-%m-%d %H:%M:%S")
         with db_connect() as conn:
-            for date_key, digest in state.items():
+            for date_key, value in state.items():
+                if isinstance(value, str):
+                    # Совместимость со старым вызовом save_state({...: hash}).
+                    digest = value
+                    data = "[]"
+                else:
+                    digest = value.get("hash") or ""
+                    data = json.dumps(
+                        value.get("data") or [], ensure_ascii=False
+                    )
                 conn.execute(
-                    "INSERT OR REPLACE INTO schedule_state (date, hash, updated_at)"
-                    " VALUES (?, ?, ?)",
-                    (date_key, digest, now),
+                    "INSERT OR REPLACE INTO schedule_state"
+                    " (date, hash, data, updated_at) VALUES (?, ?, ?, ?)",
+                    (date_key, digest, data, now),
                 )
     except Exception:
         logger.exception("Ошибка SQLite (save state)")
@@ -1006,6 +1573,13 @@ COL_GREEN = "#0E9F5F"
 COL_GREEN_LIGHT = "#E5F6ED"
 COL_BORDER = "#E2E7F0"
 COL_FOOTER = "#98A1B0"
+COL_WARN = "#B45309"
+COL_WARN_LIGHT = "#FEF3C7"
+COL_RED = "#B91C1C"
+COL_RED_LIGHT = "#FEE2E2"
+
+SUMMARY_MAX_LINES = 24
+SUMMARY_MAX_CHANGES = 20
 
 
 def _wrap_lines(text: str, font, max_width: float) -> list:
@@ -1045,12 +1619,118 @@ def _text_h(font) -> int:
     return int(font.size * 1.35)
 
 
-def render_schedule_image(schedule: Schedule) -> Path:
+def _truncate(text: str, font, max_width: float) -> str:
+    text = clean_text(text)
+    if not text or font.getlength(text) <= max_width:
+        return text
+    while font.getlength(text) > max_width and len(text) > 2:
+        text = text[:-1]
+    return text + "…"
+
+
+def _subgroup_label(subgroup) -> str:
+    if subgroup is None or subgroup == "":
+        return ""
+    return f"{clean_text(subgroup)} п/гр."
+
+
+def _lesson_from_normalized_item(item: dict) -> Lesson:
+    start = clean_text(item.get("start", ""))
+    end = clean_text(item.get("end", ""))
+    return Lesson(
+        pair=clean_text(item.get("pair", "")).upper(),
+        time=f"{start} - {end}" if start and end else "",
+        subject=clean_text(item.get("subject", "")) or "Предмет не указан",
+        teacher=clean_text(item.get("teacher", "")) or "—",
+        room=clean_text(item.get("room", "")) or "—",
+        start=start,
+        end=end,
+        subgroup=clean_text(item.get("subgroup") or "") or None,
+    )
+
+
+def _render_items_for_pair(pair: Pair, change_by_key: dict, removed_by_pair: dict) -> list:
+    items = []
+    for lesson in pair.lessons:
+        key = (clean_text(lesson.pair).upper(), clean_text(lesson.subgroup) or None)
+        change = change_by_key.get(key)
+        if change is not None and change.kind == "changed":
+            items.append({"lesson": lesson, "kind": "changed", "details": change.details})
+        elif change is not None and change.kind == "added":
+            items.append({"lesson": lesson, "kind": "added", "details": []})
+        else:
+            items.append({"lesson": lesson, "kind": "normal", "details": []})
+
+    for change in removed_by_pair.get(clean_text(pair.number).upper(), []):
+        old_item = change.old or {}
+        lesson = _lesson_from_normalized_item(old_item)
+        items.append({"lesson": lesson, "kind": "removed", "details": []})
+
+    return items
+
+
+def _change_summary_lines(changes: list) -> list:
+    """Короткий текстовый блок «Что изменилось» для картинки."""
+    lines = ["Что изменилось:"]
+    count = 0
+    for change in changes:
+        if count >= SUMMARY_MAX_CHANGES:
+            break
+        count += 1
+        pair = clean_text(change.pair).upper()
+        subgroup = clean_text(change.subgroup) or None
+        label = f"{pair} пара" + (f" • {subgroup} п/гр." if subgroup else "")
+
+        if change.kind == "added":
+            new = change.new or {}
+            lines.append(
+                f"Добавлено: {label} — {new.get('subject') or 'Предмет не указан'}"
+                + (f", {new.get('room') or '—'}" if new.get("room") else "")
+            )
+            continue
+        if change.kind == "removed":
+            old = change.old or {}
+            lines.append(
+                f"Удалено: {label} — {old.get('subject') or 'Предмет не указан'}"
+                + (f", {old.get('room') or '—'}" if old.get("room") else "")
+            )
+            continue
+
+        lines.append(f"Изменено: {label}")
+        for detail in change.details:
+            label_name = detail.get("label") or detail.get("field", "")
+            old_val = clean_text(detail.get("old", ""))
+            new_val = clean_text(detail.get("new", ""))
+            if old_val or new_val:
+                lines.append(
+                    f"* {label_name}: {old_val or '—'} -> {new_val or '—'}"
+                )
+
+    if len(changes) > count:
+        lines.append(f"… и ещё {len(changes) - count} изменений")
+
+    return lines[:SUMMARY_MAX_LINES]
+
+
+def render_schedule_image(
+    schedule: Schedule,
+    changes=None,
+    title: Optional[str] = None,
+) -> Path:
     """
-    Современная минималистичная PNG-картинка. Высота зависит от числа занятий.
+    Создаёт PNG-картинку расписания.
+
+    - `changes=None`  -> обычная картинка без выделения изменений.
+    - `changes=[...]` -> изменённые блоки выделяются цветом/рамкой,
+      добавляется заголовок «РАСПИСАНИЕ ИЗМЕНИЛОСЬ» и блок
+      «Что изменилось».
+    - `title`         -> произвольный заголовок в шапке (например
+      «РАСПИСАНИЕ ОПУБЛИКОВАНО»).
     """
     try:
-        lessons = schedule.lessons
+        lessons = list(schedule.lessons)
+        changes = list(changes or [])
+        pairs = schedule.pairs
 
         # Шрифты
         font_label = get_font(24, bold=True)
@@ -1058,12 +1738,18 @@ def render_schedule_image(schedule: Schedule) -> Path:
         font_date = get_font(30)
         font_count = get_font(24, bold=True)
         font_pair = get_font(28, bold=True)
-        font_time = get_font(40, bold=True)
-        font_subject = get_font(40, bold=True)
-        font_info = get_font(28)
+        font_time = get_font(32, bold=True)
+        font_break = get_font(22)
+        font_subject = get_font(34, bold=True)
+        font_info = get_font(26)
+        font_subg = get_font(24, bold=True)
+        font_status = get_font(22, bold=True)
+        font_detail = get_font(23, bold=True)
         font_empty_title = get_font(44, bold=True)
         font_empty_sub = get_font(30)
         font_footer = get_font(24)
+        font_summary = get_font(25, bold=True)
+        font_summary_body = get_font(24)
 
         # Геометрия
         W = 1080
@@ -1072,42 +1758,82 @@ def render_schedule_image(schedule: Schedule) -> Path:
         card_gap = 28
         x1 = MARGIN
         x2 = W - MARGIN
-        inner = 48  # отступ внутри карточки
-
-        # --- геометрия карточки (для высоты и для отрисовки) ---
+        inner = 48
+        text_w = (x2 - x1) - 2 * inner
         circle_s = 68
-        top_pad = 26          # отступ сверху карточки (круг)
-        subj_gap = 18         # зазор между кругом и предметом
-        subj_top = top_pad + circle_s + subj_gap   # верх предмета (относительно карточки)
-        line_h = int(font_subject.size * 1.35)     # межстрочный интервал предмета
-        meta_gap = 14         # зазор между предметом и мета-строкой
-        chip_h = 44           # высота бейджа аудитории
-        pad_bottom = 22       # нижний отступ карточки
+        top_pad = 26
+        pad_bottom = 24
+        item_gap = 16
+        line_h = int(font_subject.size * 1.35)
+        chip_h = 44
+        subg_h = 30
+        status_h = 30
+        detail_h = 30
 
-        def subject_lines_for(lesson):
-            if lesson.subject:
-                return _wrap_lines(
-                    lesson.subject,
-                    font_subject,
-                    (x2 - x1) - 2 * inner,
-                )
-            return ["Предмет не указан"]
+        change_by_key = {
+            (clean_text(c.pair).upper(), clean_text(c.subgroup) or None): c
+            for c in changes
+        }
+        removed_by_pair = {}
+        for c in changes:
+            if c.kind == "removed":
+                removed_by_pair.setdefault(
+                    clean_text(c.pair).upper(), []
+                ).append(c)
 
-        def card_height_for(lesson) -> int:
-            lines = subject_lines_for(lesson)
-            subj_block_h = line_h * len(lines)
-            meta_top = subj_top + subj_block_h + meta_gap
-            return meta_top + chip_h + pad_bottom
+        def subject_lines_for(subject):
+            return _wrap_lines(
+                subject or "Предмет не указан", font_subject, text_w
+            )
 
-        card_heights = [card_height_for(l) for l in lessons]
+        def item_block_height(item) -> int:
+            h = 8 + 10  # верхний/нижний отступ
+            if _subgroup_label(item["lesson"].subgroup):
+                h += subg_h
+            if item["kind"] != "normal":
+                h += status_h
+            h += line_h * len(subject_lines_for(item["lesson"].subject))
+            h += 14 + chip_h
+            if item["kind"] == "changed":
+                h += 8 + detail_h * len(item["details"])
+            return h
 
-        total_cards_h = sum(card_heights) + max(0, len(lessons) - 1) * card_gap
+        def pair_card_height(pair) -> int:
+            items = _render_items_for_pair(
+                pair, change_by_key, removed_by_pair
+            )
+            header_h = top_pad + circle_s + 24
+            blocks_h = sum(item_block_height(i) for i in items)
+            blocks_gap = max(0, len(items) - 1) * item_gap
+            return header_h + blocks_h + blocks_gap + pad_bottom
 
+        # Пустое расписание.
         if not lessons:
             empty_h = 250
-            total_cards_h = empty_h
+            pairs = []
+            cards_h = empty_h
+        else:
+            cards_h = (
+                sum(pair_card_height(p) for p in pairs)
+                + max(0, len(pairs) - 1) * card_gap
+            )
 
-        H = HEADER_H + 36 + total_cards_h + 80
+        summary_lines = _change_summary_lines(changes) if changes else []
+        if changes and not summary_lines:
+            summary_lines = ["Что изменилось:"]
+        summary_h = 0
+        if summary_lines:
+            summary_h = 50 + summary_lines.__len__() * 34 + 20
+
+        # Если есть блок «Что изменилось», оставляем больше места внизу,
+        # чтобы подвал не накладывался на последнюю строку изменений.
+        H = (
+            HEADER_H
+            + 36
+            + cards_h
+            + summary_h
+            + (140 if summary_lines else 80)
+        )
 
         image = Image.new("RGB", (W, H), COL_BG)
         draw = ImageDraw.Draw(image)
@@ -1116,18 +1842,18 @@ def render_schedule_image(schedule: Schedule) -> Path:
         draw.rectangle((0, 0, W, HEADER_H), fill=COL_WHITE)
         draw.rectangle((0, 0, 14, HEADER_H), fill=COL_ACCENT)
 
-        # label
-        draw.text((MARGIN + 20, 40), "РАСПИСАНИЕ",
+        header_label = title or (
+            "РАСПИСАНИЕ ИЗМЕНИЛОСЬ" if changes else "РАСПИСАНИЕ"
+        )
+        draw.text((MARGIN + 20, 40), header_label,
                   font=font_label, fill=COL_ACCENT)
-        # группа
         draw.text((MARGIN + 20, 84), GROUP_NAME,
                   font=font_group, fill=COL_INK)
-        # дата
         draw.text((MARGIN + 22, 186),
                   format_date_header(schedule.date),
                   font=font_date, fill=COL_MUTED)
 
-        # бейдж «N занятий»
+        # бейдж с количеством занятий
         if lessons:
             count_text = f"{len(lessons)} "
             count_text += "занятие" if len(lessons) == 1 \
@@ -1164,22 +1890,28 @@ def render_schedule_image(schedule: Schedule) -> Path:
                 outline=COL_BORDER,
                 width=2,
             )
-            title = "Занятий нет"
-            tw = draw.textlength(title, font=font_empty_title)
-            draw.text(((W - tw) / 2, by + 62), title,
+            title_txt = "Занятий нет"
+            tw = draw.textlength(title_txt, font=font_empty_title)
+            draw.text(((W - tw) / 2, by + 62), title_txt,
                       font=font_empty_title, fill=COL_INK)
             sub = "Расписание на этот день не опубликовано."
             sw = draw.textlength(sub, font=font_empty_sub)
             draw.text(((W - sw) / 2, by + 140), sub,
                       font=font_empty_sub, fill=COL_MUTED)
 
-        # ---------- карточки занятий ----------
+        # ---------- карточки пар ----------
         else:
             y = HEADER_H + 36
-
-            for lesson, ch in zip(lessons, card_heights):
+            for pair in pairs:
                 left = x1 + inner
                 top = y
+                ch = pair_card_height(pair)
+                items = _render_items_for_pair(
+                    pair, change_by_key, removed_by_pair
+                )
+                pair_has_change = any(
+                    it["kind"] != "normal" for it in items
+                )
 
                 # тень
                 draw.rounded_rectangle(
@@ -1192,18 +1924,18 @@ def render_schedule_image(schedule: Schedule) -> Path:
                     (x1, top, x2, top + ch),
                     radius=30,
                     fill=COL_WHITE,
-                    outline=COL_BORDER,
-                    width=2,
+                    outline=COL_ACCENT if pair_has_change else COL_BORDER,
+                    width=3 if pair_has_change else 2,
                 )
 
-                # --- круг с номером пары ---
+                # --- кружок пары ---
                 cy_top = top + top_pad
                 cx = left
                 draw.ellipse(
                     (cx, cy_top, cx + circle_s, cy_top + circle_s),
                     fill=COL_ACCENT,
                 )
-                roman = lesson.pair
+                roman = clean_text(pair.number).upper()
                 rw = draw.textlength(roman, font=font_pair)
                 rh = _text_h(font_pair)
                 draw.text(
@@ -1214,61 +1946,202 @@ def render_schedule_image(schedule: Schedule) -> Path:
                     fill=COL_WHITE,
                 )
 
-                # --- время рядом с кругом ---
+                # --- время ---
                 time_y = cy_top + (circle_s - _text_h(font_time)) / 2
                 draw.text((left + circle_s + 34, time_y),
-                          f"{lesson.start} — {lesson.end}",
+                          f"{pair.start} — {pair.end}",
                           font=font_time, fill=COL_ACCENT)
+                if pair.break_duration:
+                    break_text = f"перемена {pair.break_duration}"
+                    draw.text(
+                        (left + circle_s + 34,
+                         cy_top + circle_s + 4),
+                        break_text,
+                        font=font_break,
+                        fill=COL_MUTED,
+                    )
 
-                # --- предмет (самый заметный текст карточки) ---
-                subject_lines = subject_lines_for(lesson)
-                sy = top + subj_top
-                for i, line in enumerate(subject_lines):
-                    draw.text((left, sy + i * line_h), line,
-                              font=font_subject, fill=COL_INK)
-                subj_block_h = line_h * len(subject_lines)
+                # --- блоки занятий/подгрупп ---
+                by = top + top_pad + circle_s + 24
+                for item in items:
+                    lesson = item["lesson"]
+                    kind = item["kind"]
+                    h = item_block_height(item)
 
-                # --- аудитория + преподаватель (вторичная информация) ---
-                meta_top = top + subj_top + subj_block_h + meta_gap
-                meta_h = _text_h(font_info)
+                    # Подсветка изменений.
+                    if kind == "changed":
+                        fill = COL_WARN_LIGHT
+                        outline = COL_WARN
+                    elif kind == "added":
+                        fill = COL_GREEN_LIGHT
+                        outline = COL_GREEN
+                    elif kind == "removed":
+                        fill = COL_RED_LIGHT
+                        outline = COL_RED
+                    else:
+                        fill = None
+                        outline = None
 
-                room_text = f"ауд. {lesson.room}" if lesson.room not in ("", "—") \
-                    else "ауд. —"
-                room_w = draw.textlength(room_text, font=font_info)
-                room_chip_pad = 18
-                room_chip_w = room_w + room_chip_pad * 2
-                ry = meta_top
-                draw.rounded_rectangle(
-                    (left, ry, left + room_chip_w, ry + chip_h),
-                    radius=chip_h / 2,
-                    fill=COL_GREEN_LIGHT,
-                )
-                draw.text(
-                    (left + room_chip_pad, ry + (chip_h - meta_h) / 2),
-                    room_text,
-                    font=font_info,
-                    fill=COL_GREEN,
-                )
+                    if fill is not None:
+                        draw.rounded_rectangle(
+                            (left - 6, by, x2 - inner + 6, by + h),
+                            radius=14,
+                            fill=fill,
+                            outline=outline,
+                            width=2,
+                        )
 
-                # преподаватель
-                teacher = lesson.teacher if lesson.teacher not in ("", "—") \
-                    else "Преподаватель не указан"
-                teacher_x = left + room_chip_w + 24
-                teacher_max_w = (x2 - inner) - teacher_x
-                if draw.textlength(teacher, font=font_info) > teacher_max_w:
-                    while (draw.textlength(teacher, font=font_info)
-                           > teacher_max_w and len(teacher) > 1):
-                        teacher = teacher[:-1]
-                    teacher += "…"
+                    inner_y = by + 8
 
-                draw.text(
-                    (teacher_x, ry + (chip_h - meta_h) / 2),
-                    teacher,
-                    font=font_info,
-                    fill=COL_MUTED,
-                )
+                    # Подгруппа.
+                    subgroup_txt = _subgroup_label(lesson.subgroup)
+                    if subgroup_txt:
+                        draw.rounded_rectangle(
+                            (left, inner_y, left + draw.textlength(
+                                subgroup_txt, font=font_subg
+                            ) + 24, inner_y + subg_h),
+                            radius=subg_h / 2,
+                            fill=COL_ACCENT_LIGHT,
+                        )
+                        draw.text(
+                            (left + 12,
+                             inner_y + (subg_h - _text_h(font_subg)) / 2),
+                            subgroup_txt,
+                            font=font_subg,
+                            fill=COL_ACCENT,
+                        )
+                        inner_y += subg_h + 6
+
+                    # Статус изменения (без эмодзи: шрифт DejaVu их не рисует).
+                    if kind == "changed":
+                        status = "ИЗМЕНЕНО"
+                        color = COL_WARN
+                    elif kind == "added":
+                        status = "ДОБАВЛЕНО"
+                        color = COL_GREEN
+                    elif kind == "removed":
+                        status = "УДАЛЕНО"
+                        color = COL_RED
+                    else:
+                        status = ""
+
+                    if status:
+                        sw2 = draw.textlength(status, font=font_status)
+                        draw.text(
+                            (x2 - inner - sw2, inner_y),
+                            status,
+                            font=font_status,
+                            fill=color,
+                        )
+                        inner_y += status_h
+
+                    # Предмет.
+                    subject = clean_text(lesson.subject) or "Предмет не указан"
+                    subj_lines = subject_lines_for(subject)
+                    for idx, line in enumerate(subj_lines):
+                        draw.text(
+                            (left, inner_y + idx * line_h),
+                            line,
+                            font=font_subject,
+                            fill=COL_INK,
+                        )
+                    inner_y += line_h * len(subj_lines)
+
+                    # Аудитория + преподаватель.
+                    inner_y += 14
+                    meta_y = inner_y
+                    room_text = (
+                        f"ауд. {lesson.room}"
+                        if clean_text(lesson.room) not in ("", "—")
+                        else "ауд. —"
+                    )
+                    room_color = COL_RED if kind == "removed" else COL_GREEN
+                    room_fill = (
+                        COL_RED_LIGHT if kind == "removed" else COL_GREEN_LIGHT
+                    )
+                    room_w = draw.textlength(room_text, font=font_info)
+                    room_chip_pad = 18
+                    room_chip_w = room_w + room_chip_pad * 2
+                    draw.rounded_rectangle(
+                        (left, meta_y,
+                         left + room_chip_w, meta_y + chip_h),
+                        radius=chip_h / 2,
+                        fill=room_fill,
+                    )
+                    draw.text(
+                        (left + room_chip_pad,
+                         meta_y + (chip_h - _text_h(font_info)) / 2),
+                        room_text,
+                        font=font_info,
+                        fill=room_color,
+                    )
+
+                    teacher = (
+                        clean_text(lesson.teacher)
+                        if clean_text(lesson.teacher) not in ("", "—")
+                        else "Преподаватель не указан"
+                    )
+                    teacher_x = left + room_chip_w + 24
+                    teacher_max_w = (x2 - inner) - teacher_x
+                    teacher = _truncate(teacher, font_info, teacher_max_w)
+                    draw.text(
+                        (teacher_x, meta_y + (chip_h - _text_h(font_info)) / 2),
+                        teacher,
+                        font=font_info,
+                        fill=COL_MUTED,
+                    )
+                    inner_y += chip_h
+
+                    # Было -> стало для изменённых полей.
+                    if kind == "changed":
+                        inner_y += 8
+                        for detail in item["details"]:
+                            label_name = detail.get("label") or detail.get(
+                                "field", ""
+                            )
+                            old_val = clean_text(detail.get("old", ""))
+                            new_val = clean_text(detail.get("new", ""))
+                            line = (
+                                f"{label_name}: "
+                                f"{old_val or '—'} -> {new_val or '—'}"
+                            )
+                            draw.text(
+                                (left, inner_y),
+                                _truncate(line, font_detail, text_w),
+                                font=font_detail,
+                                fill=COL_WARN,
+                            )
+                            inner_y += detail_h
+
+                    # --- подвал блока ---
+                    by += h + item_gap
 
                 y += ch + card_gap
+
+        # ---------- блок «Что изменилось» ----------
+        if summary_lines:
+            sy = HEADER_H + 36 + cards_h + (36 if lessons else 0)
+            summary_h_actual = 50 + summary_lines.__len__() * 34 + 20
+            draw.rounded_rectangle(
+                (x1, sy, x2, sy + summary_h_actual),
+                radius=30,
+                fill=COL_WHITE,
+                outline=COL_WARN,
+                width=2,
+            )
+            tys = sy + 24
+            heading = "Что изменилось:"
+            draw.text((x1 + inner, tys), heading,
+                      font=font_summary, fill=COL_WARN)
+            tys += 44
+            for line in summary_lines:
+                draw.text(
+                    (x1 + inner + 8, tys),
+                    _truncate(line, font_summary_body, text_w - 16),
+                    font=font_summary_body,
+                    fill=COL_INK,
+                )
+                tys += 34
 
         # ---------- подвал ----------
         footer = "ИНК · расписание"
@@ -1281,7 +2154,10 @@ def render_schedule_image(schedule: Schedule) -> Path:
         )
 
         # ---------- сохранение ----------
-        filename = f"schedule_{schedule.date.isoformat()}_{len(lessons)}.png"
+        suffix = "_changed" if changes else ""
+        filename = (
+            f"schedule_{schedule.date.isoformat()}_{len(lessons)}{suffix}.png"
+        )
         path = IMAGE_DIR / filename
         image.save(path, "PNG", optimize=True)
         logger.info("Изображение сохранено: %s (%sx%s)", path, W, H)
@@ -1802,8 +2678,75 @@ async def cb_help(callback: CallbackQuery):
 # МОНИТОРИНГ ИЗМЕНЕНИЙ
 # ============================================================
 
+def _change_title_text(change) -> str:
+    pair = clean_text(change.pair).upper()
+    subgroup = clean_text(change.subgroup) or None
+    label = f"{pair} пара"
+    if subgroup:
+        label += f" • {subgroup} п/гр."
+    return label
+
+
+def _format_change_text(change) -> str:
+    """Короткий текст изменения для caption/уведомления."""
+    label = _change_title_text(change)
+    if change.kind == "added":
+        new = change.new or {}
+        return (
+            f"🟢 <b>Добавлено:</b> {label}\n"
+            f"{clean_text(new.get('subject') or 'Предмет не указан')}"
+            + (
+                f", {clean_text(new.get('room') or '—')}"
+                if new.get("room")
+                else ""
+            )
+        )
+    if change.kind == "removed":
+        old = change.old or {}
+        return (
+            f"🔴 <b>Удалено:</b> {label}\n"
+            f"{clean_text(old.get('subject') or 'Предмет не указан')}"
+            + (
+                f", {clean_text(old.get('room') or '—')}"
+                if old.get("room")
+                else ""
+            )
+        )
+
+    lines = [f"🟡 <b>Изменено:</b> {label}"]
+    for detail in change.details[:8]:
+        field_label = detail.get("label") or detail.get("field", "")
+        old_val = clean_text(detail.get("old", ""))
+        new_val = clean_text(detail.get("new", ""))
+        lines.append(
+            f"• {field_label}: {old_val or '—'} → {new_val or '—'}"
+        )
+    return "\n".join(lines)
+
+
+def _changes_text_summary(changes: list, max_char: int = 800) -> str:
+    if not changes:
+        return ""
+    parts = []
+    total_chars = 0
+    for change in changes[:12]:
+        text = _format_change_text(change)
+        if total_chars + len(text) > max_char:
+            break
+        parts.append(text)
+        total_chars += len(text)
+    if len(changes) > len(parts):
+        parts.append(
+            f"… и ещё {len(changes) - len(parts)} изменений"
+        )
+    return "\n\n".join(parts)
+
+
 def _notification_caption(
-    schedule: Schedule, day: date, first_time: bool
+    schedule: Schedule,
+    day: date,
+    first_time: bool,
+    changes=None,
 ) -> str:
     """Подпись уведомления — всегда с явным указанием дня.
 
@@ -1818,12 +2761,21 @@ def _notification_caption(
         action = "🆕 <b>Расписание опубликовано!</b>"
     else:
         action = "🔄 <b>Расписание изменилось!</b>"
-    return (
-        f"{action}\n\n"
-        f"📅 {day_str}\n"
-        f"👥 Группа: <b>{schedule.group}</b>\n"
-        f"🕐 Занятий: {len(schedule.lessons)}"
-    )
+
+    lines = [
+        action,
+        "",
+        f"📅 {day_str}",
+        f"👥 Группа: <b>{schedule.group}</b>",
+        f"🕐 Занятий: {len(schedule.lessons)}",
+    ]
+
+    if not first_time and changes:
+        summary = _changes_text_summary(changes)
+        if summary:
+            lines.extend(["", "Что изменилось:", summary])
+
+    return "\n".join(lines)[:1000]
 
 
 async def _notify_changed(
@@ -1832,6 +2784,7 @@ async def _notify_changed(
     day: date,
     signature: str,
     first_time: bool,
+    changes=None,
 ) -> int:
     """Отправляет актуальное расписание ТЕМ, кто его ещё не получил.
 
@@ -1859,8 +2812,15 @@ async def _notify_changed(
         )
         return 0, 0
 
-    image_path = render_schedule_image(schedule)
-    caption = _notification_caption(schedule, day, first_time)
+    changes = changes or []
+    image_path = render_schedule_image(
+        schedule,
+        changes=changes,
+        title="РАСПИСАНИЕ ИЗМЕНИЛОСЬ" if not first_time else "РАСПИСАНИЕ ОПУБЛИКОВАНО",
+    )
+    caption = _notification_caption(
+        schedule, day, first_time, changes
+    )
     delivered = 0
     still_pending = 0  # получатели, которым сообщение реально не ушло
 
@@ -1959,22 +2919,46 @@ async def _check_date(bot: Bot, day: date) -> None:
     logger.info("Hash расписания %s: %s", date_key, signature)
 
     state = load_state()
-    old = state.get(date_key)
+    old_state = state.get(date_key)
+    old_hash = old_state.get("hash") if old_state else None
 
-    if old == signature:
+    if old_hash == signature:
         logger.info("Изменений нет: %s", date_key)
         return
 
-    first_time = old is None
+    first_time = old_state is None
+    changes = []
+    if not first_time:
+        old_data = old_state.get("data") if old_state else None
+        if old_data is None:
+            # Старая база без сохранённого data: не выдумываем «было пусто
+            # -> стало всё добавлено». Одноразово сообщим об обновлении.
+            logger.info(
+                "Проверка %s: старое data отсутствует — построчное сравнение "
+                "не выполняется.",
+                date_key,
+            )
+        else:
+            old_schedule = schedule_from_storage(old_data, day)
+            changes = compare_schedules(old_schedule, schedule)
+            logger.info(
+                "Найдено изменений %s: %s", date_key, len(changes)
+            )
+
     logger.info(
         "%s: %s (%s)",
         "РАСПИСАНИЕ ПОЯВИЛОСЬ" if first_time else "РАСПИСАНИЕ ИЗМЕНИЛОСЬ",
         date_key,
-        f"занятий: {len(schedule.lessons)}",
+        f"занятий: {len(schedule.lessons)}, изменений: {len(changes)}",
     )
 
     delivered, still_pending = await _notify_changed(
-        bot, schedule, day, signature, first_time
+        bot,
+        schedule,
+        day,
+        signature,
+        first_time,
+        changes=changes,
     )
 
     # Состояние фиксируем только когда расписание реально ушло всем
@@ -1982,7 +2966,10 @@ async def _check_date(bot: Bot, day: date) -> None:
     # Если хоть один получатель не получил уведомление — состояние не
     # обновляется, и в следующем цикле отправка повторится только ему.
     if still_pending == 0:
-        state[date_key] = signature
+        state[date_key] = {
+            "hash": signature,
+            "data": normalize_schedule(schedule),
+        }
         save_state(state)
         logger.info(
             "Состояние %s обновлено (доставлено: %s).", date_key, delivered
