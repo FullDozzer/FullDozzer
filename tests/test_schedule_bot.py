@@ -13,6 +13,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
+from PIL import Image
+
 # Изолируем БД до импорта модуля
 _TEST_DATA = Path(tempfile.mkdtemp(prefix="sched_bot_test_"))
 os.environ["DATA_DIR"] = str(_TEST_DATA)
@@ -818,6 +820,31 @@ class TestMonitoring(DBTestCase):
         self.assertEqual(self.bot.sent, [])
         self.assertNotIn(sunday.isoformat(), bot.load_state())
 
+    def test_state_saves_normalized_data_json(self):
+        day = date(2026, 9, 7)
+        schedule = bot.Schedule(
+            date=day,
+            group=bot.GROUP_NAME,
+            lessons=[
+                lesson("II", "1"),
+                lesson("II", "2", room="ПК303"),
+            ],
+        )
+        state = {
+            day.isoformat(): {
+                "hash": bot.schedule_signature(schedule),
+                "data": bot.normalize_schedule(schedule),
+            }
+        }
+        bot.save_state(state)
+        loaded = bot.load_state()[day.isoformat()]
+        self.assertEqual(loaded["hash"], state[day.isoformat()]["hash"])
+        self.assertEqual(len(loaded["data"]), 2)
+        restored = bot.schedule_from_storage(loaded["data"], day)
+        self.assertEqual(
+            len(bot.compare_schedules(restored, schedule)), 0
+        )
+
 
 class TestChangelogDelivery(DBTestCase):
     def setUp(self):
@@ -898,6 +925,336 @@ class TestChangelogDelivery(DBTestCase):
                          last_notified_version="2.1.4")
         run(bot._process_changelog(self.bot))
         self.assertEqual(self.bot.sent, [])
+
+
+PROVIDED_HTML = """
+<html><body>
+  <div class="card myCard">
+    <div class="card-header">
+      <span class="h3">I</span> пара
+      <span class="pl-2 h4">08<sup>30</sup> - 09<sup>50</sup></span>
+      <span class="pl-1">перемена 15 мин</span>
+    </div>
+    <div class="card-body p-0">
+      <div class="d-md-none text-center text-truncate">Химия Н и Г</div>
+      <span>ауд.<span class="h5">УК307</span></span>
+      <span class="Staff">Арнаутова А.В.</span>
+    </div>
+  </div>
+
+  <div class="card myCard">
+    <div class="card-header">
+      <span class="h3">II</span> пара
+      <span class="pl-2 h4">10<sup>00</sup> - 11<sup>20</sup></span>
+      <span class="pl-1">перемена 15 мин</span>
+    </div>
+    <div class="card-body p-0">
+      <div class="d-flex flex-column subGroup1">
+        <span>1</span> п/гр.
+        <span>ауд.<span class="h5">ПК103</span></span>
+        <span class="Staff">Мурзабулатова Ф.Ф.</span>
+        <span class="d-md-none text-center text-truncate">Ин.яз.</span>
+      </div>
+      <div class="d-flex flex-column subGroup2">
+        <span>2</span> п/гр.
+        <span>ауд.<span class="h5 font-weight-bold">ПК303</span></span>
+        <span class="Staff">Амирханова Г.А.</span>
+        <span class="d-md-none text-center text-truncate">Ин.яз.</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card myCard">
+    <div class="card-header">
+      <span class="h3">III</span> пара
+      <span class="pl-2 h4">11<sup>40</sup> - 13<sup>00</sup></span>
+    </div>
+    <div class="card-body p-0">
+      <div class="d-md-none text-center text-truncate">Экспл Н/Г мест</div>
+      <span>ауд.<span class="h5">ПК217</span></span>
+      <span class="Staff">Степанов С.В.</span>
+    </div>
+  </div>
+
+  <div class="card myCard">
+    <div class="card-header">
+      <span class="h3">IV</span> пара
+      <span class="pl-2 h4">13<sup>20</sup> - 14<sup>40</sup></span>
+    </div>
+    <div class="card-body p-0">
+      <div class="d-md-none text-center text-truncate">Пром безопас</div>
+      <span>ауд.<span class="h5">ПК201</span></span>
+      <span class="Staff">Гайзуллин И.Т.</span>
+    </div>
+  </div>
+</body></html>
+"""
+
+
+def lesson(
+    pair="II",
+    subgroup=None,
+    subject="Ин.яз.",
+    room="ПК103",
+    teacher="Мурзабулатова Ф.Ф.",
+    start="10:00",
+    end="11:20",
+):
+    return bot.Lesson(
+        pair=pair,
+        time=f"{start} - {end}",
+        subject=subject,
+        teacher=teacher,
+        room=room,
+        start=start,
+        end=end,
+        subgroup=subgroup,
+    )
+
+
+class TestSubgroupParsing(unittest.TestCase):
+    def test_provided_html_has_both_subgroups(self):
+        day = date(2026, 9, 7)
+        schedule = bot.parse_schedule(PROVIDED_HTML, day)
+        self.assertEqual(len(schedule.lessons), 5)
+
+        pair_i = [x for x in schedule.lessons if x.pair == "I"]
+        pair_ii = [x for x in schedule.lessons if x.pair == "II"]
+
+        self.assertEqual(len(pair_i), 1)
+        self.assertIsNone(pair_i[0].subgroup)
+        self.assertEqual(pair_i[0].subject, "Химия Н и Г")
+        self.assertEqual(pair_i[0].room, "УК307")
+        self.assertEqual(pair_i[0].teacher, "Арнаутова А.В.")
+
+        # Главное требование: вторая подгруппа не потеряна.
+        self.assertEqual(len(pair_ii), 2)
+        by_sub = {bot.clean_text(x.subgroup): x for x in pair_ii}
+        self.assertEqual(set(by_sub), {"1", "2"})
+        self.assertEqual(by_sub["1"].subject, "Ин.яз.")
+        self.assertEqual(by_sub["1"].room, "ПК103")
+        self.assertEqual(by_sub["1"].teacher, "Мурзабулатова Ф.Ф.")
+        self.assertEqual(by_sub["2"].subject, "Ин.яз.")
+        self.assertEqual(by_sub["2"].room, "ПК303")
+        self.assertEqual(by_sub["2"].teacher, "Амирханова Г.А.")
+
+        # Пары: II содержит два занятия, III/IV по одному.
+        pairs = {p.number: p for p in schedule.pairs}
+        self.assertEqual(len(pairs["II"].lessons), 2)
+        self.assertEqual(len(pairs["III"].lessons), 1)
+        self.assertEqual(pairs["III"].lessons[0].room, "ПК217")
+        self.assertEqual(len(pairs["IV"].lessons), 1)
+        self.assertEqual(pairs["IV"].lessons[0].room, "ПК201")
+
+    def test_plain_text_without_known_classes_still_parses_subgroups(self):
+        html = """
+        <div class="card myCard">
+          <div class="card-header"><span class="h3">II</span> пара
+            <span class="h4">10<sup>00</sup> - 11<sup>20</sup></span></div>
+          <div class="card-body">
+            <div class="d-flex flex-column subGroup1">
+              <span>1</span> п/гр.
+              <span>ауд.<span class="h5">ПК103</span></span>
+              Мурзабулатова Ф.Ф.
+              Ин.яз.
+            </div>
+            <div class="d-flex flex-column subGroup2">
+              <span>2</span> п/гр.
+              <span>ауд.<span class="h5">ПК303</span></span>
+              Амирханова Г.А.
+              Ин.яз.
+            </div>
+          </div>
+        </div>
+        """
+        schedule = bot.parse_schedule(html, date(2026, 9, 7))
+        self.assertEqual(len(schedule.lessons), 2)
+        self.assertEqual(schedule.lessons[0].subgroup, "1")
+        self.assertEqual(schedule.lessons[0].subject, "Ин.яз.")
+        self.assertEqual(schedule.lessons[0].teacher, "Мурзабулатова Ф.Ф.")
+        self.assertEqual(schedule.lessons[1].subgroup, "2")
+        self.assertEqual(schedule.lessons[1].subject, "Ин.яз.")
+        self.assertEqual(schedule.lessons[1].teacher, "Амирханова Г.А.")
+
+    def test_ordinary_pair_has_no_fake_subgroup(self):
+        schedule = bot.parse_schedule(PROVIDED_HTML, date(2026, 9, 7))
+        ordinary = [x for x in schedule.lessons if x.pair == "I"][0]
+        self.assertIsNone(ordinary.subgroup)
+        self.assertEqual(ordinary.subject, "Химия Н и Г")
+
+
+class TestScheduleComparison(unittest.TestCase):
+    def make(self, days=None, lessons=None):
+        return bot.Schedule(
+            date=days or date(2026, 9, 7),
+            group=bot.GROUP_NAME,
+            lessons=lessons or [],
+        )
+
+    def test_room_change_only_target_subgroup(self):
+        old = self.make(lessons=[
+            lesson("II", "1", room="ПК103"),
+            lesson("II", "2", room="ПК303"),
+        ])
+        new = self.make(lessons=[
+            lesson("II", "1", room="ПК103"),
+            lesson("II", "2", room="ПК305"),
+        ])
+        changes = bot.compare_schedules(old, new)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].kind, "changed")
+        self.assertEqual(changes[0].subgroup, "2")
+        self.assertEqual(len(changes[0].details), 1)
+        self.assertEqual(changes[0].details[0]["field"], "room")
+        self.assertEqual(changes[0].details[0]["old"], "ПК303")
+        self.assertEqual(changes[0].details[0]["new"], "ПК305")
+
+    def test_teacher_subject_and_time_changes(self):
+        old = self.make(lessons=[lesson(subgroup=None, subject="Ин.яз.")])
+        new = self.make(lessons=[
+            lesson(subgroup=None, subject="Математика", teacher="Иванова А.А.",
+                   start="10:00", end="11:30")
+        ])
+        changes = bot.compare_schedules(old, new)
+        self.assertEqual(len(changes), 1)
+        fields = {d["field"] for d in changes[0].details}
+        self.assertIn("subject", fields)
+        self.assertIn("teacher", fields)
+        self.assertIn("time", fields)
+
+    def test_added_subgroup_detected(self):
+        old = self.make(lessons=[lesson("II", "1")])
+        new = self.make(lessons=[
+            lesson("II", "1"),
+            lesson("II", "2", room="ПК303", teacher="Амирханова Г.А."),
+        ])
+        changes = bot.compare_schedules(old, new)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].kind, "added")
+        self.assertEqual(changes[0].subgroup, "2")
+
+    def test_removed_subgroup_detected(self):
+        old = self.make(lessons=[
+            lesson("II", "1"),
+            lesson("II", "2", room="ПК303", teacher="Амирханова Г.А."),
+        ])
+        new = self.make(lessons=[lesson("II", "1")])
+        changes = bot.compare_schedules(old, new)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].kind, "removed")
+        self.assertEqual(changes[0].subgroup, "2")
+
+    def test_added_and_removed_pair(self):
+        old = self.make(lessons=[lesson("I", subject="Химия")])
+        new = self.make(lessons=[
+            lesson("I", subject="Химия"),
+            lesson("IV", subject="Пром безопас", room="ПК201",
+                   teacher="Гайзуллин И.Т.", start="13:20", end="14:40"),
+        ])
+        changes = bot.compare_schedules(old, new)
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0].kind, "added")
+        self.assertEqual(changes[0].pair, "IV")
+
+        old2 = self.make(lessons=[
+            lesson("I"),
+            lesson("II", "2"),
+        ])
+        new2 = self.make(lessons=[lesson("I")])
+        changes2 = bot.compare_schedules(old2, new2)
+        self.assertEqual(len(changes2), 1)
+        self.assertEqual(changes2[0].kind, "removed")
+        self.assertEqual(changes2[0].pair, "II")
+
+    def test_no_changes(self):
+        old = self.make(lessons=[lesson("II", "1"), lesson("II", "2")])
+        new = self.make(lessons=[lesson("II", "1"), lesson("II", "2")])
+        self.assertEqual(bot.compare_schedules(old, new), [])
+
+    def test_whitespace_and_case_are_invisible_to_hash(self):
+        old = bot.Schedule(date=date(2026, 9, 7), group=bot.GROUP_NAME,
+                           lessons=[lesson(room=" ПК103 ",
+                                           subject=" ин.яз. ")])
+        new = bot.Schedule(date=date(2026, 9, 7), group=bot.GROUP_NAME,
+                           lessons=[lesson(room="ПК103", subject="Ин.яз.")])
+        self.assertEqual(bot.schedule_signature(old), bot.schedule_signature(new))
+
+
+class TestPillowRendering(unittest.TestCase):
+    def test_render_subgroups_and_changes_dynamic_height(self):
+        schedule = bot.Schedule(
+            date=date(2026, 9, 7),
+            group=bot.GROUP_NAME,
+            lessons=[
+                lesson("I", None, "Химия Н и Г", "УК307", "Арнаутова А.В."),
+                lesson("II", "1"),
+                lesson("II", "2", room="ПК305"),
+                lesson(
+                    "III", None, "Очень длинное название предмета для проверки "
+                    "переноса текста в несколько строк внутри Pillow",
+                    "ПК217", "Степанов Сергей Владимирович Иванов Пётр Петрович",
+                    "11:40", "13:00",
+                ),
+            ],
+        )
+        changes = bot.compare_schedules(
+            bot.Schedule(
+                date=date(2026, 9, 7),
+                group=bot.GROUP_NAME,
+                lessons=[
+                    lesson("I", None, "Химия Н и Г", "УК307", "Арнаутова А.В."),
+                    lesson("II", "1"),
+                    lesson("II", "2", room="ПК303"),
+                    lesson(
+                        "III", None, "Очень длинное название предмета для проверки "
+                        "переноса текста в несколько строк внутри Pillow",
+                        "ПК217", "Степанов Сергей Владимирович Иванов Пётр Петрович",
+                        "11:40", "13:00",
+                    ),
+                ],
+            ),
+            schedule,
+        )
+        self.assertEqual(len(changes), 1)
+        normal = bot.render_schedule_image(schedule)
+        changed = bot.render_schedule_image(schedule, changes=changes)
+        with Image.open(normal) as img_n, Image.open(changed) as img_c:
+            self.assertGreater(img_n.size[0], 500)
+            self.assertGreater(img_n.size[1], 300)
+            # У изменённой картинки есть блок «Что изменилось» => выше.
+            self.assertGreater(img_c.size[1], img_n.size[1])
+
+    def test_render_added_and_removed_subgroups(self):
+        old = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
+                           lessons=[lesson("II", "1")])
+        new = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
+                           lessons=[
+                               lesson("II", "1"),
+                               lesson("II", "2", room="ПК303",
+                                      teacher="Амирханова Г.А."),
+                           ])
+        changes = bot.compare_schedules(old, new)
+        self.assertEqual(changes[0].kind, "added")
+        path = bot.render_schedule_image(new, changes=changes)
+        self.assertTrue(path.exists())
+
+    def test_render_many_changes_doesnt_crash(self):
+        lessons = []
+        changes = []
+        for i in range(1, 12):
+            lessons.append(lesson("II", str(i), subject=f"Предмет {i}"))
+            changes.append(bot.ScheduleChange(
+                kind="added",
+                pair="II",
+                subgroup=str(i),
+                old=None,
+                new={"subject": f"Предмет {i}", "room": "ПК100", "teacher": "—"},
+                details=[],
+            ))
+        schedule = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
+                                lessons=lessons)
+        path = bot.render_schedule_image(schedule, changes=changes)
+        self.assertTrue(path.exists())
 
 
 if __name__ == "__main__":
