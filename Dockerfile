@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
+COPY versioning.py .
 COPY fonts ./fonts
 
 RUN mkdir -p /app/data

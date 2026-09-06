@@ -7,7 +7,10 @@ Telegram-бот расписания группы ЭС7-24 (Институт н�
 - Игнорирует недельную таблицу.
 - Генерирует современную PNG-картинку через Pillow.
 - Поддержка подписок (SQLite), фоновый мониторинг изменений.
-- Работает в Docker, кодировка UTF-8, московское время.
+- Работает в Docker, кодировка UTF-8.
+- Все даты считаются в часовом поясе Asia/Yekaterinburg (UTC+5),
+  локальное время сервера не используется.
+- Версия 2.1.4 — система версий и changelog: versioning.py.
 """
 
 import asyncio
@@ -19,6 +22,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -42,6 +46,15 @@ from aiogram.types import (
     Message,
 )
 
+from versioning import (
+    BOT_VERSION,
+    CHANGELOG,
+    changelog_text,
+    get_released_at,
+    pending_versions,
+    version_key,
+)
+
 
 # ============================================================
 # НАСТРОЙКИ
@@ -59,14 +72,15 @@ BASE_URL = os.getenv(
 # Токен берётся только из переменной окружения / .env, не из кода.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Период автоматической проверки (секунды)
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))
+# Период автоматической проверки (секунды). 5 минут = 300
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 
 # Таймаут HTTP-запроса
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 
-# Время, из которого берётся «сегодня» / «завтра»
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+# Часовой пояс бота — фиксированный. Нельзя использовать локальное
+# время сервера, поэтому переменная TIMEZONE не берётся из окружения.
+TIMEZONE = "Asia/Yekaterinburg"  # UTC+5
 TZ = ZoneInfo(TIMEZONE)
 
 # Каталоги / файлы
@@ -139,6 +153,14 @@ logging.basicConfig(
 logger = logging.getLogger("schedule_bot")
 
 
+def _log_time_converter(timestamp: float, *_args):
+    """Время в логах тоже показываем по Asia/Yekaterinburg, а не по серверу."""
+    return now_local().timetuple()
+
+
+logging.Formatter.converter = _log_time_converter
+
+
 # ============================================================
 # КАТАЛОГИ / ИНИЦИАЛИЗАЦИЯ
 # ============================================================
@@ -148,7 +170,7 @@ IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# ДАТА (Московское время)
+# ДАТА (Asia/Yekaterinburg, UTC+5)
 # ============================================================
 
 WEEKDAYS = [
@@ -168,8 +190,18 @@ MONTHS_GEN = {
 }
 
 
+def now_local() -> datetime:
+    """Единственная точка получения текущего времени.
+
+    Всегда Asia/Yekaterinburg (UTC+5). Локальное время сервера
+    (datetime.now() без часового пояса) в логике не используется.
+    """
+    return datetime.now(TZ)
+
+
 def get_today() -> date:
-    return datetime.now(TZ).date()
+    """Сегодняшняя дата по Asia/Yekaterinburg. Пересчитывается каждый вызов."""
+    return now_local().date()
 
 
 def is_day_off(value: date) -> bool:
@@ -177,20 +209,35 @@ def is_day_off(value: date) -> bool:
     return value.weekday() == 6
 
 
-def next_study_day(value: date) -> date:
-    """Ближайший учебный день, начиная со следующего за value.
-
-    Если следующий день — воскресенье, берём понедельник.
-    """
-    candidate = value + timedelta(days=1)
-    while is_day_off(candidate):
-        candidate += timedelta(days=1)
-    return candidate
-
-
 def get_tomorrow() -> date:
-    """«Завтра» с пропуском воскресенья (тогда это понедельник)."""
-    return next_study_day(get_today())
+    """Строго следующий календарный день по Asia/Yekaterinburg.
+
+    Без «пропуска воскресенья» и без подстановки другой даты:
+    /schedule должен показывать ровно завтра.
+    """
+    return get_today() + timedelta(days=1)
+
+
+def parse_db_datetime(value: str) -> Optional[datetime]:
+    """Разбирает дату/время из БД как время Asia/Yekaterinburg."""
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def day_label_for(day: date) -> str:
+    """«Сегодня» / «Завтра» для однозначных уведомлений."""
+    today = get_today()
+    if day == today:
+        return "Сегодня"
+    if day == today + timedelta(days=1):
+        return "Завтра"
+    return format_date_header(day)
 
 
 MONTH_NAMES = {
@@ -203,7 +250,6 @@ MONTH_NAMES = {
 _DATE_PATTERNS = (
     "%Y-%m-%d",
     "%d.%m.%Y",
-    "%d.%m.%y",
     "%d/%m/%Y",
     "%d-%m-%Y",
     "%d.%m",
@@ -241,22 +287,49 @@ def parse_user_date(raw: str):
             delta = (index - today.weekday()) % 7
             return today + timedelta(days=delta)
 
+    # Двухзначный год: 04.09.26 -> 2026 (однозначное правило,
+    # без угадывания века; не полагаемся на платформенный %y).
+    match = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{2})", text)
+    if match:
+        try:
+            return date(
+                2000 + int(match.group(3)),
+                int(match.group(2)),
+                int(match.group(1)),
+            )
+        except ValueError:
+            return None
+
     # Числовые форматы.
     for pattern in _DATE_PATTERNS:
         try:
             parsed = datetime.strptime(text, pattern)
         except ValueError:
             continue
-        if "%Y" not in pattern and "%y" not in pattern:
+        if "%Y" not in pattern:
             parsed = parsed.replace(year=today.year)
         return parsed.date()
 
-    # Текстовый месяц: «4 сентября» / «4 сентября 2026».
-    match = re.fullmatch(r"(\d{1,2}) ([а-яё]+)(?: (\d{4}))?", text)
+    # Текстовый месяц: «4 сентября», «4 сентября 2026»,
+    # «4 сентября 2026 года», «4 сентября 2026г», «4 сентябрь»,
+    # «4 сентября 26».
+    match = re.fullmatch(
+        r"(\d{1,2})\s+([а-яё]+)"
+        r"(?:\s+(\d{2,4})\s*(?:год[а-яё]*|г\.?)?)?",
+        text,
+    )
     if match:
         day_num = int(match.group(1))
         month_word = match.group(2)
-        year = int(match.group(3)) if match.group(3) else today.year
+        raw_year = match.group(3)
+
+        if raw_year:
+            year = int(raw_year)
+            if len(raw_year) == 2:
+                # Однозначное правило: 26 -> 2026.
+                year = 2000 + year
+        else:
+            year = today.year
 
         month = None
         for stem, number in MONTH_NAMES.items():
@@ -271,6 +344,68 @@ def parse_user_date(raw: str):
                 return None
 
     return None
+
+
+# ============================================================
+# ТЕКСТОВАЯ КОМАНДА «РАСПИСАНИЕ»
+# ============================================================
+
+@dataclass
+class ScheduleTextRequest:
+    """Результат разбора текстовой команды «расписание…».
+
+    - matched=False — сообщение не команда (бота не касается);
+    - date=None, error=False — «расписание» без даты -> завтра;
+    - date=<дата> — распознанная дата;
+    - error=True — «расписание» есть, но дату определить не удалось.
+    """
+
+    matched: bool = False
+    date: Optional[date] = None
+    error: bool = False
+
+
+_SCHEDULE_TEXT_RE = re.compile(r"^расписание(.*)$", re.IGNORECASE)
+
+
+def parse_schedule_text(text: str) -> ScheduleTextRequest:
+    """Разбирает «расписание» и «расписание на <дата>».
+
+    Отдельная функция: обработка команды -> парсинг даты -> get_schedule.
+    Устойчива к регистру и лишним пробелам. Относительные даты
+    («сегодня», «завтра», «послезавтра») считаются в часовом поясе
+    Asia/Yekaterinburg. Ошибок «угадывания» нет: непонятная дата
+    возвращает error=True.
+    """
+    if not text:
+        return ScheduleTextRequest()
+
+    normalized = clean_text(text).lower()
+    match = _SCHEDULE_TEXT_RE.match(normalized)
+    if not match:
+        return ScheduleTextRequest()
+
+    rest = match.group(1).strip()
+    if not rest:
+        # Просто «расписание» -> расписание на завтра.
+        return ScheduleTextRequest(matched=True)
+
+    # Дальше допускается только «на <дата>».
+    arg_match = re.fullmatch(r"на(?:\s+(.+))?", rest)
+    if not arg_match:
+        # «расписание чего-то» — это не наша команда.
+        return ScheduleTextRequest()
+
+    arg = clean_text(arg_match.group(1) or "")
+    if not arg:
+        # «расписание на» без даты — подсказка, не угадываем.
+        return ScheduleTextRequest(matched=True, error=True)
+
+    target = parse_user_date(arg)
+    if target is None:
+        return ScheduleTextRequest(matched=True, error=True)
+
+    return ScheduleTextRequest(matched=True, date=target)
 
 
 def format_date_full(value: date) -> str:
@@ -556,7 +691,12 @@ def parse_schedule(html: str, day: date) -> Schedule:
 
 
 async def get_schedule(day: date) -> Schedule:
-    """Получает и разбирает расписание. Бросает ScheduleUnavailable при сетевой ошибке."""
+    """Единая функция получения расписания ровно на переданную дату.
+
+    ВАЖНО: без скрытого fallback. Если расписания на `day` нет —
+    возвращается пустое расписание (lessons == []), а не данные
+    другой даты. При ошибке сети/источника бросается ScheduleUnavailable.
+    """
     html = await fetch_html(day)
 
     if html is None:
@@ -567,33 +707,6 @@ async def get_schedule(day: date) -> Schedule:
     except Exception:
         logger.exception("Ошибка парсинга HTML")
         raise ScheduleUnavailable("Ошибка парсинга расписания")
-
-
-async def get_schedule_with_fallback(target: date):
-    """
-    1. target_date.
-    2. Есть занятия -> вернуть их (fallback=False).
-    3. Нет занятий -> взять сегодняшнее; если есть — вернуть его (fallback=True).
-    4. И сегодня пусто -> вернуть пустое расписание.
-    """
-    if is_day_off(target):
-        # В воскресенье занятий не бывает — сразу показываем сегодняшний день.
-        today_schedule = await get_schedule(get_today())
-        today_schedule.fallback = True
-        return today_schedule
-
-    schedule = await get_schedule(target)
-
-    if schedule.lessons:
-        return schedule
-
-    today_schedule = await get_schedule(get_today())
-    today_schedule.fallback = True
-
-    if today_schedule.lessons:
-        return today_schedule
-
-    return today_schedule
 
 
 # ============================================================
@@ -656,12 +769,43 @@ def init_db() -> None:
                     " NOT NULL DEFAULT ''"
                 )
 
+            # 2.1.4: последняя версия changelog, успешно доставленная.
+            if "last_notified_version" not in existing:
+                conn.execute(
+                    "ALTER TABLE subscribers ADD COLUMN"
+                    " last_notified_version TEXT NOT NULL DEFAULT ''"
+                )
+
+            # Безопасная миграция created_at: если дату создания восстановить
+            # нельзя, считаем пользователя существовавшим до любых релизов —
+            # тогда старые пользователи получат changelog 2.1.4,
+            # а новые (созданные после релиза) его не получат.
+            conn.execute(
+                "UPDATE subscribers SET created_at = '1970-01-01 00:00:00'"
+                " WHERE created_at IS NULL OR created_at = ''"
+            )
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS schedule_state (
                     date       TEXT PRIMARY KEY,
                     hash       TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+            # 2.1.4: фактическая доставка расписания каждому подписчику
+            # (комбинация «подписчик + дата»), чтобы не отправлять
+            # повторно то же самое и не терять изменения при сбоях.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schedule_notifications (
+                    user_id INTEGER NOT NULL,
+                    date    TEXT NOT NULL,
+                    hash    TEXT NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, date)
                 )
                 """
             )
@@ -677,7 +821,7 @@ def subscribe_user(
 
     True если добавлен, False если уже был.
     """
-    created = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    created = now_local().strftime("%Y-%m-%d %H:%M:%S")
     try:
         with db_connect() as conn:
             cur = conn.execute(
@@ -738,6 +882,50 @@ def subscriber_info(user_id: int):
         return None
 
 
+def load_subscriber_rows() -> list:
+    """Все подписчики с created_at и last_notified_version."""
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT user_id, created_at, last_notified_version"
+                " FROM subscribers ORDER BY user_id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+    except Exception:
+        logger.exception("Ошибка SQLite (load subscriber rows)")
+        return []
+
+
+def mark_changelog_notified(user_id: int, version: str) -> bool:
+    """Отмечает версию changelog как успешно доставленную пользователю.
+
+    Сохраняет максимальную доставленную версию — это не мешает
+    будущим версиям (2.1.5, 2.1.6…), потому что eligibility
+    проверяется отдельно для каждой версии.
+    """
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT last_notified_version FROM subscribers"
+                " WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            current = row["last_notified_version"] or ""
+            if version_key(current) >= version_key(version):
+                return True
+            conn.execute(
+                "UPDATE subscribers SET last_notified_version = ?"
+                " WHERE user_id = ?",
+                (version, user_id),
+            )
+            return True
+    except Exception:
+        logger.exception("Ошибка SQLite (mark changelog notified)")
+        return False
+
+
 def load_state() -> dict:
     try:
         with db_connect() as conn:
@@ -752,7 +940,7 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     try:
-        now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        now = now_local().strftime("%Y-%m-%d %H:%M:%S")
         with db_connect() as conn:
             for date_key, digest in state.items():
                 conn.execute(
@@ -762,6 +950,42 @@ def save_state(state: dict) -> None:
                 )
     except Exception:
         logger.exception("Ошибка SQLite (save state)")
+
+
+def load_schedule_notifications() -> dict:
+    """{дата: {user_id: hash}} — последнее доставленное состояние каждому."""
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT user_id, date, hash FROM schedule_notifications"
+            ).fetchall()
+            result = {}
+            for row in rows:
+                result.setdefault(row["date"], {})[
+                    int(row["user_id"])
+                ] = row["hash"]
+            return result
+    except Exception:
+        logger.exception("Ошибка SQLite (load notifications)")
+        return {}
+
+
+def record_schedule_notification(
+    user_id: int, date_key: str, signature: str
+) -> bool:
+    """Фиксирует успешную отправку расписания подписчику."""
+    try:
+        now = now_local().strftime("%Y-%m-%d %H:%M:%S")
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO schedule_notifications"
+                " (user_id, date, hash, sent_at) VALUES (?, ?, ?, ?)",
+                (user_id, date_key, signature, now),
+            )
+            return True
+    except Exception:
+        logger.exception("Ошибка SQLite (record notification)")
+        return False
 
 
 init_db()
@@ -1073,12 +1297,15 @@ def render_schedule_image(schedule: Schedule) -> Path:
 # ============================================================
 
 def main_keyboard(is_subscribed: bool) -> InlineKeyboardMarkup:
-    """Одна кнопка «Расписание»: завтра, а если его нет — сегодня."""
+    """Кнопки «Сегодня» (/today) и «Завтра» (/schedule)."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📅 Расписание", callback_data="schedule"
+                    text="📅 Сегодня", callback_data="today"
+                ),
+                InlineKeyboardButton(
+                    text="📅 Завтра", callback_data="schedule"
                 ),
             ],
             [
@@ -1146,66 +1373,21 @@ async def _send_text(destination, text: str) -> None:
 
 
 async def _handle_today(destination):
+    """Команда /today: расписание ТОЛЬКО на сегодняшний день.
+
+    Никакого fallback на завтра/другую дату. Если расписания нет —
+    сообщаем об этом.
+    """
     try:
         today = get_today()
-
-        if is_day_off(today):
-            await _send_text(
-                destination,
-                f"📅 <b>Расписание на сегодня</b>\n\n"
-                f"Группа: <b>{GROUP_NAME}</b>\n"
-                f"{format_date_full(today)}\n\n"
-                "☕ Воскресенье — занятий нет.\n"
-                "Расписание на понедельник: /schedule",
-            )
-            return
-
         schedule = await get_schedule(today)
-        heading = f"📅 <b>Расписание на сегодня</b>\n\n"
-        if not schedule.lessons:
-            await _send_text(
-                destination,
-                heading + f"Группа: <b>{GROUP_NAME}</b>\n"
-                f"{format_date_full(get_today())}\n\n☕ Занятий нет.",
-            )
-            return
-        ok = await _send_photo(destination, schedule)
-        if not ok:
-            await _send_text(destination, "Не удалось отправить расписание.")
-    except ScheduleUnavailable:
-        await _send_text(
-            destination,
-            "😔 Не удалось получить расписание. Сайт недоступен, попробуй позже.",
-        )
-    except Exception:
-        logger.exception("Ошибка /schedule")
-
-
-async def _handle_schedule(destination):
-    """Расписание по умолчанию: на завтра, а если его нет — на сегодня."""
-    try:
-        target = get_tomorrow()
-        schedule = await get_schedule_with_fallback(target)
-
-        if schedule.fallback:
-            label = (
-                "на понедельник"
-                if target.weekday() == 0 and get_today().weekday() == 5
-                else "на завтра"
-            )
-            await _send_text(
-                destination,
-                f"ℹ️ Расписание {label} ({format_date_full(target)}) "
-                "не опубликовано — показываю расписание на сегодня.",
-            )
 
         if not schedule.lessons:
-            day = schedule.date
             await _send_text(
                 destination,
-                f"📅 <b>Расписание: {format_date_header(day)}</b>\n\n"
-                f"Группа: <b>{GROUP_NAME}</b>\n"
-                f"{format_date_full(day)}\n\n"
+                "📅 <b>Расписание на сегодня</b>\n\n"
+                f"👥 Группа: <b>{GROUP_NAME}</b>\n"
+                f"🗓 {format_date_header(today)}\n\n"
                 "☕ Занятий нет или расписание ещё не опубликовано.",
             )
             return
@@ -1216,7 +1398,41 @@ async def _handle_schedule(destination):
     except ScheduleUnavailable:
         await _send_text(
             destination,
-            "😔 Не удалось получить расписание. Сайт недоступен, попробуй позже.",
+            f"😔 Не удалось получить расписание на "
+            f"{format_date_full(get_today())}. Сайт недоступен, попробуй позже.",
+        )
+    except Exception:
+        logger.exception("Ошибка /today")
+
+
+async def _handle_schedule(destination):
+    """Команда /schedule: расписание ТОЛЬКО на завтрашний день.
+
+    Никакого fallback на сегодня/другую дату. Если расписания нет —
+    сообщаем об этом.
+    """
+    try:
+        tomorrow = get_tomorrow()
+        schedule = await get_schedule(tomorrow)
+
+        if not schedule.lessons:
+            await _send_text(
+                destination,
+                "📅 <b>Расписание на завтра</b>\n\n"
+                f"👥 Группа: <b>{GROUP_NAME}</b>\n"
+                f"🗓 {format_date_header(tomorrow)}\n\n"
+                "☕ Занятий нет — расписание ещё не опубликовано.",
+            )
+            return
+
+        ok = await _send_photo(destination, schedule)
+        if not ok:
+            await _send_text(destination, "Не удалось отправить расписание.")
+    except ScheduleUnavailable:
+        await _send_text(
+            destination,
+            f"😔 Не удалось получить расписание на "
+            f"{format_date_full(get_tomorrow())}. Сайт недоступен, попробуй позже.",
         )
     except Exception:
         logger.exception("Ошибка /schedule")
@@ -1273,6 +1489,7 @@ async def _status_text(chat_id: int) -> str:
         lines.append("🔕 Этот чат не подписан на уведомления.")
     lines.append(f"Всего подписок: <b>{total}</b>")
     lines.append(f"Проверка изменений каждые {CHECK_INTERVAL // 60} мин.")
+    lines.append(f"Часовой пояс: <b>{TIMEZONE}</b> (UTC+5)")
     return "\n".join(lines)
 
 
@@ -1313,8 +1530,10 @@ async def cmd_start(message: Message):
         f"👋 Привет!\n\n"
         f"Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
         f"Доступные действия:\n"
-        f"📅 <b>Расписание</b> — кнопка ниже или /schedule\n"
-        f"    (по умолчанию на завтра, если его нет — на сегодня)\n"
+        f"📅 <b>Сегодня</b> — /today\n"
+        f"📅 <b>Завтра</b> — /schedule\n"
+        f"✍️ <b>Текстом</b> — просто напиши «расписание»\n"
+        f"    или «расписание на 4 сентября»\n"
         f"🔎 <b>Поиск по дате</b> — /date 04.09.2026 или /date сегодня\n"
         f"🔔 <b>Уведомления</b> — /subscribe\n"
         f"🔕 <b>Отключить уведомления</b> — /unsubscribe\n"
@@ -1326,6 +1545,12 @@ async def cmd_start(message: Message):
         f"рассылку в чат командой /subscribe."
     )
     await message.answer(text, reply_markup=main_keyboard(_is_subscribed(chat_id)))
+
+
+@dp.message(Command("today"))
+async def cmd_today(message: Message):
+    """Показывает расписание только на сегодня."""
+    await _handle_today(message)
 
 
 @dp.message(Command("schedule"))
@@ -1420,6 +1645,43 @@ async def cmd_status(message: Message):
     await message.answer(await _status_text(message.chat.id))
 
 
+# ============================================================
+# ТЕКСТОВАЯ КОМАНДА «РАСПИСАНИЕ»
+# ============================================================
+
+SCHEDULE_TEXT_HELP = (
+    "Не удалось определить дату.\n\n"
+    "Примеры:\n"
+    "• расписание\n"
+    "• расписание на сегодня\n"
+    "• расписание на завтра\n"
+    "• расписание на 4 сентября\n"
+    "• расписание на 04.09.2026"
+)
+
+
+@dp.message(F.text)
+async def cmd_text_schedule(message: Message):
+    """«расписание» / «расписание на <дата>» — без слэша.
+
+    «расписание» -> завтра; дата разбирается parse_schedule_text и
+    передаётся в ту же строгую функцию _handle_date/get_schedule,
+    что и у команд с «/». Никакого fallback на другую дату.
+    """
+    request = parse_schedule_text(message.text or "")
+
+    if not request.matched:
+        # Сообщение не про расписание — молчим.
+        return
+
+    if request.error:
+        await message.answer(SCHEDULE_TEXT_HELP)
+        return
+
+    target = request.date or get_tomorrow()
+    await _handle_date(message, target)
+
+
 @dp.my_chat_member()
 async def on_chat_member_update(event: ChatMemberUpdated):
     """Приветствие при добавлении в группу и автоочистка при удалении."""
@@ -1434,7 +1696,9 @@ async def on_chat_member_update(event: ChatMemberUpdated):
         await event.bot.send_message(
             chat.id,
             f"👋 Привет! Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
-            f"• /schedule — на завтра (если его нет — на сегодня)\n"
+            f"• /today — расписание на сегодня\n"
+            f"• /schedule — расписание на завтра\n"
+            f"• Напиши «расписание» или «расписание на дату» — без слэша\n"
             f"• /date ДАТА — поиск по дате (например /date сегодня)\n"
             f"• /subscribe — присылать расписание в этот чат "
             f"при изменениях\n"
@@ -1452,18 +1716,17 @@ async def on_chat_member_update(event: ChatMemberUpdated):
 
 @dp.callback_query(F.data == "schedule")
 async def cb_schedule(callback: CallbackQuery):
-    """Кнопка «Расписание» = команда /schedule."""
+    """Кнопка «Завтра» = команда /schedule (только завтра)."""
     await callback.answer()
     await _handle_schedule(callback)
 
 
 @dp.callback_query(F.data.in_(["today", "tomorrow"]))
 async def cb_legacy_days(callback: CallbackQuery):
-    """Старые кнопки «Сегодня»/«Завтра» из ранее отправленных сообщений.
+    """Кнопки «Сегодня»/«Завтра» из ранее отправленных сообщений.
 
-    В клавиатуре осталась одна кнопка «Расписание», но у пользователей
-    в истории ещё лежат старые сообщения — обрабатываем их, чтобы
-    нажатие не «зависало».
+    «today» -> /today (только сегодня), «tomorrow» -> /schedule
+    (только завтра). Никакого fallback.
     """
     await callback.answer()
     if callback.data == "today":
@@ -1520,8 +1783,10 @@ async def cb_help(callback: CallbackQuery):
     await callback.message.answer(
         f"🆘 <b>Помощь</b>\n\n"
         f"Я показываю расписание группы <b>{GROUP_NAME}</b>.\n\n"
-        f"• Кнопка «📅 Расписание» или /schedule — расписание на завтра, "
-        f"а если его нет — на сегодня (воскресенье пропускается)\n"
+        f"• /today — расписание только на сегодня\n"
+        f"• /schedule — расписание только на завтра\n"
+        f"• Просто напиши «расписание» или «расписание на дату» "
+        f"(без слэша)\n"
         f"• /date ДАТА — расписание на любую дату "
         f"(например <code>/date сегодня</code>)\n"
         f"• /subscribe — уведомления об изменениях\n"
@@ -1537,27 +1802,78 @@ async def cb_help(callback: CallbackQuery):
 # МОНИТОРИНГ ИЗМЕНЕНИЙ
 # ============================================================
 
-async def _notify_changed(bot: Bot, schedule: Schedule, day: date) -> None:
-    """Отправляет обновлённое расписание всем подписчикам."""
-    subscribers = load_subscribers()
-    if not subscribers:
-        return
+def _notification_caption(
+    schedule: Schedule, day: date, first_time: bool
+) -> str:
+    """Подпись уведомления — всегда с явным указанием дня.
 
-    image_path = render_schedule_image(schedule)
-    caption = (
-        "🔔 <b>Расписание изменилось</b>\n\n"
-        f"Группа: <b>{GROUP_NAME}</b>\n"
-        f"Дата: {format_date_full(day)}"
+    Пример: «📅 Сегодня, 6 сентября 2026» или «📅 Завтра, 7 сентября 2026».
+    """
+    label = day_label_for(day)
+    if label in ("Сегодня", "Завтра"):
+        day_str = f"{label}, {format_date_full(day)}"
+    else:
+        day_str = label  # полный заголовок, без дублирования
+    if first_time:
+        action = "🆕 <b>Расписание опубликовано!</b>"
+    else:
+        action = "🔄 <b>Расписание изменилось!</b>"
+    return (
+        f"{action}\n\n"
+        f"📅 {day_str}\n"
+        f"👥 Группа: <b>{schedule.group}</b>\n"
+        f"🕐 Занятий: {len(schedule.lessons)}"
     )
 
+
+async def _notify_changed(
+    bot: Bot,
+    schedule: Schedule,
+    day: date,
+    signature: str,
+    first_time: bool,
+) -> int:
+    """Отправляет актуальное расписание ТЕМ, кто его ещё не получил.
+
+    Возвращает (доставлено, не_доставлено).
+    У каждой пары «подписчик + дата» хранится последний доставленный
+    hash, поэтому повторных уведомлений не будет, а сбой у одного
+    получателя не считается доставкой.
+    """
+    subscribers = load_subscribers()
+    if not subscribers:
+        return 0, 0
+
+    date_key = day.isoformat()
+    notifications = load_schedule_notifications().get(date_key, {})
+    pending = [
+        user_id
+        for user_id in subscribers
+        if notifications.get(user_id) != signature
+    ]
+    if not pending:
+        logger.info(
+            "Все подписчики уже получили %s (%s) — пропускаем.",
+            date_key,
+            signature[:12],
+        )
+        return 0, 0
+
+    image_path = render_schedule_image(schedule)
+    caption = _notification_caption(schedule, day, first_time)
+    delivered = 0
+    still_pending = 0  # получатели, которым сообщение реально не ушло
+
     try:
-        for user_id in subscribers:
+        for user_id in pending:
             try:
                 await bot.send_photo(
                     user_id,
                     photo=FSInputFile(image_path),
                     caption=caption,
                 )
+                record_schedule_notification(user_id, date_key, signature)
+                delivered += 1
                 await asyncio.sleep(0.08)
             except Exception as error:
                 text = str(error).lower()
@@ -1571,11 +1887,14 @@ async def _notify_changed(bot: Bot, schedule: Schedule, day: date) -> None:
                         "group chat was upgraded",
                     )
                 ):
+                    # Чат недоступен — подписка снимается, доставка
+                    # ему больше не нужна.
                     unsubscribe_user(user_id)
                     logger.info(
                         "Чат %s недоступен — подписка снята.", user_id
                     )
                 else:
+                    still_pending += 1
                     logger.warning(
                         "Не удалось уведомить %s: %s", user_id, error
                     )
@@ -1585,66 +1904,239 @@ async def _notify_changed(bot: Bot, schedule: Schedule, day: date) -> None:
         except Exception:
             pass
 
+    logger.info(
+        "Уведомление %s доставлено: %s из %s.",
+        date_key,
+        delivered,
+        len(pending),
+    )
+    return delivered, still_pending
+
 
 async def _check_date(bot: Bot, day: date) -> None:
+    """Проверка расписания на КОНКРЕТНУЮ дату.
+
+    Сценарии:
+    - расписания нет (пусто)     -> состояние не меняем, ничего не шлём;
+    - ошибка источника           -> состояние не меняем, ничего не шлём;
+    - расписание появилось впервые -> уведомление «опубликовано»;
+    - расписание изменилось      -> уведомление «изменилось»;
+    - совпадает с последним      -> ничего не шлём;
+    - доставка не удалась        -> состояние не обновляется,
+                                    повторим в следующем цикле.
+    """
     date_key = day.isoformat()
 
     if is_day_off(day):
         logger.info("Проверка %s: воскресенье, пропускаем.", date_key)
         return
 
+    if not load_subscribers():
+        # Некому отправлять — не ходим на сайт и не фиксируем baseline,
+        # чтобы первый подписавшийся получил уведомление о расписании.
+        logger.info("Проверка %s: подписчиков нет, пропускаем.", date_key)
+        return
+
     try:
         schedule = await get_schedule(day)
     except ScheduleUnavailable:
-        # Отсутствие расписания / сеть — не ошибка для мониторинга.
-        logger.warning("Проверка %s: сайт недоступен, пропускаем.", date_key)
+        # Ошибка загрузки/парсинга — не считается изменением.
+        logger.warning(
+            "Проверка %s: источник недоступен — изменением не считаем.",
+            date_key,
+        )
+        return
+
+    if not schedule.lessons:
+        # Отсутствие расписания — тоже не «новая версия».
+        logger.info(
+            "Проверка %s: расписание отсутствует — состояние не меняем.",
+            date_key,
+        )
         return
 
     signature = schedule_signature(schedule)
-    logger.info("Hash расписания: %s", signature)
+    logger.info("Hash расписания %s: %s", date_key, signature)
 
     state = load_state()
     old = state.get(date_key)
-
-    # Первый запуск: фиксируем baseline и НЕ отправляем уведомление.
-    if old is None:
-        state[date_key] = signature
-        save_state(state)
-        logger.info(
-            "Первичная фиксация расписания %s (занятий: %s)",
-            date_key,
-            len(schedule.lessons),
-        )
-        return
 
     if old == signature:
         logger.info("Изменений нет: %s", date_key)
         return
 
-    # Изменение -> обновляем baseline и уведомляем подписчиков.
-    logger.info("РАСПИСАНИЕ ИЗМЕНИЛОСЬ: %s", date_key)
-    state[date_key] = signature
-    save_state(state)
+    first_time = old is None
+    logger.info(
+        "%s: %s (%s)",
+        "РАСПИСАНИЕ ПОЯВИЛОСЬ" if first_time else "РАСПИСАНИЕ ИЗМЕНИЛОСЬ",
+        date_key,
+        f"занятий: {len(schedule.lessons)}",
+    )
 
-    await _notify_changed(bot, schedule, day)
+    delivered, still_pending = await _notify_changed(
+        bot, schedule, day, signature, first_time
+    )
+
+    # Состояние фиксируем только когда расписание реально ушло всем
+    # получателям (недоступные чаты снимаются с подписки и не считаются).
+    # Если хоть один получатель не получил уведомление — состояние не
+    # обновляется, и в следующем цикле отправка повторится только ему.
+    if still_pending == 0:
+        state[date_key] = signature
+        save_state(state)
+        logger.info(
+            "Состояние %s обновлено (доставлено: %s).", date_key, delivered
+        )
+    else:
+        logger.warning(
+            "Уведомление %s не доставлено %s получателям — состояние "
+            "не обновлено, повторим в следующем цикле (доставлено: %s).",
+            date_key,
+            still_pending,
+            delivered,
+        )
+
+
+# ============================================================
+# CHANGELOG
+# ============================================================
+
+_changelog_warned = set()
+
+
+async def _deliver_changelog(bot: Bot, user_id: int, version: str) -> bool:
+    """Отправляет changelog. True — только при реальной доставке."""
+    text = changelog_text(version)
+    try:
+        await bot.send_message(user_id, text)
+        return True
+    except Exception as error:
+        error_text = str(error).lower()
+        if any(
+            marker in error_text
+            for marker in (
+                "bot was blocked",
+                "bot was kicked",
+                "chat not found",
+                "user is deactivated",
+                "group chat was upgraded",
+            )
+        ):
+            unsubscribe_user(user_id)
+            logger.info(
+                "Чат %s недоступен — подписка снята.", user_id
+            )
+        else:
+            logger.warning(
+                "Не удалось отправить changelog %s в %s: %s",
+                version,
+                user_id,
+                error,
+            )
+        return False
+
+
+async def _process_changelog(bot: Bot) -> None:
+    """Рассылка changelog. Вызывается в каждом цикле мониторинга.
+
+    Правила (для каждой версии отдельно):
+    - changelog получают только пользователи, существовавшие ДО релиза
+      версии (created_at < released_at);
+    - новые пользователи (created_at >= released_at) версию не получают;
+    - после успешной отправки last_notified_version обновляется в БД,
+      поэтому перезапуск повторно ничего не шлёт;
+    - при ошибке отправки версия НЕ помечается доставленной —
+      попытка повторится в следующем цикле;
+    - если для версии не задан released_at — она не рассылается.
+    """
+    rows = load_subscriber_rows()
+    sent = 0
+
+    for row in rows:
+        user_id = int(row["user_id"])
+        last = row["last_notified_version"] or ""
+
+        for version in pending_versions(last):
+            released = get_released_at(version)
+            if released is None:
+                if version not in _changelog_warned:
+                    _changelog_warned.add(version)
+                    logger.warning(
+                        "Для версии %s не задан released_at (%s) — "
+                        "changelog не рассылается.",
+                        version,
+                        CHANGELOG.get(version, {}).get(
+                            "released_at_env", ""
+                        ),
+                    )
+                # Версия ещё не выпущена — не считаем пропуском.
+                continue
+
+            created = parse_db_datetime(row["created_at"])
+            if created is None:
+                created = parse_db_datetime("1970-01-01 00:00:00")
+
+            # НЕЛЬЗЯ просто «last != текущая версия -> отправить»:
+            # новые пользователи созданы после релиза и старый
+            # changelog не получают.
+            if created >= released:
+                logger.info(
+                    "Changelog %s: пользователь %s создан после релиза "
+                    "(%s >= %s) — пропускаем.",
+                    version,
+                    user_id,
+                    created,
+                    released,
+                )
+                continue
+
+            ok = await _deliver_changelog(bot, user_id, version)
+            if ok:
+                mark_changelog_notified(user_id, version)
+                sent += 1
+                await asyncio.sleep(0.08)
+            else:
+                # Не помечаем: в следующем цикле повторим. Старшие
+                # версии не обгоняем — сохраняем порядок.
+                break
+
+    if sent:
+        logger.info("Changelog отправлен: %s сообщения(й).", sent)
 
 
 async def schedule_monitor(bot: Bot) -> None:
-    """Фоновая задача. Не блокирует polling."""
+    """Фоновая задача. Не блокирует polling, одна на процесс.
+
+    Каждые 5 минут даты сегодня/завтра пересчитываются заново
+    (переход через полночь обрабатывается автоматически), обе даты
+    проверяются независимо, затем рассылается changelog.
+    """
     logger.info(
-        "Мониторинг запущен. Интервал: %s сек (%s мин).",
+        "Мониторинг запущен. Интервал: %s сек (%s мин). Версия: %s.",
         CHECK_INTERVAL,
         CHECK_INTERVAL // 60,
+        BOT_VERSION,
     )
 
     while True:
+        # Каждый цикл даты вычисляются заново через Asia/Yekaterinburg.
+        for day, label in (
+            (get_today(), "сегодня"),
+            (get_tomorrow(), "завтра"),
+        ):
+            try:
+                await _check_date(bot, day)
+            except Exception:
+                logger.exception(
+                    "Ошибка проверки расписания на %s (%s)",
+                    label,
+                    day.isoformat(),
+                )
+
         try:
-            # Проверяем сегодня (воскресенье пропускается внутри)
-            await _check_date(bot, get_today())
-            # Проверяем следующий учебный день: в субботу это понедельник.
-            await _check_date(bot, get_tomorrow())
+            await _process_changelog(bot)
         except Exception:
-            logger.exception("Ошибка в цикле мониторинга")
+            logger.exception("Ошибка рассылки changelog")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -1654,10 +2146,8 @@ async def schedule_monitor(bot: Bot) -> None:
 # ============================================================
 
 COMMANDS = [
-    BotCommand(
-        command="schedule",
-        description="Расписание на завтра (если нет — на сегодня)",
-    ),
+    BotCommand(command="today", description="Расписание на сегодня"),
+    BotCommand(command="schedule", description="Расписание на завтра"),
     BotCommand(command="date", description="Поиск расписания по дате"),
     BotCommand(command="subscribe", description="Включить уведомления"),
     BotCommand(command="unsubscribe", description="Отключить уведомления"),
@@ -1682,11 +2172,11 @@ async def _setup_commands(bot: Bot) -> None:
 
 async def main() -> None:
     logger.info("=" * 60)
-    logger.info("Бот расписания группы %s", GROUP_NAME)
+    logger.info("Бот расписания группы %s (версия %s)", GROUP_NAME, BOT_VERSION)
     logger.info("Group ID: %s", GROUP_ID)
     logger.info("URL: %s", BASE_URL)
-    logger.info("Check interval: %s сек", CHECK_INTERVAL)
-    logger.info("Timezone: %s", TIMEZONE)
+    logger.info("Check interval: %s сек (%s мин)", CHECK_INTERVAL, CHECK_INTERVAL // 60)
+    logger.info("Timezone: %s (UTC+5)", TIMEZONE)
 
     if not BOT_TOKEN:
         logger.error(
@@ -1710,7 +2200,12 @@ async def main() -> None:
 
     await _setup_commands(bot)
 
-    monitor_task = asyncio.create_task(schedule_monitor(bot))
+    # Один фоновый монитор на процесс: повторный вызов main()
+    # не создаёт второй scheduler.
+    monitor_task = getattr(main, "_monitor_task", None)
+    if monitor_task is None or monitor_task.done():
+        monitor_task = asyncio.create_task(schedule_monitor(bot))
+        main._monitor_task = monitor_task
 
     try:
         await dp.start_polling(bot)
