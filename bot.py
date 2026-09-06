@@ -250,7 +250,6 @@ MONTH_NAMES = {
 _DATE_PATTERNS = (
     "%Y-%m-%d",
     "%d.%m.%Y",
-    "%d.%m.%y",
     "%d/%m/%Y",
     "%d-%m-%Y",
     "%d.%m",
@@ -288,22 +287,49 @@ def parse_user_date(raw: str):
             delta = (index - today.weekday()) % 7
             return today + timedelta(days=delta)
 
+    # Двухзначный год: 04.09.26 -> 2026 (однозначное правило,
+    # без угадывания века; не полагаемся на платформенный %y).
+    match = re.fullmatch(r"(\d{1,2})[./-](\d{1,2})[./-](\d{2})", text)
+    if match:
+        try:
+            return date(
+                2000 + int(match.group(3)),
+                int(match.group(2)),
+                int(match.group(1)),
+            )
+        except ValueError:
+            return None
+
     # Числовые форматы.
     for pattern in _DATE_PATTERNS:
         try:
             parsed = datetime.strptime(text, pattern)
         except ValueError:
             continue
-        if "%Y" not in pattern and "%y" not in pattern:
+        if "%Y" not in pattern:
             parsed = parsed.replace(year=today.year)
         return parsed.date()
 
-    # Текстовый месяц: «4 сентября» / «4 сентября 2026».
-    match = re.fullmatch(r"(\d{1,2}) ([а-яё]+)(?: (\d{4}))?", text)
+    # Текстовый месяц: «4 сентября», «4 сентября 2026»,
+    # «4 сентября 2026 года», «4 сентября 2026г», «4 сентябрь»,
+    # «4 сентября 26».
+    match = re.fullmatch(
+        r"(\d{1,2})\s+([а-яё]+)"
+        r"(?:\s+(\d{2,4})\s*(?:год[а-яё]*|г\.?)?)?",
+        text,
+    )
     if match:
         day_num = int(match.group(1))
         month_word = match.group(2)
-        year = int(match.group(3)) if match.group(3) else today.year
+        raw_year = match.group(3)
+
+        if raw_year:
+            year = int(raw_year)
+            if len(raw_year) == 2:
+                # Однозначное правило: 26 -> 2026.
+                year = 2000 + year
+        else:
+            year = today.year
 
         month = None
         for stem, number in MONTH_NAMES.items():
@@ -318,6 +344,68 @@ def parse_user_date(raw: str):
                 return None
 
     return None
+
+
+# ============================================================
+# ТЕКСТОВАЯ КОМАНДА «РАСПИСАНИЕ»
+# ============================================================
+
+@dataclass
+class ScheduleTextRequest:
+    """Результат разбора текстовой команды «расписание…».
+
+    - matched=False — сообщение не команда (бота не касается);
+    - date=None, error=False — «расписание» без даты -> завтра;
+    - date=<дата> — распознанная дата;
+    - error=True — «расписание» есть, но дату определить не удалось.
+    """
+
+    matched: bool = False
+    date: Optional[date] = None
+    error: bool = False
+
+
+_SCHEDULE_TEXT_RE = re.compile(r"^расписание(.*)$", re.IGNORECASE)
+
+
+def parse_schedule_text(text: str) -> ScheduleTextRequest:
+    """Разбирает «расписание» и «расписание на <дата>».
+
+    Отдельная функция: обработка команды -> парсинг даты -> get_schedule.
+    Устойчива к регистру и лишним пробелам. Относительные даты
+    («сегодня», «завтра», «послезавтра») считаются в часовом поясе
+    Asia/Yekaterinburg. Ошибок «угадывания» нет: непонятная дата
+    возвращает error=True.
+    """
+    if not text:
+        return ScheduleTextRequest()
+
+    normalized = clean_text(text).lower()
+    match = _SCHEDULE_TEXT_RE.match(normalized)
+    if not match:
+        return ScheduleTextRequest()
+
+    rest = match.group(1).strip()
+    if not rest:
+        # Просто «расписание» -> расписание на завтра.
+        return ScheduleTextRequest(matched=True)
+
+    # Дальше допускается только «на <дата>».
+    arg_match = re.fullmatch(r"на(?:\s+(.+))?", rest)
+    if not arg_match:
+        # «расписание чего-то» — это не наша команда.
+        return ScheduleTextRequest()
+
+    arg = clean_text(arg_match.group(1) or "")
+    if not arg:
+        # «расписание на» без даты — подсказка, не угадываем.
+        return ScheduleTextRequest(matched=True, error=True)
+
+    target = parse_user_date(arg)
+    if target is None:
+        return ScheduleTextRequest(matched=True, error=True)
+
+    return ScheduleTextRequest(matched=True, date=target)
 
 
 def format_date_full(value: date) -> str:
@@ -1444,6 +1532,8 @@ async def cmd_start(message: Message):
         f"Доступные действия:\n"
         f"📅 <b>Сегодня</b> — /today\n"
         f"📅 <b>Завтра</b> — /schedule\n"
+        f"✍️ <b>Текстом</b> — просто напиши «расписание»\n"
+        f"    или «расписание на 4 сентября»\n"
         f"🔎 <b>Поиск по дате</b> — /date 04.09.2026 или /date сегодня\n"
         f"🔔 <b>Уведомления</b> — /subscribe\n"
         f"🔕 <b>Отключить уведомления</b> — /unsubscribe\n"
@@ -1555,6 +1645,43 @@ async def cmd_status(message: Message):
     await message.answer(await _status_text(message.chat.id))
 
 
+# ============================================================
+# ТЕКСТОВАЯ КОМАНДА «РАСПИСАНИЕ»
+# ============================================================
+
+SCHEDULE_TEXT_HELP = (
+    "Не удалось определить дату.\n\n"
+    "Примеры:\n"
+    "• расписание\n"
+    "• расписание на сегодня\n"
+    "• расписание на завтра\n"
+    "• расписание на 4 сентября\n"
+    "• расписание на 04.09.2026"
+)
+
+
+@dp.message(F.text)
+async def cmd_text_schedule(message: Message):
+    """«расписание» / «расписание на <дата>» — без слэша.
+
+    «расписание» -> завтра; дата разбирается parse_schedule_text и
+    передаётся в ту же строгую функцию _handle_date/get_schedule,
+    что и у команд с «/». Никакого fallback на другую дату.
+    """
+    request = parse_schedule_text(message.text or "")
+
+    if not request.matched:
+        # Сообщение не про расписание — молчим.
+        return
+
+    if request.error:
+        await message.answer(SCHEDULE_TEXT_HELP)
+        return
+
+    target = request.date or get_tomorrow()
+    await _handle_date(message, target)
+
+
 @dp.my_chat_member()
 async def on_chat_member_update(event: ChatMemberUpdated):
     """Приветствие при добавлении в группу и автоочистка при удалении."""
@@ -1571,6 +1698,7 @@ async def on_chat_member_update(event: ChatMemberUpdated):
             f"👋 Привет! Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
             f"• /today — расписание на сегодня\n"
             f"• /schedule — расписание на завтра\n"
+            f"• Напиши «расписание» или «расписание на дату» — без слэша\n"
             f"• /date ДАТА — поиск по дате (например /date сегодня)\n"
             f"• /subscribe — присылать расписание в этот чат "
             f"при изменениях\n"
@@ -1657,6 +1785,8 @@ async def cb_help(callback: CallbackQuery):
         f"Я показываю расписание группы <b>{GROUP_NAME}</b>.\n\n"
         f"• /today — расписание только на сегодня\n"
         f"• /schedule — расписание только на завтра\n"
+        f"• Просто напиши «расписание» или «расписание на дату» "
+        f"(без слэша)\n"
         f"• /date ДАТА — расписание на любую дату "
         f"(например <code>/date сегодня</code>)\n"
         f"• /subscribe — уведомления об изменениях\n"

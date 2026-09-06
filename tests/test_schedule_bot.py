@@ -9,7 +9,7 @@ import asyncio
 import os
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -72,6 +72,17 @@ class FakeBot:
         if user_id in self.fail_users:
             raise RuntimeError("boom")
         self.sent.append(("text", user_id, text))
+
+
+class FakeMessage:
+    """Минимальное Message для текстового обработчика."""
+
+    def __init__(self, text):
+        self.text = text
+        self.answers = []
+
+    async def answer(self, text, *args, **kwargs):
+        self.answers.append(text)
 
 
 class DBTestCase(unittest.TestCase):
@@ -188,6 +199,263 @@ class TestTimezone(DBTestCase):
             datetime(2026, 9, 1, 8, 30, 0),
         )
         self.assertIsNone(bot.parse_db_datetime(""))
+
+
+class TestScheduleTextParsing(unittest.TestCase):
+    """Парсер текстовой команды «расписание…» (пункты 24–31, 34)."""
+
+    def setUp(self):
+        # Фиксируем «сейчас»: 2026-09-06 (воскресенье, Yekaterinburg).
+        self.today = date(2026, 9, 6)
+        patcher = mock.patch.object(
+            bot, "now_local",
+            return_value=datetime(2026, 9, 6, 14, 0, 0),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def parse(self, text):
+        return bot.parse_schedule_text(text)
+
+    def test_plain_schedule_means_tomorrow(self):
+        for text in ("расписание", "Расписание", "РАСПИСАНИЕ",
+                     "  расписание  "):
+            request = self.parse(text)
+            self.assertTrue(request.matched)
+            self.assertFalse(request.error)
+            self.assertIsNone(request.date)
+
+    def test_relative_dates(self):
+        self.assertEqual(
+            self.parse("расписание на сегодня").date, self.today
+        )
+        self.assertEqual(
+            self.parse("расписание на завтра").date,
+            self.today + timedelta(days=1),
+        )
+        self.assertEqual(
+            self.parse("расписание на послезавтра").date,
+            self.today + timedelta(days=2),
+        )
+
+    def test_ru_month_forms(self):
+        self.assertEqual(
+            self.parse("расписание на 4 сентября").date,
+            date(2026, 9, 4),
+        )
+        # Формы без окончания тоже понимаются
+        self.assertEqual(
+            self.parse("расписание на 4 сентябрь").date,
+            date(2026, 9, 4),
+        )
+        self.assertEqual(
+            self.parse("расписание на 1 января").date,
+            date(2026, 1, 1),
+        )
+        self.assertEqual(
+            self.parse("расписание на 31 декабрь").date,
+            date(2026, 12, 31),
+        )
+
+    def test_month_always_current_year(self):
+        # В сентябре 2026 «4 января» -> 2026 (текущий год)
+        self.assertEqual(
+            self.parse("расписание на 4 января").date,
+            date(2026, 1, 4),
+        )
+
+    def test_numeric_formats(self):
+        self.assertEqual(
+            self.parse("расписание на 04.09.2026").date,
+            date(2026, 9, 4),
+        )
+        self.assertEqual(
+            self.parse("расписание на 4.9.2026").date,
+            date(2026, 9, 4),
+        )
+        self.assertEqual(
+            self.parse("расписание на 04/09/2026").date,
+            date(2026, 9, 4),
+        )
+
+    def test_two_digit_year_rule(self):
+        # 26 -> 2026 (однозначно, без угадывания века)
+        self.assertEqual(
+            self.parse("расписание на 04.09.26").date,
+            date(2026, 9, 4),
+        )
+        # «4 сентября 26» тоже
+        self.assertEqual(
+            self.parse("расписание на 4 сентября 26").date,
+            date(2026, 9, 4),
+        )
+
+    def test_full_year_and_goda_variants(self):
+        self.assertEqual(
+            self.parse("расписание на 4 сентября 2026").date,
+            date(2026, 9, 4),
+        )
+        self.assertEqual(
+            self.parse("расписание на 4 сентября 2026 года").date,
+            date(2026, 9, 4),
+        )
+        self.assertEqual(
+            self.parse("расписание на 4 сентября 2026г").date,
+            date(2026, 9, 4),
+        )
+
+    def test_spaces_and_case(self):
+        self.assertEqual(
+            self.parse("РАСПИСАНИЕ   НА   ЗАВТРА").date,
+            self.today + timedelta(days=1),
+        )
+        self.assertEqual(
+            self.parse("  Расписание  на  4  сентября  ").date,
+            date(2026, 9, 4),
+        )
+
+    def test_invalid_date_error(self):
+        for text in (
+            "расписание на 35 сентября",
+            "расписание на 99.99.2026",
+            "расписание на абвг",
+            "расписание на 2026",
+            "расписание на",
+        ):
+            request = self.parse(text)
+            self.assertTrue(request.matched, text)
+            self.assertTrue(request.error, text)
+
+    def test_not_a_schedule_message(self):
+        for text in ("привет", "расписаниеx", "распи", "на завтра"):
+            request = self.parse(text)
+            self.assertFalse(request.matched)
+
+    def test_new_year_wrap(self):
+        # 31.12.2026 23:59 -> послезавтра 2 января 2027
+        with mock.patch.object(
+            bot, "now_local",
+            return_value=datetime(2026, 12, 31, 23, 59, 0),
+        ):
+            parser_date = bot.parse_schedule_text("расписание на послезавтра").date
+            self.assertEqual(parser_date, date(2027, 1, 2))
+
+
+class TestScheduleTextHandler(DBTestCase):
+    """Полный путь: текст -> parse_schedule_text -> _handle_date."""
+
+    def setUp(self):
+        super().setUp()
+        self.requests = []
+        self.photos = []
+        self.texts = []
+
+        async def fake_get_schedule(day):
+            self.requests.append(day)
+            return make_schedule(day, "Предмет")
+
+        async def fake_send_photo(dest, schedule):
+            self.photos.append(schedule)
+            return True
+
+        async def fake_send_text(dest, text):
+            self.texts.append(text)
+
+        patcher = mock.patch.object(
+            bot, "now_local",
+            return_value=datetime(2026, 9, 7, 14, 0, 0),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for patch in (
+            mock.patch.object(bot, "get_schedule", fake_get_schedule),
+            mock.patch.object(bot, "_send_photo", fake_send_photo),
+            mock.patch.object(bot, "_send_text", fake_send_text),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_plain_text_uses_tomorrow(self):
+        message = FakeMessage("расписание")
+        run(bot.cmd_text_schedule(message))
+        self.assertEqual(self.requests, [date(2026, 9, 8)])
+        self.assertEqual([s.date for s in self.photos], [date(2026, 9, 8)])
+
+    def test_text_for_relative_date(self):
+        message = FakeMessage("расписание на сегодня")
+        run(bot.cmd_text_schedule(message))
+        self.assertEqual(self.requests, [date(2026, 9, 7)])
+
+    def test_text_for_date_uses_exact_date(self):
+        target = date(2026, 9, 12)
+        message = FakeMessage("расписание на 12 сентября 2026")
+        run(bot.cmd_text_schedule(message))
+        self.assertEqual(self.requests, [target])
+        self.assertEqual([s.date for s in self.photos], [target])
+
+    def test_invalid_date_shows_hint_no_request(self):
+        message = FakeMessage("расписание на абвг")
+        run(bot.cmd_text_schedule(message))
+        self.assertEqual(self.requests, [])
+        self.assertEqual(len(message.answers), 1)
+        self.assertIn("Не удалось определить дату", message.answers[0])
+        self.assertIn("расписание на завтра", message.answers[0])
+
+    def test_not_schedule_text_ignored(self):
+        message = FakeMessage("привет")
+        run(bot.cmd_text_schedule(message))
+        self.assertEqual(self.requests, [])
+        self.assertEqual(message.answers, [])
+
+    def test_text_no_fallback_on_missing(self):
+        """Если на запрошенной дате расписания нет — не показываем другое."""
+        target = date(2026, 9, 10)
+        requested = []
+
+        async def fake_get_schedule(day):
+            requested.append(day)
+            if day == target:
+                return empty_schedule(day)
+            return make_schedule(day, "Другая дата")
+
+        message = FakeMessage("расписание на 10 сентября 2026")
+        with mock.patch.object(bot, "get_schedule", fake_get_schedule):
+            run(bot.cmd_text_schedule(message))
+        self.assertEqual(requested, [target])
+        self.assertTrue(self.texts)
+        self.assertIn(bot.format_date_header(target), self.texts[0])
+        for text in self.texts:
+            self.assertNotIn(bot.format_date_header(date(2026, 9, 6)), text)
+            self.assertNotIn(bot.format_date_header(date(2026, 9, 7)), text)
+
+
+class TestDateParsingEdge(unittest.TestCase):
+    """Пункт 28: parse_user_date + отдельный парсер, TZ Yekaterinburg."""
+
+    def test_parse_user_date_two_digit(self):
+        self.assertEqual(
+            bot.parse_user_date("04.09.26"), date(2026, 9, 4)
+        )
+        self.assertEqual(
+            bot.parse_user_date("4.9.26"), date(2026, 9, 4)
+        )
+
+    def test_parse_user_date_month_now(self):
+        with mock.patch.object(
+            bot, "now_local",
+            return_value=datetime(2026, 9, 6, 14, 0, 0),
+        ):
+            self.assertEqual(
+                bot.parse_user_date("4 сентября"), date(2026, 9, 4)
+            )
+            self.assertEqual(
+                bot.parse_user_date("4 сентября 2026 года"),
+                date(2026, 9, 4),
+            )
+
+    def test_parse_user_date_rejects_invalid(self):
+        for raw in ("35 сентября", "99.99.2026", "абвг", "2026"):
+            self.assertIsNone(bot.parse_user_date(raw))
 
 
 class TestParseAndGetSchedule(unittest.TestCase):
