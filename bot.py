@@ -186,6 +186,50 @@ class ScheduleUnavailable(Exception):
     """Сайт недоступен / сеть не работает."""
 
 
+def lesson_slot_key(lesson) -> tuple:
+    """Идентификатор пары / временного слота.
+
+    Все подгруппы одной пары дают ОДИН и тот же ключ, поэтому он подходит
+    и для группировки в карточки, и для подсчёта количества занятий.
+    Основной идентификатор — номер пары; если его нет, используется
+    время начала и окончания.
+    """
+    if isinstance(lesson, dict):
+        pair = clean_text(lesson.get("pair", ""))
+        start = clean_text(lesson.get("start", ""))
+        end = clean_text(lesson.get("end", ""))
+        time_str = clean_text(lesson.get("time", ""))
+    else:
+        pair = clean_text(getattr(lesson, "pair", ""))
+        start = clean_text(getattr(lesson, "start", ""))
+        end = clean_text(getattr(lesson, "end", ""))
+        time_str = clean_text(getattr(lesson, "time", ""))
+
+    if (not start or not end) and time_str:
+        match = re.search(
+            r"(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})", time_str
+        )
+        if match:
+            start = start or match.group(1)
+            end = end or match.group(2)
+
+    return (pair.upper(), start, end)
+
+
+def count_lessons(source) -> int:
+    """Количество занятий = количество уникальных пар / временных слотов.
+
+    Принимает `Schedule`, список `Lesson` или список словарей
+    (нормализованное расписание из БД).
+
+    Пара с несколькими подгруппами — это ОДНО занятие:
+    количество отображаемых блоков (подгрупп) может быть больше,
+    чем количество занятий.
+    """
+    lessons = getattr(source, "lessons", source) or []
+    return len({lesson_slot_key(item) for item in lessons})
+
+
 def group_into_pairs(lessons: list) -> list:
     """Группирует flat-список занятий в пары.
 
@@ -194,11 +238,7 @@ def group_into_pairs(lessons: list) -> list:
     """
     groups = OrderedDict()
     for lesson in lessons:
-        key = (
-            clean_text(lesson.pair).upper(),
-            clean_text(lesson.start) or "",
-            clean_text(lesson.end) or "",
-        )
+        key = lesson_slot_key(lesson)
         groups.setdefault(key, []).append(lesson)
 
     result = []
@@ -975,7 +1015,11 @@ def parse_schedule(html: str, day: date) -> Schedule:
         )
     )
 
-    logger.info("Найдено занятий: %s", len(unique))
+    logger.info(
+        "Найдено занятий (пар): %s, записей (с подгруппами): %s",
+        count_lessons(unique),
+        len(unique),
+    )
 
     for lesson in unique:
         subgroup_s = f" | {lesson.subgroup} п/гр." if lesson.subgroup else ""
@@ -1764,6 +1808,14 @@ def render_schedule_image(
         top_pad = 26
         pad_bottom = 24
         item_gap = 16
+        # Вертикальные уровни шапки карточки:
+        #   1) время пары; 2) «перемена XX мин»; затем блоки занятий
+        #   (3) предмет, 4) аудитория/преподаватель — рисуются ниже).
+        time_line_h = _text_h(font_time)
+        break_line_h = _text_h(font_break)
+        break_gap = 6      # между строкой времени и строкой перемены
+        header_gap = 24    # между шапкой пары и первым блоком занятия
+        time_x_offset = 34  # отступ текстовой колонки от кружка пары
         line_h = int(font_subject.size * 1.35)
         chip_h = 44
         subg_h = 30
@@ -1798,11 +1850,30 @@ def render_schedule_image(
                 h += 8 + detail_h * len(item["details"])
             return h
 
+        def pair_break_text(pair) -> str:
+            """«перемена XX мин» или пустая строка, если данных нет."""
+            duration = clean_text(getattr(pair, "break_duration", ""))
+            return f"перемена {duration}" if duration else ""
+
+        def pair_header_metrics(pair) -> tuple:
+            """Метрики шапки пары: (высота шапки, высота текст. блока,
+            высота содержимого шапки).
+
+            Строка «перемена» — часть текстового блока времени, поэтому
+            она не сдвигает предмет по горизонтали и не наезжает на него
+            по вертикали. Если перемены нет, строка не резервируется.
+            """
+            block_h = time_line_h
+            if pair_break_text(pair):
+                block_h += break_gap + break_line_h
+            content_h = max(circle_s, block_h)
+            return top_pad + content_h + header_gap, block_h, content_h
+
         def pair_card_height(pair) -> int:
             items = _render_items_for_pair(
                 pair, change_by_key, removed_by_pair
             )
-            header_h = top_pad + circle_s + 24
+            header_h = pair_header_metrics(pair)[0]
             blocks_h = sum(item_block_height(i) for i in items)
             blocks_gap = max(0, len(items) - 1) * item_gap
             return header_h + blocks_h + blocks_gap + pad_bottom
@@ -1823,17 +1894,30 @@ def render_schedule_image(
             summary_lines = ["Что изменилось:"]
         summary_h = 0
         if summary_lines:
-            summary_h = 50 + summary_lines.__len__() * 34 + 20
+            summary_h = 50 + len(summary_lines) * 34 + 20
 
-        # Если есть блок «Что изменилось», оставляем больше места внизу,
-        # чтобы подвал не накладывался на последнюю строку изменений.
-        H = (
-            HEADER_H
-            + 36
-            + cards_h
-            + summary_h
-            + (140 if summary_lines else 80)
-        )
+        # ---------- layout по вертикали ----------
+        # Подвал — полноценная часть layout: сначала считаем нижнюю границу
+        # контента, затем добавляем отступ, строку подвала и нижний padding.
+        footer_text = "ИНК · расписание"
+        footer_h = _text_h(font_footer)
+        footer_gap = 44          # между последним блоком контента и подвалом
+        footer_pad_bottom = 40   # нижний padding изображения
+        card_shadow = 8          # тень карточек рисуется на 8px ниже
+
+        content_top = HEADER_H + 36
+        if lessons:
+            content_bottom = content_top + cards_h + card_shadow
+        else:
+            content_bottom = content_top + cards_h
+
+        summary_y = None
+        if summary_lines:
+            summary_y = content_top + cards_h + (36 if lessons else 0)
+            content_bottom = summary_y + summary_h
+
+        footer_y = content_bottom + footer_gap
+        H = int(footer_y + footer_h + footer_pad_bottom)
 
         image = Image.new("RGB", (W, H), COL_BG)
         draw = ImageDraw.Draw(image)
@@ -1853,28 +1937,31 @@ def render_schedule_image(
                   format_date_header(schedule.date),
                   font=font_date, fill=COL_MUTED)
 
-        # бейдж с количеством занятий
-        if lessons:
-            count_text = f"{len(lessons)} "
-            count_text += "занятие" if len(lessons) == 1 \
-                else "занятия" if len(lessons) < 5 else "занятий"
+        # бейдж с количеством занятий (пары, а не подгруппы)
+        lesson_count = count_lessons(lessons)
+        if lesson_count:
+            count_text = f"{lesson_count} "
+            count_text += "занятие" if lesson_count == 1 \
+                else "занятия" if lesson_count < 5 else "занятий"
         else:
             count_text = "занятий нет"
 
+        # ВАЖНО: у бейджа своя высота (`count_chip_h`); переиспользовать
+        # `chip_h` нельзя — он участвует в расчёте высоты карточек.
         cw = draw.textlength(count_text, font=font_count)
         chip_pad_x = 26
         chip_w = cw + chip_pad_x * 2
-        chip_h = 54
+        count_chip_h = 54
         chip_x = W - MARGIN - chip_w
         chip_y = 48
         draw.rounded_rectangle(
-            (chip_x, chip_y, chip_x + chip_w, chip_y + chip_h),
-            radius=chip_h / 2,
+            (chip_x, chip_y, chip_x + chip_w, chip_y + count_chip_h),
+            radius=count_chip_h / 2,
             fill=COL_ACCENT_LIGHT,
         )
         draw.text(
             (chip_x + chip_pad_x,
-             chip_y + (chip_h - _text_h(font_count)) // 2),
+             chip_y + (count_chip_h - _text_h(font_count)) // 2),
             count_text,
             font=font_count,
             fill=COL_ACCENT,
@@ -1928,8 +2015,12 @@ def render_schedule_image(
                     width=3 if pair_has_change else 2,
                 )
 
+                # --- шапка пары: кружок + время + перемена ---
+                header_h, block_h, content_h = pair_header_metrics(pair)
+                header_top = top + top_pad
+
                 # --- кружок пары ---
-                cy_top = top + top_pad
+                cy_top = header_top + (content_h - circle_s) / 2
                 cx = left
                 draw.ellipse(
                     (cx, cy_top, cx + circle_s, cy_top + circle_s),
@@ -1946,23 +2037,27 @@ def render_schedule_image(
                     fill=COL_WHITE,
                 )
 
-                # --- время ---
-                time_y = cy_top + (circle_s - _text_h(font_time)) / 2
-                draw.text((left + circle_s + 34, time_y),
+                # --- время (уровень 1) и перемена (уровень 2) ---
+                # Обе строки лежат в одной текстовой колонке, поэтому
+                # положение времени стабильно при любой длине текста.
+                text_x = left + circle_s + time_x_offset
+                text_max_w = (x2 - inner) - text_x
+                time_y = header_top + (content_h - block_h) / 2
+                draw.text((text_x, time_y),
                           f"{pair.start} — {pair.end}",
                           font=font_time, fill=COL_ACCENT)
-                if pair.break_duration:
-                    break_text = f"перемена {pair.break_duration}"
+
+                break_text = pair_break_text(pair)
+                if break_text:
                     draw.text(
-                        (left + circle_s + 34,
-                         cy_top + circle_s + 4),
-                        break_text,
+                        (text_x, time_y + time_line_h + break_gap),
+                        _truncate(break_text, font_break, text_max_w),
                         font=font_break,
                         fill=COL_MUTED,
                     )
 
-                # --- блоки занятий/подгрупп ---
-                by = top + top_pad + circle_s + 24
+                # --- блоки занятий/подгрупп (уровни 3 и 4) ---
+                by = top + header_h
                 for item in items:
                     lesson = item["lesson"]
                     kind = item["kind"]
@@ -2120,10 +2215,9 @@ def render_schedule_image(
 
         # ---------- блок «Что изменилось» ----------
         if summary_lines:
-            sy = HEADER_H + 36 + cards_h + (36 if lessons else 0)
-            summary_h_actual = 50 + summary_lines.__len__() * 34 + 20
+            sy = summary_y
             draw.rounded_rectangle(
-                (x1, sy, x2, sy + summary_h_actual),
+                (x1, sy, x2, sy + summary_h),
                 radius=30,
                 fill=COL_WHITE,
                 outline=COL_WARN,
@@ -2144,11 +2238,12 @@ def render_schedule_image(
                 tys += 34
 
         # ---------- подвал ----------
-        footer = "ИНК · расписание"
+        # footer_y и высота изображения посчитаны заранее: подвал не
+        # накладывается на контент и не обрезается снизу.
         draw.text(
-            (W - MARGIN - draw.textlength(footer, font=font_footer),
-             H - 56),
-            footer,
+            (x2 - draw.textlength(footer_text, font=font_footer),
+             footer_y),
+            footer_text,
             font=font_footer,
             fill=COL_FOOTER,
         )
@@ -2210,7 +2305,7 @@ def _photo_caption(schedule: Schedule) -> str:
         f"📅 {format_date_full(schedule.date)}",
     ]
     if schedule.lessons:
-        lines.append(f"🕐 Занятий: {len(schedule.lessons)}")
+        lines.append(f"🕐 Занятий: {count_lessons(schedule)}")
     return "\n".join(lines)
 
 
@@ -2767,7 +2862,7 @@ def _notification_caption(
         "",
         f"📅 {day_str}",
         f"👥 Группа: <b>{schedule.group}</b>",
-        f"🕐 Занятий: {len(schedule.lessons)}",
+        f"🕐 Занятий: {count_lessons(schedule)}",
     ]
 
     if not first_time and changes:
@@ -2949,7 +3044,7 @@ async def _check_date(bot: Bot, day: date) -> None:
         "%s: %s (%s)",
         "РАСПИСАНИЕ ПОЯВИЛОСЬ" if first_time else "РАСПИСАНИЕ ИЗМЕНИЛОСЬ",
         date_key,
-        f"занятий: {len(schedule.lessons)}, изменений: {len(changes)}",
+        f"занятий: {count_lessons(schedule)}, изменений: {len(changes)}",
     )
 
     delivered, still_pending = await _notify_changed(

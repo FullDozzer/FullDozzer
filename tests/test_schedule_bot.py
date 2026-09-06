@@ -1257,5 +1257,199 @@ class TestPillowRendering(unittest.TestCase):
         self.assertTrue(path.exists())
 
 
+class TestLessonCount(unittest.TestCase):
+    """COUNT = количество уникальных пар / временных слотов."""
+
+    def sched(self, lessons):
+        return bot.Schedule(date=date(2026, 9, 7), group=bot.GROUP_NAME,
+                            lessons=lessons)
+
+    def four_pairs(self):
+        return [
+            lesson("I", None, "Химия Н и Г", "УК307", "Арнаутова А.В.",
+                   "08:30", "09:50"),
+            lesson("II", None, "Ин.яз."),
+            lesson("III", None, "НГПО", "ПК217", "Степанов С.В.",
+                   "11:35", "12:55"),
+            lesson("IV", None, "Пром безопас", "ПК201", "Гайзуллин И.Т.",
+                   "13:25", "14:45"),
+        ]
+
+    def test_a_four_pairs_without_subgroups(self):
+        self.assertEqual(bot.count_lessons(self.sched(self.four_pairs())), 4)
+
+    def test_b_four_pairs_one_with_two_subgroups(self):
+        lessons = self.four_pairs()
+        lessons[1] = lesson("II", "1")
+        lessons.insert(2, lesson("II", "2", room="ПК303",
+                                 teacher="Амирханова Г.А."))
+        schedule = self.sched(lessons)
+        self.assertEqual(len(schedule.lessons), 5)
+        self.assertEqual(bot.count_lessons(schedule), 4)
+
+    def test_c_four_pairs_one_with_three_subgroups(self):
+        lessons = self.four_pairs()
+        lessons[1] = lesson("II", "1")
+        lessons.insert(2, lesson("II", "2", room="ПК303"))
+        lessons.insert(3, lesson("II", "3", room="ПК305"))
+        schedule = self.sched(lessons)
+        self.assertEqual(len(schedule.lessons), 6)
+        self.assertEqual(bot.count_lessons(schedule), 4)
+
+    def test_d_same_subject_in_two_pairs_counts_twice(self):
+        schedule = self.sched([
+            lesson("I", None, "Ин.яз.", start="08:30", end="09:50"),
+            lesson("II", None, "Ин.яз."),
+        ])
+        self.assertEqual(bot.count_lessons(schedule), 2)
+
+    def test_e_different_rooms_and_teachers_still_one_lesson(self):
+        schedule = self.sched([
+            lesson("II", "1", room="ПК103", teacher="Мурзабулатова Ф.Ф."),
+            lesson("II", "2", room="ПК303", teacher="Амирханова Г.А."),
+        ])
+        self.assertEqual(bot.count_lessons(schedule), 1)
+
+    def test_f_pair_without_subgroups(self):
+        self.assertEqual(bot.count_lessons(self.sched([lesson("II")])), 1)
+
+    def test_empty_schedule(self):
+        self.assertEqual(bot.count_lessons(self.sched([])), 0)
+
+    def test_count_matches_number_of_rendered_pairs(self):
+        schedule = bot.parse_schedule(PROVIDED_HTML, date(2026, 9, 7))
+        self.assertEqual(len(schedule.lessons), 5)      # записи с подгруппами
+        self.assertEqual(bot.count_lessons(schedule), 4)  # занятия
+        self.assertEqual(len(schedule.pairs), 4)
+
+    def test_accepts_lists_and_dicts(self):
+        schedule = self.sched([lesson("II", "1"), lesson("II", "2")])
+        self.assertEqual(bot.count_lessons(schedule.lessons), 1)
+        self.assertEqual(bot.count_lessons(bot.normalize_schedule(schedule)), 1)
+
+    def test_time_only_lessons_grouped_by_slot(self):
+        without_pair = [
+            bot.Lesson(pair="", time="10:00 - 11:20", subject="Ин.яз.",
+                       teacher="—", room="ПК103", subgroup="1"),
+            bot.Lesson(pair="", time="10:00 - 11:20", subject="Ин.яз.",
+                       teacher="—", room="ПК303", subgroup="2"),
+            bot.Lesson(pair="", time="11:35 - 12:55", subject="НГПО",
+                       teacher="—", room="ПК217"),
+        ]
+        self.assertEqual(bot.count_lessons(without_pair), 2)
+
+    def test_captions_use_lesson_count(self):
+        schedule = bot.parse_schedule(PROVIDED_HTML, date(2026, 9, 7))
+        self.assertIn("Занятий: 4", bot._photo_caption(schedule))
+        caption = bot._notification_caption(
+            schedule, date(2026, 9, 7), first_time=False, changes=[]
+        )
+        self.assertIn("Занятий: 4", caption)
+        self.assertNotIn("Занятий: 5", caption)
+
+
+class TestImageLayoutFixes(unittest.TestCase):
+    """Разметка картинки: блок «перемена» и подвал."""
+
+    BG = (243, 245, 250)
+
+    def scan(self, path):
+        """Возвращает (ширина, высота, строки карточек, строки подвала)."""
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            width, height = im.size
+            px = im.load()
+            card_rows = [
+                y for y in range(height)
+                if any(px[x, y] == (255, 255, 255)
+                       for x in range(200, width - 200, 8))
+            ]
+            drawn_rows = [
+                y for y in range(height)
+                if any(px[x, y] != self.BG
+                       for x in range(20, width - 20, 4))
+            ]
+        last_card = max(card_rows)
+        footer_rows = [y for y in drawn_rows if y > last_card + 12]
+        return width, height, last_card, footer_rows
+
+    def subject_left_x(self, path):
+        """Левая граница текста предмета (единственный тёмный текст)."""
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            width, height = im.size
+            px = im.load()
+            for x in range(width):
+                for y in range(300, height):
+                    r, g, b = px[x, y]
+                    if r < 80 and g < 80 and b < 80:
+                        return x
+        return -1
+
+    def make(self, break_duration=""):
+        item = lesson("I", None, "Химия Н и Г", "УК307", "Арнаутова А.В.",
+                      "08:30", "09:50")
+        item.break_duration = break_duration
+        return bot.Schedule(date=date(2026, 9, 9), group=bot.GROUP_NAME,
+                            lessons=[item])
+
+    def test_footer_is_inside_image_and_not_over_last_card(self):
+        schedule = bot.parse_schedule(PROVIDED_HTML, date(2026, 9, 7))
+        path = bot.render_schedule_image(schedule)
+        width, height, last_card, footer_rows = self.scan(path)
+        self.assertTrue(footer_rows, "подвал не найден под последней карточкой")
+        # Подвал ниже последней карточки, с заметным отступом.
+        self.assertGreaterEqual(min(footer_rows) - last_card, 20)
+        # И не прижат к нижней границе / не обрезан.
+        self.assertGreaterEqual(height - 1 - max(footer_rows), 20)
+
+    def test_footer_included_in_height_with_summary_block(self):
+        old = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
+                           lessons=[lesson("II", "1")])
+        new = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
+                           lessons=[lesson("II", "1", room="ПК305")])
+        changes = bot.compare_schedules(old, new)
+        path = bot.render_schedule_image(new, changes=changes)
+        width, height, last_card, footer_rows = self.scan(path)
+        self.assertTrue(footer_rows)
+        self.assertGreaterEqual(height - 1 - max(footer_rows), 20)
+
+    def test_empty_schedule_footer_fits(self):
+        path = bot.render_schedule_image(empty_schedule(date(2026, 9, 8)))
+        width, height, last_card, footer_rows = self.scan(path)
+        self.assertTrue(footer_rows)
+        self.assertGreaterEqual(min(footer_rows) - last_card, 20)
+        self.assertGreaterEqual(height - 1 - max(footer_rows), 20)
+
+    def test_break_line_does_not_move_subject(self):
+        with_break = bot.render_schedule_image(self.make("30 мин"))
+        x_with = self.subject_left_x(with_break)
+        without_break = bot.render_schedule_image(self.make(""))
+        x_without = self.subject_left_x(without_break)
+        self.assertGreater(x_with, 0)
+        self.assertEqual(x_with, x_without)
+
+    def test_break_line_reserves_vertical_space(self):
+        with Image.open(bot.render_schedule_image(self.make("30 мин"))) as a, \
+                Image.open(bot.render_schedule_image(self.make(""))) as b:
+            # Строка перемены добавляет высоту, а не наезжает на предмет.
+            self.assertGreater(a.size[1], b.size[1])
+
+    def test_subgroups_are_still_rendered(self):
+        schedule = bot.parse_schedule(PROVIDED_HTML, date(2026, 9, 7))
+        # Пара II с двумя подгруппами выше пары IV без подгрупп.
+        pairs = {p.number: p for p in schedule.pairs}
+        self.assertEqual(len(pairs["II"].lessons), 2)
+        two = bot.Schedule(date=date(2026, 9, 7), group=bot.GROUP_NAME,
+                           lessons=[x for x in schedule.lessons
+                                    if x.pair == "II"])
+        one = bot.Schedule(date=date(2026, 9, 7), group=bot.GROUP_NAME,
+                           lessons=[x for x in schedule.lessons
+                                    if x.pair == "IV"])
+        with Image.open(bot.render_schedule_image(two)) as img_two, \
+                Image.open(bot.render_schedule_image(one)) as img_one:
+            self.assertGreater(img_two.size[1], img_one.size[1])
+
+
 if __name__ == "__main__":
     unittest.main()
