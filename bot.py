@@ -10,7 +10,6 @@ Telegram-бот расписания группы ЭС7-24 (Институт н�
 - Работает в Docker, кодировка UTF-8.
 - Все даты считаются в часовом поясе Asia/Yekaterinburg (UTC+5),
   локальное время сервера не используется.
-- Версия 2.1.5 — система версий и changelog: versioning.py.
 - Расписание преподавателей использует единый справочник staff_directory.py.
 
 """
@@ -62,15 +61,6 @@ from staff_directory import (
 
 # Публичные имена для интеграций: справочник остаётся одним объектом.
 STAFF_MAPPING = STAFF_DIRECTORY
-from versioning import (
-    BOT_VERSION,
-    CHANGELOG,
-    changelog_text,
-    get_released_at,
-    pending_versions,
-    version_key,
-)
-
 
 # ============================================================
 # НАСТРОЙКИ
@@ -170,7 +160,7 @@ class Lesson:
 
     ``groups`` используется на странице расписания преподавателя: сайт может
     показать несколько групп в одной паре. Для группового расписания поле
-    пустое и не меняет поведение версии 2.1.4.
+    пустое и не меняет существующую обработку подгрупп.
     """
 
     pair: str          # римский номер, например "I"
@@ -404,18 +394,6 @@ def get_tomorrow() -> date:
     /schedule должен показывать ровно завтра.
     """
     return get_today() + timedelta(days=1)
-
-
-def parse_db_datetime(value: str) -> Optional[datetime]:
-    """Разбирает дату/время из БД как время Asia/Yekaterinburg."""
-    if not value:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    return None
 
 
 def day_label_for(day: date) -> str:
@@ -1076,7 +1054,7 @@ def parse_schedule(
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # В обычной странице это div.card.myCard. Некоторые версии staff-
+    # В обычной странице это div.card.myCard. Некоторые варианты staff-
     # страницы теряют класс myCard, но сохраняют card-header; запасной
     # селектор не меняет фильтр по обязательным элементам шапки.
     cards = soup.select("div.card.myCard") or soup.select("div.card")
@@ -1404,7 +1382,7 @@ def schedule_signature(schedule: Schedule) -> str:
                 _field_key(item["teacher"]),
             ]
         )
-        # Пустое поле staff-групп не меняет hash основной группы 2.1.4;
+        # Пустое поле staff-групп не меняет hash основной группы;
         # непустые группы учитываются на staff-страницах.
         if item.get("groups"):
             parts.append(_field_key(item["groups"]))
@@ -1568,17 +1546,8 @@ def init_db() -> None:
                     " NOT NULL DEFAULT ''"
                 )
 
-            # 2.1.4: последняя версия changelog, успешно доставленная.
-            if "last_notified_version" not in existing:
-                conn.execute(
-                    "ALTER TABLE subscribers ADD COLUMN"
-                    " last_notified_version TEXT NOT NULL DEFAULT ''"
-                )
-
-            # Безопасная миграция created_at: если дату создания восстановить
-            # нельзя, считаем пользователя существовавшим до любых релизов —
-            # тогда старые пользователи получат changelog 2.1.4,
-            # а новые (созданные после релиза) его не получат.
+            # Старые базы могут содержать legacy-поле created_at; оно
+            # сохраняется как дата регистрации подписчика.
             conn.execute(
                 "UPDATE subscribers SET created_at = '1970-01-01 00:00:00'"
                 " WHERE created_at IS NULL OR created_at = ''"
@@ -1595,8 +1564,8 @@ def init_db() -> None:
                 """
             )
 
-            # 2.1.4: в состоянии храним не только hash, но и нормализованные
-            # данные — без них невозможно показать «было -> стало».
+            # В состоянии храним hash и нормализованные данные — без них
+            # невозможно показать «было -> стало».
             state_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(schedule_state)")
@@ -1607,7 +1576,7 @@ def init_db() -> None:
                     " NOT NULL DEFAULT ''"
                 )
 
-            # 2.1.4: фактическая доставка расписания каждому подписчику
+            # Фактическая доставка расписания каждому подписчику
             # (комбинация «подписчик + дата»), чтобы не отправлять
             # повторно то же самое и не терять изменения при сбоях.
             conn.execute(
@@ -1779,50 +1748,6 @@ def subscriber_info(user_id: int):
     except Exception:
         logger.exception("Ошибка SQLite (subscriber info)")
         return None
-
-
-def load_subscriber_rows() -> list:
-    """Все подписчики с created_at и last_notified_version."""
-    try:
-        with db_connect() as conn:
-            rows = conn.execute(
-                "SELECT user_id, created_at, last_notified_version"
-                " FROM subscribers ORDER BY user_id"
-            ).fetchall()
-            return [dict(row) for row in rows]
-    except Exception:
-        logger.exception("Ошибка SQLite (load subscriber rows)")
-        return []
-
-
-def mark_changelog_notified(user_id: int, version: str) -> bool:
-    """Отмечает версию changelog как успешно доставленную пользователю.
-
-    Сохраняет максимальную доставленную версию — это не мешает
-    будущим версиям (2.1.5, 2.1.6…), потому что eligibility
-    проверяется отдельно для каждой версии.
-    """
-    try:
-        with db_connect() as conn:
-            row = conn.execute(
-                "SELECT last_notified_version FROM subscribers"
-                " WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-            if row is None:
-                return False
-            current = row["last_notified_version"] or ""
-            if version_key(current) >= version_key(version):
-                return True
-            conn.execute(
-                "UPDATE subscribers SET last_notified_version = ?"
-                " WHERE user_id = ?",
-                (version, user_id),
-            )
-            return True
-    except Exception:
-        logger.exception("Ошибка SQLite (mark changelog notified)")
-        return False
 
 
 def load_state() -> dict:
@@ -2445,7 +2370,7 @@ def _change_summary_lines(changes: list) -> list:
 
 
 # ============================================================
-# РЕНДЕР 2.1.5: строгая горизонтальная лента карточек
+# РЕНДЕР: строгая горизонтальная лента карточек
 # ============================================================
 
 
@@ -4132,7 +4057,7 @@ async def _check_date(bot: Bot, day: date) -> None:
         return
 
     if not schedule.lessons:
-        # Отсутствие расписания — тоже не «новая версия».
+        # Отсутствие расписания — тоже не изменение.
         logger.info(
             "Проверка %s: расписание отсутствует — состояние не меняем.",
             date_key,
@@ -4209,123 +4134,20 @@ async def _check_date(bot: Bot, day: date) -> None:
 
 
 # ============================================================
-# CHANGELOG
+# МОНИТОРИНГ ИЗМЕНЕНИЙ
 # ============================================================
-
-_changelog_warned = set()
-
-
-async def _deliver_changelog(bot: Bot, user_id: int, version: str) -> bool:
-    """Отправляет changelog. True — только при реальной доставке."""
-    text = changelog_text(version)
-    try:
-        await bot.send_message(user_id, text)
-        return True
-    except Exception as error:
-        error_text = str(error).lower()
-        if any(
-            marker in error_text
-            for marker in (
-                "bot was blocked",
-                "bot was kicked",
-                "chat not found",
-                "user is deactivated",
-                "group chat was upgraded",
-            )
-        ):
-            unsubscribe_user(user_id)
-            logger.info(
-                "Чат %s недоступен — подписка снята.", user_id
-            )
-        else:
-            logger.warning(
-                "Не удалось отправить changelog %s в %s: %s",
-                version,
-                user_id,
-                error,
-            )
-        return False
-
-
-async def _process_changelog(bot: Bot) -> None:
-    """Рассылка changelog. Вызывается в каждом цикле мониторинга.
-
-    Правила (для каждой версии отдельно):
-    - changelog получают только пользователи, существовавшие ДО релиза
-      версии (created_at < released_at);
-    - новые пользователи (created_at >= released_at) версию не получают;
-    - после успешной отправки last_notified_version обновляется в БД,
-      поэтому перезапуск повторно ничего не шлёт;
-    - при ошибке отправки версия НЕ помечается доставленной —
-      попытка повторится в следующем цикле;
-    - если для версии не задан released_at — она не рассылается.
-    """
-    rows = load_subscriber_rows()
-    sent = 0
-
-    for row in rows:
-        user_id = int(row["user_id"])
-        last = row["last_notified_version"] or ""
-
-        for version in pending_versions(last):
-            released = get_released_at(version)
-            if released is None:
-                if version not in _changelog_warned:
-                    _changelog_warned.add(version)
-                    logger.warning(
-                        "Для версии %s не задан released_at (%s) — "
-                        "changelog не рассылается.",
-                        version,
-                        CHANGELOG.get(version, {}).get(
-                            "released_at_env", ""
-                        ),
-                    )
-                # Версия ещё не выпущена — не считаем пропуском.
-                continue
-
-            created = parse_db_datetime(row["created_at"])
-            if created is None:
-                created = parse_db_datetime("1970-01-01 00:00:00")
-
-            # НЕЛЬЗЯ просто «last != текущая версия -> отправить»:
-            # новые пользователи созданы после релиза и старый
-            # changelog не получают.
-            if created >= released:
-                logger.info(
-                    "Changelog %s: пользователь %s создан после релиза "
-                    "(%s >= %s) — пропускаем.",
-                    version,
-                    user_id,
-                    created,
-                    released,
-                )
-                continue
-
-            ok = await _deliver_changelog(bot, user_id, version)
-            if ok:
-                mark_changelog_notified(user_id, version)
-                sent += 1
-            else:
-                # Не помечаем: в следующем цикле повторим. Старшие
-                # версии не обгоняем — сохраняем порядок.
-                break
-
-    if sent:
-        logger.info("Changelog отправлен: %s сообщения(й).", sent)
-
 
 async def schedule_monitor(bot: Bot) -> None:
     """Фоновая задача. Не блокирует polling, одна на процесс.
 
     Каждые 5 минут даты сегодня/завтра пересчитываются заново
     (переход через полночь обрабатывается автоматически), обе даты
-    проверяются независимо, затем рассылается changelog.
+    проверяются независимо.
     """
     logger.info(
-        "Мониторинг запущен. Интервал: %s сек (%s мин). Версия: %s.",
+        "Мониторинг запущен. Интервал: %s сек (%s мин).",
         CHECK_INTERVAL,
         CHECK_INTERVAL // 60,
-        BOT_VERSION,
     )
 
     birthday_checked_dates: set[str] = set()
@@ -4359,11 +4181,6 @@ async def schedule_monitor(bot: Bot) -> None:
                     birthday_checked_dates.add(today.isoformat())
             except Exception:
                 logger.exception("Ошибка скрытой ежедневной проверки")
-
-        try:
-            await _process_changelog(bot)
-        except Exception:
-            logger.exception("Ошибка рассылки changelog")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -4399,7 +4216,7 @@ async def _setup_commands(bot: Bot) -> None:
 
 async def main() -> None:
     logger.info("=" * 60)
-    logger.info("Бот расписания группы %s (версия %s)", GROUP_NAME, BOT_VERSION)
+    logger.info("Бот расписания группы %s", GROUP_NAME)
     logger.info("Group ID: %s", GROUP_ID)
     logger.info("URL: %s", BASE_URL)
     logger.info("Check interval: %s сек (%s мин)", CHECK_INTERVAL, CHECK_INTERVAL // 60)
