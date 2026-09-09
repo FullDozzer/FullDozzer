@@ -1316,5 +1316,91 @@ class TestImageLayoutFixes(unittest.TestCase):
             self.assertGreater(img_two.size[1], img_one.size[1])
 
 
+class TestTotalStudyBadge(DBTestCase):
+    """Бейдж «Отучились суммарно» в шапке картинки и подсчёт минут истории."""
+
+    ACCENT_LIGHT = (236, 236, 251)  # hex COL_ACCENT_LIGHT ("#ECECFB")
+
+    def setUp(self):
+        super().setUp()
+        with bot.db_connect() as conn:
+            conn.execute("DELETE FROM lesson_history")
+            conn.execute("DELETE FROM subjects")
+
+    def tearDown(self):
+        with bot.db_connect() as conn:
+            conn.execute("DELETE FROM lesson_history")
+            conn.execute("DELETE FROM subjects")
+
+    def badge_rows(self, path, y0=150, y1=250, x0=450):
+        """Строки с заливкой бейджа (accent-light) в нижней части шапки."""
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            return [
+                y for y in range(y0, y1)
+                if any(px[x, y] == self.ACCENT_LIGHT
+                       for x in range(x0, 1040, 2))
+            ]
+
+    def test_total_minutes_sums_only_main_group(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 1), "I", "08:30", "09:50",
+            "Математика", duration=80,
+        )
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 2), "II", "10:00", "11:20",
+            "Физика", duration=95,
+        )
+        # Чужая группа в сумму не попадает.
+        bot.record_completed_lesson(
+            "Другая-группа", date(2026, 9, 1), "I", "08:30", "09:50",
+            "Химия", duration=999,
+        )
+        self.assertEqual(bot.load_total_study_minutes(), 175)
+        self.assertEqual(bot.format_duration(175), "2 ч 55 мин")
+
+    def test_badge_shown_on_group_image(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 1), "I", "08:30", "09:50",
+            "Математика", duration=80,
+        )
+        schedule = bot.Schedule(
+            date=date(2026, 9, 7), group=bot.GROUP_NAME,
+            lessons=[lesson("I", None, "Химия Н и Г", "УК307",
+                            "Арнаутова А.В.", "08:30", "09:50")],
+        )
+        path = bot.render_schedule_image(schedule)
+        rows = self.badge_rows(path)
+        self.assertTrue(rows, "бейдж суммарного времени не найден в шапке")
+        # Бейдж лежит внутри белой шапки, не выходит за неё.
+        self.assertLess(rows[-1], 250)
+
+    def test_no_badge_without_history(self):
+        schedule = bot.Schedule(
+            date=date(2026, 9, 7), group=bot.GROUP_NAME,
+            lessons=[lesson("I", None, "Химия Н и Г", "УК307",
+                            "Арнаутова А.В.", "08:30", "09:50")],
+        )
+        path = bot.render_schedule_image(schedule)
+        self.assertEqual(self.badge_rows(path), [])
+
+    def test_no_badge_on_staff_image(self):
+        # История копится только для основной группы; на staff-картинке
+        # бейдж не нужен даже при наличии записей в БД.
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 1), "I", "08:30", "09:50",
+            "Математика", duration=80,
+        )
+        staff = bot.Schedule(
+            date=date(2026, 9, 8), group="Степанов Сергей Владимирович",
+            schedule_type="staff", staff_id=321,
+            staff_name="Степанов Сергей Владимирович",
+            lessons=[lesson("I", None, "Математика", "УК307", "—")],
+        )
+        path = bot.render_schedule_image(staff)
+        self.assertEqual(self.badge_rows(path), [])
+
+
 if __name__ == "__main__":
     unittest.main()

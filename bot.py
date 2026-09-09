@@ -2098,6 +2098,18 @@ def load_subject_totals(
         return {}
 
 
+def load_total_study_minutes(group_name: str = GROUP_NAME) -> int:
+    """Суммарное отученное время (минуты) по истории завершённых пар."""
+    try:
+        return sum(load_subject_totals(group_name).values())
+    except Exception:
+        logger.exception("Ошибка подсчёта суммарного времени учёбы")
+        return 0
+
+
+total_study_minutes = load_total_study_minutes
+
+
 def register_subjects_from_schedule(schedule: Schedule) -> int:
     """Регистрирует новые предметы без фиксированного справочника."""
     if schedule.schedule_type != "group" or schedule.group != GROUP_NAME:
@@ -2388,6 +2400,9 @@ def render_schedule_image(
       «РАСПИСАНИЕ ОПУБЛИКОВАНО»).
     - для `schedule_type == "staff"` в шапке выводится ФИО
       преподавателя, а в карточках — группы пар (`lesson.groups`).
+    - для расписания основной группы в правом нижнем углу шапки
+      показывается бейдж «Отучились суммарно» с накопленным временем
+      из истории завершённых пар.
     """
     try:
         lessons = list(schedule.lessons)
@@ -2399,6 +2414,7 @@ def render_schedule_image(
         font_group = get_font(72, bold=True)
         font_date = get_font(30)
         font_count = get_font(24, bold=True)
+        font_total = get_font(22, bold=True)
         font_pair = get_font(28, bold=True)
         font_time = get_font(32, bold=True)
         font_break = get_font(22)
@@ -2557,6 +2573,25 @@ def render_schedule_image(
         header_extra = max(0, len(title_lines) - 1) * title_step
         header_bottom = HEADER_H + header_extra
 
+        # Бейдж «Отучились суммарно: …» для расписания группы. Ставится в
+        # правый нижний угол шапки — ниже бейджа занятий и ниже заголовка,
+        # поэтому не пересекается ни с ним, ни с датой. Показывается только
+        # когда в истории завершённых пар уже накоплены минуты.
+        total_pill = None
+        if not is_staff:
+            total_minutes = load_total_study_minutes()
+            if total_minutes > 0:
+                total_text = (
+                    f"Отучились суммарно: {format_duration(total_minutes)}"
+                )
+                total_pad_x = 26
+                total_w = font_total.getlength(total_text) + total_pad_x * 2
+                total_h = 50
+                total_x = W - MARGIN - total_w
+                total_y = 84 + len(title_lines) * title_step + 20
+                total_pill = (total_x, total_y, total_w, total_h,
+                              total_text, total_pad_x)
+
         # Подвал — полноценная часть layout: сначала считаем нижнюю границу
         # контента, затем добавляем отступ, строку подвала и нижний padding.
         footer_text = "ИНК · расписание"
@@ -2615,6 +2650,22 @@ def render_schedule_image(
             font=font_count,
             fill=COL_ACCENT,
         )
+
+        # Бейдж суммарного отученного времени — в той же стилистике, что и
+        # бейдж занятий, чтобы правая колонка шапки смотрелась цельно.
+        if total_pill is not None:
+            tx, ty, tw, th, ttext, tpad = total_pill
+            draw.rounded_rectangle(
+                (tx, ty, tx + tw, ty + th),
+                radius=th / 2,
+                fill=COL_ACCENT_LIGHT,
+            )
+            draw.text(
+                (tx + tpad, ty + (th - _text_h(font_total)) // 2),
+                ttext,
+                font=font_total,
+                fill=COL_ACCENT,
+            )
 
         # ---------- пустое расписание ----------
         if not lessons:
