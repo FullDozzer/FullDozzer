@@ -2408,6 +2408,16 @@ def render_schedule_image(
         lessons = list(schedule.lessons)
         changes = list(changes or [])
         pairs = schedule.pairs
+        is_group = schedule.schedule_type == "group"
+        is_staff = schedule.schedule_type == "staff"
+
+        # История нужна только для расписания основной группы. Загружаем её
+        # одним запросом на картинку: эти же totals используются и строками
+        # прогресса в блоках, и бейджем в шапке.
+        subject_totals = {}
+        if is_group:
+            register_subjects_from_schedule(schedule)
+            subject_totals = load_subject_totals()
 
         # Шрифты
         font_label = get_font(24, bold=True)
@@ -2455,6 +2465,20 @@ def render_schedule_image(
         subg_h = 30
         status_h = 30
         detail_h = 30
+        progress_gap = 8
+        progress_h = _text_h(font_break)
+
+        def progress_for_lesson(lesson):
+            """Возвращает подпись и цвет прогресса для блока занятия."""
+            if not is_group:
+                return "", COL_MUTED
+            normalized = normalize_subject_name(lesson.subject)
+            if not normalized:
+                return "", COL_MUTED
+            minutes = subject_totals.get(normalized, 0)
+            if minutes > 0:
+                return f"Изучено: {format_duration(minutes)}", COL_GREEN
+            return "Первое занятие по предмету", COL_MUTED
 
         change_by_key = {
             (clean_text(c.pair).upper(), clean_text(c.subgroup) or None): c
@@ -2482,6 +2506,9 @@ def render_schedule_image(
             h += 14 + chip_h
             if clean_text(getattr(item["lesson"], "groups", "")):
                 h += 8 + _text_h(font_info)
+            progress_text, _ = progress_for_lesson(item["lesson"])
+            if progress_text:
+                h += progress_gap + progress_h
             if item["kind"] == "changed":
                 h += 8 + detail_h * len(item["details"])
             return h
@@ -2536,7 +2563,6 @@ def render_schedule_image(
         # Заголовок шапки — название группы либо ФИО преподавателя.
         # Сначала подбираем шрифт и число строк заголовка: длинное ФИО
         # не должно уезжать под бейдж занятий или за правый край.
-        is_staff = schedule.schedule_type == "staff"
         big_title = clean_text(
             (schedule.staff_name or schedule.group)
             if is_staff else (schedule.group or GROUP_NAME)
@@ -2578,8 +2604,8 @@ def render_schedule_image(
         # поэтому не пересекается ни с ним, ни с датой. Показывается только
         # когда в истории завершённых пар уже накоплены минуты.
         total_pill = None
-        if not is_staff:
-            total_minutes = load_total_study_minutes()
+        if is_group:
+            total_minutes = sum(subject_totals.values())
             if total_minutes > 0:
                 total_text = (
                     f"Отучились суммарно: {format_duration(total_minutes)}"
@@ -2897,6 +2923,19 @@ def render_schedule_image(
                             fill=COL_MUTED,
                         )
                         inner_y += 8 + _text_h(font_info)
+
+                    # Накопленный прогресс — только в карточках основной
+                    # группы. Он идёт после аудитории/преподавателя и после
+                    # списка групп, но до деталей изменения.
+                    progress_text, progress_color = progress_for_lesson(lesson)
+                    if progress_text:
+                        draw.text(
+                            (left, inner_y + progress_gap),
+                            progress_text,
+                            font=font_break,
+                            fill=progress_color,
+                        )
+                        inner_y += progress_gap + progress_h
 
                     # Было -> стало для изменённых полей.
                     if kind == "changed":

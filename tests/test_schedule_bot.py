@@ -1320,6 +1320,8 @@ class TestTotalStudyBadge(DBTestCase):
     """Бейдж «Отучились суммарно» в шапке картинки и подсчёт минут истории."""
 
     ACCENT_LIGHT = (236, 236, 251)  # hex COL_ACCENT_LIGHT ("#ECECFB")
+    GREEN = (14, 159, 95)            # hex COL_GREEN
+    MUTED = (100, 116, 139)          # hex COL_MUTED
 
     def setUp(self):
         super().setUp()
@@ -1342,6 +1344,103 @@ class TestTotalStudyBadge(DBTestCase):
                 if any(px[x, y] == self.ACCENT_LIGHT
                        for x in range(x0, 1040, 2))
             ]
+
+    def color_rows(self, path, color, y0=520):
+        """Точные цветовые строки внутри блока занятия, ниже метаданных."""
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            return [
+                y for y in range(y0, im.height)
+                if any(px[x, y] == color for x in range(100, 980))
+            ]
+
+    def color_clusters(self, rows):
+        clusters = []
+        for row in rows:
+            if not clusters or row > clusters[-1][-1] + 2:
+                clusters.append([row])
+            else:
+                clusters[-1].append(row)
+        return clusters
+
+    def test_subject_progress_shown_on_group_image(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 1), "I", "08:30", "09:50",
+            "Математика", duration=160,
+        )
+        schedule = bot.Schedule(
+            date=date(2026, 9, 7), group=bot.GROUP_NAME,
+            lessons=[lesson("I", None, "Математика")],
+        )
+        path = bot.render_schedule_image(schedule)
+        # После чипа аудитории у строки «Изучено: 2 ч 40 мин» есть зелёные
+        # пиксели; зелёная надпись аудитории находится выше этого диапазона.
+        self.assertTrue(self.color_rows(path, self.GREEN))
+
+    def test_subject_progress_without_history_is_muted_first_lesson(self):
+        schedule = bot.Schedule(
+            date=date(2026, 9, 7), group=bot.GROUP_NAME,
+            lessons=[lesson("I", None, "Новый предмет")],
+        )
+        path = bot.render_schedule_image(schedule)
+        self.assertTrue(self.color_rows(path, self.MUTED))
+        self.assertEqual(
+            bot.get_subject_progress("Новый предмет"),
+            "Первое занятие по предмету",
+        )
+
+    def test_subject_progress_is_absent_on_staff_image(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 1), "I", "08:30", "09:50",
+            "Математика", duration=80,
+        )
+        staff = bot.Schedule(
+            date=date(2026, 9, 8), group="Степанов Сергей Владимирович",
+            schedule_type="staff", staff_id=321,
+            staff_name="Степанов Сергей Владимирович",
+            lessons=[lesson("I", None, "Математика")],
+        )
+        path = bot.render_schedule_image(staff)
+        self.assertEqual(self.color_rows(path, self.GREEN), [])
+
+    def test_progress_does_not_reduce_card_height(self):
+        without_history = bot.Schedule(
+            date=date(2026, 9, 7), group=bot.GROUP_NAME,
+            lessons=[lesson("I", None, "Предмет без истории")],
+        )
+        with_history = bot.Schedule(
+            date=date(2026, 9, 8), group=bot.GROUP_NAME,
+            lessons=[lesson("I", None, "Математика")],
+        )
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 1), "I", "08:30", "09:50",
+            "Математика", duration=80,
+        )
+        without_path = bot.render_schedule_image(without_history)
+        with_path = bot.render_schedule_image(with_history)
+        with Image.open(without_path) as without_img, \
+                Image.open(with_path) as with_img:
+            self.assertGreaterEqual(with_img.size[1], without_img.size[1])
+
+    def test_progress_is_rendered_for_each_subgroup_and_pair(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 1), "I", "08:30", "09:50",
+            "Информатика", duration=80,
+        )
+        schedule = bot.Schedule(
+            date=date(2026, 9, 7), group=bot.GROUP_NAME,
+            lessons=[
+                lesson("I", "1", "Информатика"),
+                lesson("I", "2", "Информатика", room="ПК303"),
+                lesson("II", None, "Информатика"),
+            ],
+        )
+        path = bot.render_schedule_image(schedule)
+        # У каждого из трёх блоков есть отдельная зелёная строка прогресса.
+        self.assertGreaterEqual(
+            len(self.color_clusters(self.color_rows(path, self.GREEN))), 3
+        )
 
     def test_total_minutes_sums_only_main_group(self):
         bot.record_completed_lesson(
