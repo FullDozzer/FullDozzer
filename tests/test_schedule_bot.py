@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Проверки логики бота версии 2.1.4.
+"""Проверки логики бота.
 
 Запуск:  python -m unittest discover -s tests -v
 (из корня репозитория, с установленными зависимостями)
@@ -19,17 +19,8 @@ from PIL import Image
 _TEST_DATA = Path(tempfile.mkdtemp(prefix="sched_bot_test_"))
 os.environ["DATA_DIR"] = str(_TEST_DATA)
 os.environ["CHECK_INTERVAL"] = "300"
-os.environ["CHANGELOG_2_1_4_RELEASED_AT"] = "2026-09-06 12:00:00"
 
 import bot  # noqa: E402
-from versioning import (  # noqa: E402
-    BOT_VERSION,
-    CHANGELOG,
-    changelog_text,
-    get_released_at,
-    pending_versions,
-    version_key,
-)
 
 
 def run(coro):
@@ -94,54 +85,14 @@ class DBTestCase(unittest.TestCase):
             conn.execute("DELETE FROM schedule_notifications")
             conn.execute("DELETE FROM subscribers")
 
-    def insert_user(self, user_id, created_at, last_notified_version=""):
+    def insert_user(self, user_id, created_at):
         with bot.db_connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO subscribers"
-                " (user_id, created_at, chat_type, title,"
-                "  last_notified_version)"
-                " VALUES (?, ?, 'private', '', ?)",
-                (user_id, created_at, last_notified_version),
+                " (user_id, created_at, chat_type, title)"
+                " VALUES (?, ?, 'private', '')",
+                (user_id, created_at),
             )
-
-
-class TestVersionSystem(unittest.TestCase):
-    def test_bot_version(self):
-        self.assertEqual(BOT_VERSION, "2.1.4")
-        self.assertEqual(bot.BOT_VERSION, "2.1.4")
-
-    def test_changelog_2_1_4_exists(self):
-        self.assertIn("2.1.4", CHANGELOG)
-        changes = CHANGELOG["2.1.4"]["changes"]
-        self.assertGreaterEqual(len(changes), 6)
-        joined = " ".join(changes).lower()
-        self.assertIn("/today", joined)
-        self.assertIn("5 минут", joined)
-        self.assertIn("asia/yekaterinburg", joined)
-
-    def test_version_key_and_pending(self):
-        self.assertEqual(version_key("2.1.4"), (2, 1, 4))
-        self.assertLess(version_key("2.1.4"), version_key("2.1.5"))
-        self.assertEqual(pending_versions(""), ["2.1.4"])
-        self.assertEqual(pending_versions("2.1.4"), [])
-        # Пользователь после 2.1.4 (до 2.1.5) получит 2.1.5
-        self.assertEqual(pending_versions("2.1.4"), [])
-
-    def test_released_at_comes_from_config(self):
-        released = get_released_at("2.1.4")
-        self.assertIsNotNone(released)
-        self.assertEqual(released, datetime(2026, 9, 6, 12, 0, 0))
-        with mock.patch.dict(
-            os.environ, {"CHANGELOG_2_1_4_RELEASED_AT": ""}
-        ):
-            self.assertIsNone(get_released_at("2.1.4"))
-
-    def test_changelog_text(self):
-        text = changelog_text("2.1.4")
-        self.assertIn("2.1.4", text)
-        self.assertIn("/today", text)
-        self.assertIn("•", text)
-        self.assertIn("Asia/Yekaterinburg", text)
 
 
 class TestTimezone(DBTestCase):
@@ -195,12 +146,7 @@ class TestTimezone(DBTestCase):
             "Завтра",
         )
 
-    def test_parse_db_datetime(self):
-        self.assertEqual(
-            bot.parse_db_datetime("2026-09-01 08:30:00"),
-            datetime(2026, 9, 1, 8, 30, 0),
-        )
-        self.assertIsNone(bot.parse_db_datetime(""))
+
 
 
 class TestScheduleTextParsing(unittest.TestCase):
@@ -777,8 +723,8 @@ class TestMonitoring(DBTestCase):
     def test_interval_is_5_minutes(self):
         self.assertEqual(bot.CHECK_INTERVAL, 300)
 
-    def test_monitor_full_cycle_both_dates_and_changelog(self):
-        """Один цикл монитора: сегодня + завтра + changelog, без дублей."""
+    def test_monitor_full_cycle_both_dates(self):
+        """Один цикл монитора: сегодня и завтра без дублей."""
         bot.subscribe_user(1001)
         fake_bot = FakeBot()
         today = bot.get_today()
@@ -844,87 +790,6 @@ class TestMonitoring(DBTestCase):
         self.assertEqual(
             len(bot.compare_schedules(restored, schedule)), 0
         )
-
-
-class TestChangelogDelivery(DBTestCase):
-    def setUp(self):
-        super().setUp()
-        self.bot = FakeBot()
-
-    def test_old_user_gets_21_4_new_user_does_not(self):
-        self.insert_user(2001, "2026-09-01 00:00:00")   # до релиза
-        self.insert_user(2002, "2026-09-07 00:00:00")   # после релиза
-        run(bot._process_changelog(self.bot))
-        sent_ids = [item[1] for item in self.bot.sent if item[0] == "text"]
-        self.assertEqual(sent_ids, [2001])
-        with bot.db_connect() as conn:
-            rows = {
-                r["user_id"]: r["last_notified_version"]
-                for r in conn.execute(
-                    "SELECT user_id, last_notified_version FROM subscribers"
-                )
-            }
-        self.assertEqual(rows[2001], "2.1.4")
-        self.assertEqual(rows[2002], "")
-
-    def test_restart_does_not_resend(self):
-        self.insert_user(2001, "2026-09-01 00:00:00")
-        run(bot._process_changelog(self.bot))
-        count_after_first = len(self.bot.sent)
-        # «Перезапуск»: снова вызываем рассылку
-        run(bot._process_changelog(self.bot))
-        self.assertEqual(len(self.bot.sent), count_after_first)
-
-    def test_failed_send_not_marked_then_retried(self):
-        self.insert_user(3001, "2026-09-01 00:00:00")
-
-        async def failing(b, user_id, version):
-            return False
-
-        with mock.patch.object(bot, "_deliver_changelog", failing):
-            run(bot._process_changelog(self.bot))
-        with bot.db_connect() as conn:
-            row = conn.execute(
-                "SELECT last_notified_version FROM subscribers"
-                " WHERE user_id = 3001"
-            ).fetchone()
-        self.assertEqual(row["last_notified_version"], "")
-        # Теперь доставка удалась
-        run(bot._process_changelog(self.bot))
-        with bot.db_connect() as conn:
-            row = conn.execute(
-                "SELECT last_notified_version FROM subscribers"
-                " WHERE user_id = 3001"
-            ).fetchone()
-        self.assertEqual(row["last_notified_version"], "2.1.4")
-
-    def test_unreleased_version_not_sent(self):
-        self.insert_user(4001, "2026-09-01 00:00:00")
-        with mock.patch.dict(
-            os.environ, {"CHANGELOG_2_1_4_RELEASED_AT": ""}
-        ):
-            run(bot._process_changelog(self.bot))
-        self.assertEqual(self.bot.sent, [])
-        with bot.db_connect() as conn:
-            row = conn.execute(
-                "SELECT last_notified_version FROM subscribers"
-                " WHERE user_id = 4001"
-            ).fetchone()
-        self.assertEqual(row["last_notified_version"], "")
-
-    def test_legacy_user_without_created_at_is_old(self):
-        self.insert_user(5001, "")
-        run(bot._process_changelog(self.bot))
-        sent_ids = [item[1] for item in self.bot.sent if item[0] == "text"]
-        self.assertEqual(sent_ids, [5001])
-
-    def test_future_version_planning(self):
-        # Пользователь после 2.1.4 не получает 2.1.4 —
-        # и так как CHANGELOG для 2.1.5 ещё нет, ничего не получает.
-        self.insert_user(6001, "2026-09-10 00:00:00",
-                         last_notified_version="2.1.4")
-        run(bot._process_changelog(self.bot))
-        self.assertEqual(self.bot.sent, [])
 
 
 PROVIDED_HTML = """

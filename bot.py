@@ -10,7 +10,8 @@ Telegram-бот расписания группы ЭС7-24 (Институт н�
 - Работает в Docker, кодировка UTF-8.
 - Все даты считаются в часовом поясе Asia/Yekaterinburg (UTC+5),
   локальное время сервера не используется.
-- Версия 2.1.4 — система версий и changelog: versioning.py.
+- Расписание преподавателей использует единый справочник staff_directory.py.
+
 """
 
 import asyncio
@@ -20,9 +21,10 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -32,7 +34,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -45,18 +47,20 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
 )
 
-from versioning import (
-    BOT_VERSION,
-    CHANGELOG,
-    changelog_text,
-    get_released_at,
-    pending_versions,
-    version_key,
+from staff_directory import (
+    STAFF_BY_ID,
+    STAFF_DIRECTORY,
+    STAFF_MEMBERS,
+    StaffMember,
+    search_staff,
 )
 
+# Публичные имена для интеграций: справочник остаётся одним объектом.
+STAFF_MAPPING = STAFF_DIRECTORY
 
 # ============================================================
 # НАСТРОЙКИ
@@ -64,15 +68,49 @@ from versioning import (
 
 load_dotenv()
 
-# Группа
+# Брендинг и группа
+BOT_NAME = "ИНК • Расписание"
 GROUP_NAME = os.getenv("GROUP_NAME", "ЭС7-24").strip()
 GROUP_ID = int(os.getenv("GROUP_ID", "508"))
 BASE_URL = os.getenv(
     "BASE_URL", "http://www.ishnk.ru/2025/site/schedule/group/508"
 ).rstrip("/")
+STAFF_BASE_URL = os.getenv(
+    "STAFF_BASE_URL", "http://www.ishnk.ru/2025/site/schedule/staff"
+).rstrip("/")
+# Домашняя страница колледжа содержит блок happyCard. URL можно заменить,
+# не меняя scheduler или обработчики.
+BIRTHDAY_URL = os.getenv(
+    "BIRTHDAY_URL", "http://www.ishnk.ru/2025/site"
+).rstrip("/")
+BIRTHDAY_CHAT_ID_RAW = next(
+    (
+        os.getenv(key, "").strip()
+        for key in (
+            "BIRTHDAY_CHAT_ID", "BIRTHDAY_GROUP_ID",
+            "TELEGRAM_GROUP_ID", "TELEGRAM_CHAT_ID",
+        )
+        if os.getenv(key, "").strip()
+    ),
+    "",
+)
+try:
+    BIRTHDAY_CHAT_ID = int(BIRTHDAY_CHAT_ID_RAW) if BIRTHDAY_CHAT_ID_RAW else None
+except ValueError:
+    BIRTHDAY_CHAT_ID = None
 
 # Токен берётся только из переменной окружения / .env, не из кода.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+# Rate limiter. Значения достаточно мягкие для обычного просмотра расписания,
+# но защищают сайт и генератор от автоматического шквала запросов.
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "10"))
+RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "8"))
+RATE_LIMIT_BLACKLIST_AFTER = int(os.getenv("RATE_LIMIT_BLACKLIST_AFTER", "2"))
+RATE_LIMIT_WARNING_COOLDOWN = int(
+    os.getenv("RATE_LIMIT_WARNING_COOLDOWN", "30")
+)
+SPAM_WARNING_TEXT = "⚠️ Слишком много запросов подряд.\nПожалуйста, немного подождите."
 
 # Период автоматической проверки (секунды). 5 минут = 300
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
@@ -118,7 +156,12 @@ ROMAN_PAIRS = {
 
 @dataclass
 class Lesson:
-    """Одно занятие / одна подгруппа в рамках пары."""
+    """Одно занятие / одна подгруппа в рамках пары.
+
+    ``groups`` используется на странице расписания преподавателя: сайт может
+    показать несколько групп в одной паре. Для группового расписания поле
+    пустое и не меняет существующую обработку подгрупп.
+    """
 
     pair: str          # римский номер, например "I"
     time: str          # "08:30 - 09:50"
@@ -129,6 +172,7 @@ class Lesson:
     end: str = ""      # "09:50"
     subgroup: Optional[str] = None  # "1", "2" или None (обычное занятие)
     break_duration: str = ""        # например "15 мин"
+    groups: str = ""                # «ЭС7-24, БС1-23» для staff-расписания
 
     @property
     def key(self) -> tuple:
@@ -167,14 +211,19 @@ class ScheduleChange:
 class Schedule:
     """Расписание на конкретный день.
 
-    `lessons` остаётся плоским списком всех занятий/подгрупп (Это удобно
+    `lessons` остаётся плоским списком всех занятий/подгрупп (это удобно
     для подписи/хэша и совместимости), а `pairs` собирает их в пары.
+    ``schedule_type`` различает основную группу и преподавателя, поэтому
+    callback-и, состояние и рендер не смешивают эти два вида расписания.
     """
 
     date: date
     group: str
     lessons: list
     fallback: bool = False
+    schedule_type: str = "group"
+    staff_id: Optional[int] = None
+    staff_name: str = ""
 
     @property
     def pairs(self) -> list:
@@ -347,18 +396,6 @@ def get_tomorrow() -> date:
     return get_today() + timedelta(days=1)
 
 
-def parse_db_datetime(value: str) -> Optional[datetime]:
-    """Разбирает дату/время из БД как время Asia/Yekaterinburg."""
-    if not value:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    return None
-
-
 def day_label_for(day: date) -> str:
     """«Сегодня» / «Завтра» для однозначных уведомлений."""
     today = get_today()
@@ -371,7 +408,8 @@ def day_label_for(day: date) -> str:
 
 MONTH_NAMES = {
     "январ": 1, "феврал": 2, "март": 3, "апрел": 4,
-    "ма": 5, "июн": 6, "июл": 7, "август": 8,
+    "май": 5, "мая": 5, "мае": 5,
+    "июн": 6, "июл": 7, "август": 8,
     "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12,
 }
 
@@ -475,66 +513,133 @@ def parse_user_date(raw: str):
     return None
 
 
+# Единое имя для компонентов, которым не важно, откуда пришла дата.
+parse_date = parse_user_date
+
+
 # ============================================================
 # ТЕКСТОВАЯ КОМАНДА «РАСПИСАНИЕ»
 # ============================================================
 
 @dataclass
 class ScheduleTextRequest:
-    """Результат разбора текстовой команды «расписание…».
+    """Единый результат разбора естественного запроса расписания.
 
-    - matched=False — сообщение не команда (бота не касается);
-    - date=None, error=False — «расписание» без даты -> завтра;
-    - date=<дата> — распознанная дата;
-    - error=True — «расписание» есть, но дату определить не удалось.
+    ``schedule_type`` равен ``group`` или ``staff``. Дата всегда проходит
+    через один и тот же :func:`parse_user_date`; отдельного date parser для
+    преподавателей нет.
     """
 
     matched: bool = False
     date: Optional[date] = None
     error: bool = False
+    schedule_type: str = "group"
+    staff_query: str = ""
 
 
-_SCHEDULE_TEXT_RE = re.compile(r"^расписание(.*)$", re.IGNORECASE)
+_SCHEDULE_TEXT_RE = re.compile(r"^расписание(?:\s+(.*))?$", re.IGNORECASE)
+
+
+def _extract_staff_date_and_query(raw: str) -> tuple[str, Optional[date], bool]:
+    """Возвращает (запрос преподавателя, дата, ошибка даты).
+
+    Суффикс ``на <дата>`` отделяется только если весь суффикс является
+    корректной датой. Это не создаёт второго парсера и не ломает фамилии.
+    """
+    rest = clean_text(raw)
+    if not rest:
+        return "", None, False
+
+    if rest.casefold().endswith(" на"):
+        return clean_text(rest[:-2]), None, True
+
+    if rest.casefold().startswith("на "):
+        date_raw = clean_text(rest[3:])
+        if not date_raw:
+            return "", None, True
+        parsed = parse_user_date(date_raw)
+        return "", parsed, parsed is None
+
+    # Берём последнее « на »: имя и фамилия остаются запросом, а дата
+    # распознаётся тем же parse_user_date, что и для основной группы.
+    marker = re.search(r"\s+на\s+(.+)$", rest, flags=re.IGNORECASE)
+    if marker:
+        date_raw = clean_text(marker.group(1))
+        parsed = parse_user_date(date_raw)
+        if parsed is not None:
+            query = clean_text(rest[: marker.start()])
+            return query, parsed, False
+        # Похожий на дату суффикс нельзя молча считать частью ФИО.
+        return clean_text(rest[: marker.start()]), None, True
+
+    return rest, None, False
 
 
 def parse_schedule_text(text: str) -> ScheduleTextRequest:
-    """Разбирает «расписание» и «расписание на <дата>».
+    """Разбирает групповые и преподавательские запросы.
 
-    Отдельная функция: обработка команды -> парсинг даты -> get_schedule.
-    Устойчива к регистру и лишним пробелам. Относительные даты
-    («сегодня», «завтра», «послезавтра») считаются в часовом поясе
-    Asia/Yekaterinburg. Ошибок «угадывания» нет: непонятная дата
-    возвращает error=True.
+    Поддерживаются, в частности:
+    ``расписание`` -> завтра;
+    ``расписание на сегодня`` -> сегодня;
+    ``расписание преподавателя Аглиуллиной на 9 сентября``;
+    ``расписание Аглиуллиной`` -> расписание преподавателя на завтра.
     """
     if not text:
         return ScheduleTextRequest()
 
     normalized = clean_text(text).lower()
-    match = _SCHEDULE_TEXT_RE.match(normalized)
+    match = _SCHEDULE_TEXT_RE.fullmatch(normalized)
     if not match:
         return ScheduleTextRequest()
 
-    rest = match.group(1).strip()
+    rest = clean_text(match.group(1) or "")
     if not rest:
-        # Просто «расписание» -> расписание на завтра.
         return ScheduleTextRequest(matched=True)
 
-    # Дальше допускается только «на <дата>».
-    arg_match = re.fullmatch(r"на(?:\s+(.+))?", rest)
-    if not arg_match:
-        # «расписание чего-то» — это не наша команда.
-        return ScheduleTextRequest()
+    # Групповой запрос имеет единственный допустимый префикс «на».
+    if rest.casefold().startswith("на") and (
+        rest.casefold() == "на" or rest[2:3].isspace()
+    ):
+        arg = clean_text(rest[2:])
+        if not arg:
+            return ScheduleTextRequest(matched=True, error=True)
+        target = parse_user_date(arg)
+        return ScheduleTextRequest(
+            matched=True, date=target, error=target is None
+        )
 
-    arg = clean_text(arg_match.group(1) or "")
-    if not arg:
-        # «расписание на» без даты — подсказка, не угадываем.
-        return ScheduleTextRequest(matched=True, error=True)
+    # «расписание преподавателя …» и короткая форма
+    # «расписание Аглиуллиной» — один и тот же маршрут.
+    if rest.casefold() == "преподавателя":
+        return ScheduleTextRequest(
+            matched=True, error=True, schedule_type="staff"
+        )
+    if rest.casefold().startswith("преподавателя "):
+        staff_raw = clean_text(rest[len("преподавателя "):])
+    else:
+        staff_raw = rest
 
-    target = parse_user_date(arg)
-    if target is None:
-        return ScheduleTextRequest(matched=True, error=True)
+    staff_query, target, date_error = _extract_staff_date_and_query(staff_raw)
+    if not staff_query:
+        return ScheduleTextRequest(
+            matched=True,
+            date=target,
+            error=True if date_error or target is None else False,
+            schedule_type="staff",
+            staff_query="",
+        )
 
-    return ScheduleTextRequest(matched=True, date=target)
+    return ScheduleTextRequest(
+        matched=True,
+        date=target,
+        error=date_error,
+        schedule_type="staff",
+        staff_query=staff_query,
+    )
+
+
+# Явное имя удобно для интеграционных тестов и не создаёт отдельной логики.
+parse_staff_schedule_text = parse_schedule_text
 
 
 def format_date_full(value: date) -> str:
@@ -562,66 +667,70 @@ def build_url(day: date) -> str:
     return f"{BASE_URL}/{day.isoformat()}"
 
 
-async def fetch_html(day: date):
+def build_staff_url(staff_id: int, day: date) -> str:
+    """Строит URL только для ID из STAFF_DIRECTORY."""
+    if int(staff_id) not in STAFF_BY_ID:
+        raise ValueError(f"Неизвестный STAFF_ID: {staff_id}")
+    return f"{STAFF_BASE_URL}/{int(staff_id)}/{day.isoformat()}"
+
+
+async def fetch_url(url: str, label: str = "страницы колледжа"):
+    """Получает HTML без перехода по редиректам.
+
+    Один низкоуровневый HTTP-компонент используется группой, staff-страницей
+    и скрытой ежедневной проверкой страницы колледжа.
     """
-    Выполняет GET по HTTP и возвращает строку HTML (utf-8) либо None.
-
-    - allow_redirects=False: не переходим по 3xx и не меняем протокол.
-    - timeout ~20 секунд.
-    """
-    url = build_url(day)
-
-    logger.info("Получение расписания: %s", day.isoformat())
-
+    logger.info("Получение %s: %s", label, url)
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-
     try:
         async with aiohttp.ClientSession(
             headers=HEADERS,
             timeout=timeout,
         ) as session:
-
-            async with session.get(
-                url,
-                allow_redirects=False,
-            ) as response:
-
+            async with session.get(url, allow_redirects=False) as response:
                 status = response.status
-                logger.info("HTTP статус: %s", status)
-
-                # Редирект — не следуем (иначе могли бы уйти на другой протокол).
+                logger.info("HTTP статус (%s): %s", label, status)
                 if status in (300, 301, 302, 303, 307, 308):
-                    location = response.headers.get("Location", "")
                     logger.error(
-                        "HTTP редирект %s на «%s» — не переходим по перенаправлению.",
+                        "HTTP редирект %s на «%s» — не переходим.",
                         status,
-                        location,
+                        response.headers.get("Location", ""),
                     )
                     return None
-
                 if status != 200:
-                    logger.error("HTTP ошибка: %s", status)
+                    logger.error("HTTP ошибка (%s): %s", label, status)
                     return None
-
                 raw = await response.read()
-
                 if not raw:
-                    logger.error("Пустой HTML")
+                    logger.error("Пустой HTML (%s)", label)
                     return None
-
-                logger.info("Получено HTML: %s байт", len(raw))
-
                 return raw.decode("utf-8", errors="replace")
-
     except asyncio.TimeoutError:
-        logger.error("Таймаут при получении расписания: %s", url)
+        logger.error("Таймаут при получении %s: %s", label, url)
         return None
     except aiohttp.ClientError as error:
-        logger.error("HTTP ошибка при получении расписания: %s", error)
+        logger.error("HTTP ошибка при получении %s: %s", label, error)
         return None
     except Exception:
-        logger.exception("Не удалось получить расписание")
+        logger.exception("Не удалось получить %s", label)
         return None
+
+
+async def fetch_html(day: date):
+    return await fetch_url(
+        build_url(day), f"расписания группы на {day.isoformat()}"
+    )
+
+
+async def fetch_staff_html(staff_id: int, day: date):
+    return await fetch_url(
+        build_staff_url(staff_id, day),
+        f"расписания преподавателя {staff_id} на {day.isoformat()}",
+    )
+
+
+async def fetch_birthday_html():
+    return await fetch_url(BIRTHDAY_URL, "страницы college")
 
 
 # ============================================================
@@ -667,7 +776,7 @@ def _find_room(node) -> str:
     """
     # Способ 1: элемент .h5 рядом с текстом «ауд.»
     for text_node in node.find_all(string=True):
-        if text_node and "ауд." in text_node:
+        if text_node and ("ауд." in text_node.lower() or "аудитори" in text_node.lower()):
             parent = text_node.parent
             if parent is None:
                 continue
@@ -681,7 +790,7 @@ def _find_room(node) -> str:
     # Способ 2: regex по очищенному тексту карточки
     text = clean_text(node.get_text(" ", strip=True))
     match = re.search(
-        r"ауд\.\s*([A-Za-zА-Яа-я0-9№.\-()/]+)",
+        r"(?:ауд\.|аудитория)\s*([A-Za-zА-Яа-я0-9№.\-()/]+)",
         text,
         re.IGNORECASE,
     )
@@ -737,6 +846,35 @@ def _find_teacher(node) -> str:
                 return value
 
     return ""
+
+
+_GROUP_TOKEN_RE = re.compile(
+    r"(?<![A-Za-zА-Яа-яЁё0-9])([A-Za-zА-Яа-яЁё]{1,8}\s*\d{1,3}\s*[-–—]\s*\d{1,3})(?![A-Za-zА-Яа-яЁё0-9])",
+    re.IGNORECASE,
+)
+
+
+def _find_groups(node) -> str:
+    """Группы на странице преподавателя, без вывода ID из HTML."""
+    values = []
+    text = clean_text(node.get_text(" ", strip=True))
+    for match in _GROUP_TOKEN_RE.finditer(text):
+        value = re.sub(r"\s*[-–—]\s*", "-", clean_text(match.group(1)))
+        value = re.sub(r"\s+", "", value)
+        if value.casefold() not in {item.casefold() for item in values}:
+            values.append(value)
+
+    # Некоторые варианты страницы помещают группу только в title/aria-label.
+    for attr in ("title", "data-group", "aria-label"):
+        for element in node.select(f"[{attr}]"):
+            raw = clean_text(element.get(attr, ""))
+            for match in _GROUP_TOKEN_RE.finditer(raw):
+                value = re.sub(r"\s*[-–—]\s*", "-", clean_text(match.group(1)))
+                value = re.sub(r"\s+", "", value)
+                if value.casefold() not in {item.casefold() for item in values}:
+                    values.append(value)
+
+    return ", ".join(values)
 
 
 def _find_break_duration(header) -> str:
@@ -849,6 +987,7 @@ def _parse_lesson_from_node(
     teacher = _find_teacher(node)
     room = _find_room(node)
     subgroup = _find_subgroup(node, css_class=css_class)
+    groups = _find_groups(node)
 
     # Запасная эвристика для plain-text HTML без классов .Staff/.d-md-none:
     # преподавателя ищем по паттерну «Фамилия И.О.».
@@ -875,6 +1014,7 @@ def _parse_lesson_from_node(
         room=room or "—",
         subgroup=subgroup,
         break_duration=break_duration,
+        groups=groups,
     )
 
 
@@ -897,12 +1037,27 @@ def _iter_subgroup_blocks(body):
     return candidates
 
 
-def parse_schedule(html: str, day: date) -> Schedule:
+def parse_schedule(
+    html: str,
+    day: date,
+    group: Optional[str] = None,
+    *,
+    schedule_type: str = "group",
+    staff_id: Optional[int] = None,
+    staff_name: str = "",
+) -> Schedule:
+    """Общий parser карточек группы и staff-страницы.
+
+    Структура источника одна: карточки ``myCard`` и их пары. Для staff
+    передаются только метаданные из локального справочника, а не ID,
+    найденный в HTML.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Учитываем ТОЛЬКО карточки ежедневного расписания:
-    #   div.card.myCard  +  .card-header  (+ .h3 и .h4 внутри)
-    cards = soup.select("div.card.myCard")
+    # В обычной странице это div.card.myCard. Некоторые варианты staff-
+    # страницы теряют класс myCard, но сохраняют card-header; запасной
+    # селектор не меняет фильтр по обязательным элементам шапки.
+    cards = soup.select("div.card.myCard") or soup.select("div.card")
 
     lessons: list = []
 
@@ -1001,6 +1156,7 @@ def parse_schedule(html: str, day: date) -> Schedule:
             lesson.teacher,
             lesson.room,
             lesson.subgroup,
+            lesson.groups,
         )
         if key in seen:
             continue
@@ -1033,10 +1189,14 @@ def parse_schedule(html: str, day: date) -> Schedule:
             lesson.subject,
         )
 
+    effective_name = staff_name or (group if schedule_type == "staff" else "")
     return Schedule(
         date=day,
-        group=GROUP_NAME,
+        group=group or GROUP_NAME,
         lessons=unique,
+        schedule_type=schedule_type,
+        staff_id=staff_id,
+        staff_name=effective_name,
     )
 
 
@@ -1059,15 +1219,45 @@ async def get_schedule(day: date) -> Schedule:
         raise ScheduleUnavailable("Ошибка парсинга расписания")
 
 
+async def get_staff_schedule(staff_id: int, day: date) -> Schedule:
+    """Получает расписание преподавателя по разрешённому STAFF_ID."""
+    member = STAFF_BY_ID.get(int(staff_id))
+    if member is None:
+        raise ScheduleUnavailable("Неизвестный преподаватель")
+    html = await fetch_staff_html(member.staff_id, day)
+    if html is None:
+        raise ScheduleUnavailable(
+            f"Сайт недоступен для преподавателя {member.staff_id}"
+        )
+    try:
+        return parse_schedule(
+            html,
+            day,
+            group=member.full_name,
+            schedule_type="staff",
+            staff_id=member.staff_id,
+            staff_name=member.full_name,
+        )
+    except Exception:
+        logger.exception("Ошибка парсинга staff HTML")
+        raise ScheduleUnavailable("Ошибка парсинга расписания преподавателя")
+
+
+fetch_staff_schedule = get_staff_schedule
+
+
 # ============================================================
 # НОРМАЛИЗАЦИЯ, ХЭШ И СРАВНЕНИЕ РАСПИСАНИЙ
 # ============================================================
 
-LESSON_FIELDS = ("pair", "start", "end", "subgroup", "subject", "room", "teacher")
+LESSON_FIELDS = (
+    "pair", "start", "end", "subgroup", "subject", "room", "teacher", "groups"
+)
 FIELD_LABELS = {
     "subject": "Предмет",
     "room": "Аудитория",
     "teacher": "Преподаватель",
+    "groups": "Группы",
     "time": "Время",
 }
 
@@ -1112,6 +1302,9 @@ def normalize_schedule(schedule) -> list:
             "room": normalize_value(lesson.room),
             "teacher": normalize_value(lesson.teacher),
         }
+        groups = normalize_value(getattr(lesson, "groups", ""))
+        if groups or getattr(schedule, "schedule_type", "group") == "staff":
+            item["groups"] = groups
         items.append(item)
 
     items.sort(
@@ -1151,6 +1344,7 @@ def schedule_from_storage(stored, day: date) -> Schedule:
         subject = clean_text(item.get("subject", "")) or "Предмет не указан"
         teacher = clean_text(item.get("teacher", "")) or "—"
         room = clean_text(item.get("room", "")) or "—"
+        groups = clean_text(item.get("groups", ""))
         lessons.append(
             Lesson(
                 pair=pair,
@@ -1161,6 +1355,7 @@ def schedule_from_storage(stored, day: date) -> Schedule:
                 start=start,
                 end=end,
                 subgroup=subgroup,
+                groups=groups,
             )
         )
     return Schedule(date=day, group=GROUP_NAME, lessons=lessons)
@@ -1187,6 +1382,10 @@ def schedule_signature(schedule: Schedule) -> str:
                 _field_key(item["teacher"]),
             ]
         )
+        # Пустое поле staff-групп не меняет hash основной группы;
+        # непустые группы учитываются на staff-страницах.
+        if item.get("groups"):
+            parts.append(_field_key(item["groups"]))
 
     data = "\n".join(parts).encode("utf-8")
     return hashlib.sha256(data).hexdigest()
@@ -1249,6 +1448,7 @@ def compare_schedules(old_schedule, new_schedule) -> list:
             ("subject", FIELD_LABELS["subject"]),
             ("room", FIELD_LABELS["room"]),
             ("teacher", FIELD_LABELS["teacher"]),
+            ("groups", FIELD_LABELS["groups"]),
         ):
             old_val = normalize_value(old_item.get(key_name))
             new_val = normalize_value(new_item.get(key_name))
@@ -1306,8 +1506,15 @@ def _schedule_change_sort_key(change):
 # ============================================================
 
 def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
+    """Открывает короткое SQLite-соединение с безопасными настройками.
+
+    Включён WAL и busy timeout: middleware и фоновые задачи могут обратиться
+    к БД параллельно, не теряя атомарные решения rate limiter/blacklist.
+    """
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -1339,17 +1546,8 @@ def init_db() -> None:
                     " NOT NULL DEFAULT ''"
                 )
 
-            # 2.1.4: последняя версия changelog, успешно доставленная.
-            if "last_notified_version" not in existing:
-                conn.execute(
-                    "ALTER TABLE subscribers ADD COLUMN"
-                    " last_notified_version TEXT NOT NULL DEFAULT ''"
-                )
-
-            # Безопасная миграция created_at: если дату создания восстановить
-            # нельзя, считаем пользователя существовавшим до любых релизов —
-            # тогда старые пользователи получат changelog 2.1.4,
-            # а новые (созданные после релиза) его не получат.
+            # Старые базы могут содержать legacy-поле created_at; оно
+            # сохраняется как дата регистрации подписчика.
             conn.execute(
                 "UPDATE subscribers SET created_at = '1970-01-01 00:00:00'"
                 " WHERE created_at IS NULL OR created_at = ''"
@@ -1366,8 +1564,8 @@ def init_db() -> None:
                 """
             )
 
-            # 2.1.4: в состоянии храним не только hash, но и нормализованные
-            # данные — без них невозможно показать «было -> стало».
+            # В состоянии храним hash и нормализованные данные — без них
+            # невозможно показать «было -> стало».
             state_columns = {
                 row["name"]
                 for row in conn.execute("PRAGMA table_info(schedule_state)")
@@ -1378,7 +1576,7 @@ def init_db() -> None:
                     " NOT NULL DEFAULT ''"
                 )
 
-            # 2.1.4: фактическая доставка расписания каждому подписчику
+            # Фактическая доставка расписания каждому подписчику
             # (комбинация «подписчик + дата»), чтобы не отправлять
             # повторно то же самое и не терять изменения при сбоях.
             conn.execute(
@@ -1389,6 +1587,93 @@ def init_db() -> None:
                     hash    TEXT NOT NULL,
                     sent_at TEXT NOT NULL,
                     PRIMARY KEY (user_id, date)
+                )
+                """
+            )
+
+            # Источник истины накопления — одна запись на фактически
+            # завершённую пару. Подгруппы не входят в уникальный ключ.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subjects (
+                    normalized_subject TEXT PRIMARY KEY,
+                    original_subject   TEXT NOT NULL,
+                    created_at         TEXT NOT NULL,
+                    updated_at         TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lesson_history (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_name         TEXT NOT NULL,
+                    date               TEXT NOT NULL,
+                    pair_number        TEXT NOT NULL,
+                    start_time         TEXT NOT NULL,
+                    end_time           TEXT NOT NULL,
+                    subject            TEXT NOT NULL,
+                    normalized_subject TEXT NOT NULL,
+                    duration_minutes   INTEGER NOT NULL,
+                    subgroup_info      TEXT NOT NULL DEFAULT '',
+                    teacher            TEXT NOT NULL DEFAULT '',
+                    room               TEXT NOT NULL DEFAULT '',
+                    completed_at       TEXT NOT NULL,
+                    created_at         TEXT NOT NULL,
+                    UNIQUE (group_name, date, pair_number)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_lesson_history_subject
+                ON lesson_history (group_name, normalized_subject, date)
+                """
+            )
+            # День считается обработанным только после успешного получения
+            # HTML. При ошибке строка не создаётся и дата будет повторена.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lesson_backfill_days (
+                    group_name TEXT NOT NULL,
+                    date       TEXT NOT NULL,
+                    processed_at TEXT NOT NULL,
+                    PRIMARY KEY (group_name, date)
+                )
+                """
+            )
+
+            # Скрытая ежедневная автоматизация поздравлений.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS birthday_notifications (
+                    date       TEXT NOT NULL,
+                    group_name TEXT NOT NULL,
+                    sent_at    TEXT NOT NULL,
+                    people     TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (date, group_name)
+                )
+                """
+            )
+
+            # Rate limiter и внутренний blacklist переживают перезапуск.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS blacklist (
+                    user_id  INTEGER PRIMARY KEY,
+                    added_at TEXT NOT NULL,
+                    reason   TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rate_limit_state (
+                    user_id          INTEGER PRIMARY KEY,
+                    events_json      TEXT NOT NULL DEFAULT '[]',
+                    warning_count    INTEGER NOT NULL DEFAULT 0,
+                    last_warning_at  REAL NOT NULL DEFAULT 0,
+                    updated_at       TEXT NOT NULL
                 )
                 """
             )
@@ -1463,50 +1748,6 @@ def subscriber_info(user_id: int):
     except Exception:
         logger.exception("Ошибка SQLite (subscriber info)")
         return None
-
-
-def load_subscriber_rows() -> list:
-    """Все подписчики с created_at и last_notified_version."""
-    try:
-        with db_connect() as conn:
-            rows = conn.execute(
-                "SELECT user_id, created_at, last_notified_version"
-                " FROM subscribers ORDER BY user_id"
-            ).fetchall()
-            return [dict(row) for row in rows]
-    except Exception:
-        logger.exception("Ошибка SQLite (load subscriber rows)")
-        return []
-
-
-def mark_changelog_notified(user_id: int, version: str) -> bool:
-    """Отмечает версию changelog как успешно доставленную пользователю.
-
-    Сохраняет максимальную доставленную версию — это не мешает
-    будущим версиям (2.1.5, 2.1.6…), потому что eligibility
-    проверяется отдельно для каждой версии.
-    """
-    try:
-        with db_connect() as conn:
-            row = conn.execute(
-                "SELECT last_notified_version FROM subscribers"
-                " WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()
-            if row is None:
-                return False
-            current = row["last_notified_version"] or ""
-            if version_key(current) >= version_key(version):
-                return True
-            conn.execute(
-                "UPDATE subscribers SET last_notified_version = ?"
-                " WHERE user_id = ?",
-                (version, user_id),
-            )
-            return True
-    except Exception:
-        logger.exception("Ошибка SQLite (mark changelog notified)")
-        return False
 
 
 def load_state() -> dict:
@@ -1597,6 +1838,377 @@ def record_schedule_notification(
     except Exception:
         logger.exception("Ошибка SQLite (record notification)")
         return False
+
+
+# ============================================================
+# ИСТОРИЯ ЗАВЕРШЁННЫХ ЗАНЯТИЙ И НАКОПЛЕННЫЕ ЧАСЫ
+# ============================================================
+
+
+def normalize_subject_name(value: str) -> str:
+    """Стабильный ключ предмета без неуверенного fuzzy matching."""
+    text = clean_text(value).casefold().replace("ё", "е")
+    text = text.replace("–", "-").replace("—", "-")
+    text = re.sub(r"\s*([,.;:()/\\\-])\s*", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return text
+
+
+# Короткие алиасы остаются переиспользуемыми для внешних тестов/миграций.
+normalize_subject = normalize_subject_name
+
+
+def _local_aware(value: Optional[datetime] = None) -> datetime:
+    current = value or now_local()
+    if current.tzinfo is None:
+        return current.replace(tzinfo=TZ)
+    return current.astimezone(TZ)
+
+
+def parse_clock(value: str) -> Optional[datetime_time]:
+    value = clean_text(value)
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", value)
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return datetime_time(hour, minute)
+
+
+def duration_minutes(start_time: str, end_time: str) -> int:
+    """Реальная длительность пары в минутах, без округления."""
+    start = parse_clock(start_time)
+    end = parse_clock(end_time)
+    if start is None or end is None:
+        return 0
+    start_total = start.hour * 60 + start.minute
+    end_total = end.hour * 60 + end.minute
+    if end_total < start_total:
+        # Защита от редкого перехода через полночь.
+        end_total += 24 * 60
+    return max(0, end_total - start_total)
+
+
+calculate_duration_minutes = duration_minutes
+
+
+def lesson_duration_minutes(lesson: Lesson) -> int:
+    start, end = _split_time(lesson)
+    return duration_minutes(start, end)
+
+
+calculate_lesson_duration = lesson_duration_minutes
+
+
+def format_duration(minutes: int) -> str:
+    minutes = max(0, int(minutes or 0))
+    hours, rest = divmod(minutes, 60)
+    if hours and rest:
+        return f"{hours} ч {rest} мин"
+    if hours:
+        return f"{hours} ч"
+    return f"{rest} мин"
+
+
+def get_academic_year_start(day: Optional[date] = None) -> date:
+    """1 сентября текущего учебного года в календаре Екатеринбурга."""
+    value = day or get_today()
+    year = value.year if value.month >= 9 else value.year - 1
+    return date(year, 9, 1)
+
+
+academic_year_start = get_academic_year_start
+
+
+def is_lesson_completed(
+    day: date, end_time: str, current: Optional[datetime] = None
+) -> bool:
+    """Пара считается завершённой начиная с момента её окончания."""
+    end_clock = parse_clock(end_time)
+    if end_clock is None:
+        return False
+    end_at = datetime.combine(day, end_clock).replace(tzinfo=TZ)
+    return _local_aware(current) >= end_at
+
+
+lesson_is_completed = is_lesson_completed
+
+
+def _pair_representative(pair: Pair) -> Optional[Lesson]:
+    if not pair.lessons:
+        return None
+    # Если подгруппы имеют один предмет, это ровно одна история пары. При
+    # различиях сохраняем первый элемент, не умножая длительность на число
+    # подгрупп.
+    return next((item for item in pair.lessons if clean_text(item.subject)), pair.lessons[0])
+
+
+def _pair_subgroups(pair: Pair) -> str:
+    values = []
+    for item in pair.lessons:
+        value = clean_text(item.subgroup)
+        if value and value not in values:
+            values.append(value)
+    return ", ".join(values)
+
+
+def _upsert_subject(conn: sqlite3.Connection, original: str, normalized: str) -> None:
+    if not normalized:
+        return
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        """
+        INSERT INTO subjects (normalized_subject, original_subject, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(normalized_subject) DO UPDATE SET
+            original_subject = CASE
+                WHEN subjects.original_subject = '' THEN excluded.original_subject
+                ELSE subjects.original_subject
+            END,
+            updated_at = excluded.updated_at
+        """,
+        (normalized, clean_text(original), stamp, stamp),
+    )
+
+
+def record_completed_lesson(
+    group_name: str,
+    day: date,
+    pair_number: str,
+    start_time: str,
+    end_time: str,
+    subject: str,
+    *,
+    subgroup_info: str = "",
+    teacher: str = "",
+    room: str = "",
+    duration: Optional[int] = None,
+) -> bool:
+    """Идемпотично записывает одну завершённую пару.
+
+    ``INSERT OR IGNORE`` и UNIQUE(group, date, pair_number) делают повторный
+    backfill/перезапуск безопасным и не считают подгруппы дважды.
+    """
+    normalized = normalize_subject_name(subject)
+    minutes = duration if duration is not None else duration_minutes(start_time, end_time)
+    if not normalized or minutes <= 0:
+        return False
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with db_connect() as conn:
+            _upsert_subject(conn, subject, normalized)
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO lesson_history
+                (group_name, date, pair_number, start_time, end_time, subject,
+                 normalized_subject, duration_minutes, subgroup_info, teacher,
+                 room, completed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_text(group_name) or GROUP_NAME,
+                    day.isoformat(),
+                    clean_text(pair_number).upper() or f"{start_time}-{end_time}",
+                    clean_text(start_time),
+                    clean_text(end_time),
+                    clean_text(subject),
+                    normalized,
+                    int(minutes),
+                    clean_text(subgroup_info),
+                    clean_text(teacher),
+                    clean_text(room),
+                    stamp,
+                    stamp,
+                ),
+            )
+            return cursor.rowcount > 0
+    except Exception:
+        logger.exception("Ошибка записи истории занятия")
+        return False
+
+
+def record_completed_lessons(
+    schedule: Schedule, current: Optional[datetime] = None
+) -> int:
+    """Добавляет завершённые пары расписания основной группы."""
+    if schedule.schedule_type != "group":
+        return 0
+    if schedule.group != GROUP_NAME:
+        return 0
+    if schedule.date < get_academic_year_start():
+        return 0
+
+    inserted = 0
+    for pair in schedule.pairs:
+        if not is_lesson_completed(schedule.date, pair.end, current):
+            continue
+        minutes = duration_minutes(pair.start, pair.end)
+        representative = _pair_representative(pair)
+        if representative is None or minutes <= 0:
+            continue
+        if record_completed_lesson(
+            schedule.group,
+            schedule.date,
+            pair.number,
+            pair.start,
+            pair.end,
+            representative.subject,
+            subgroup_info=_pair_subgroups(pair),
+            teacher=representative.teacher,
+            room=representative.room,
+            duration=minutes,
+        ):
+            inserted += 1
+    return inserted
+
+
+# Названия, встречающиеся в интеграциях проекта.
+process_completed_lessons = record_completed_lessons
+
+
+def load_subject_totals(
+    group_name: str = GROUP_NAME,
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+) -> dict[str, int]:
+    """Сумма фактически завершённых минут по нормализованному предмету."""
+    clauses = ["group_name = ?"]
+    params: list = [group_name]
+    if start is not None:
+        clauses.append("date >= ?")
+        params.append(start.isoformat())
+    if end is not None:
+        clauses.append("date <= ?")
+        params.append(end.isoformat())
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT normalized_subject, SUM(duration_minutes) AS minutes "
+                "FROM lesson_history WHERE " + " AND ".join(clauses) +
+                " GROUP BY normalized_subject",
+                params,
+            ).fetchall()
+            return {
+                row["normalized_subject"]: int(row["minutes"] or 0)
+                for row in rows
+            }
+    except Exception:
+        logger.exception("Ошибка загрузки накопленных часов")
+        return {}
+
+
+def register_subjects_from_schedule(schedule: Schedule) -> int:
+    """Регистрирует новые предметы без фиксированного справочника."""
+    if schedule.schedule_type != "group" or schedule.group != GROUP_NAME:
+        return 0
+    values = {}
+    for lesson in schedule.lessons:
+        original = clean_text(lesson.subject)
+        normalized = normalize_subject_name(original)
+        if normalized:
+            values.setdefault(normalized, original)
+    try:
+        with db_connect() as conn:
+            for normalized, original in values.items():
+                _upsert_subject(conn, original, normalized)
+        return len(values)
+    except Exception:
+        logger.exception("Ошибка регистрации предметов")
+        return 0
+
+
+register_schedule_subjects = register_subjects_from_schedule
+
+
+def get_subject_total_minutes(
+    subject: str, group_name: str = GROUP_NAME
+) -> int:
+    return load_subject_totals(group_name).get(normalize_subject_name(subject), 0)
+
+
+def get_subject_progress(subject: str, group_name: str = GROUP_NAME) -> str:
+    normalized = normalize_subject_name(subject)
+    minutes = get_subject_total_minutes(subject, group_name)
+    if minutes > 0:
+        return f"Изучено: {format_duration(minutes)}"
+    try:
+        with db_connect() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM subjects WHERE normalized_subject = ?",
+                (normalized,),
+            ).fetchone()
+        # Даже если subject уже зарегистрирован текущим, но первая пара не
+        # завершена, пользователь видит честный статус без выдуманных часов.
+        return "Первое занятие по предмету" if exists or normalized else ""
+    except Exception:
+        logger.exception("Ошибка получения прогресса предмета")
+        return "Первое занятие по предмету" if normalized else ""
+
+
+def _backfill_day_processed(group_name: str, day: date) -> bool:
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM lesson_backfill_days WHERE group_name = ? AND date = ?",
+                (group_name, day.isoformat()),
+            ).fetchone()
+            return row is not None
+    except Exception:
+        logger.exception("Ошибка проверки backfill-даты")
+        return False
+
+
+def _mark_backfill_day_processed(group_name: str, day: date) -> None:
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO lesson_backfill_days "
+                "(group_name, date, processed_at) VALUES (?, ?, ?)",
+                (group_name, day.isoformat(), now_local().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+    except Exception:
+        logger.exception("Ошибка сохранения backfill-даты")
+
+
+async def backfill_lesson_history(
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+) -> int:
+    """Backfill с 1 сентября до вчерашнего дня.
+
+    День отмечается обработанным только после успешного HTTP+parse. Ошибка
+    источника оставляет дату для следующей попытки и не создаёт фиктивных
+    занятий.
+    """
+    today = get_today()
+    first = start or get_academic_year_start(today)
+    last = end or (today - timedelta(days=1))
+    if last < first:
+        return 0
+
+    inserted = 0
+    day = first
+    while day <= last:
+        if _backfill_day_processed(GROUP_NAME, day):
+            day += timedelta(days=1)
+            continue
+        # Даже воскресенье запрашивается как историческая дата: пустой
+        # ответ источника — это честный результат, а не придуманное занятие.
+        try:
+            schedule = await get_schedule(day)
+        except ScheduleUnavailable:
+            logger.warning("Backfill %s: источник недоступен, повторим позже", day)
+            day += timedelta(days=1)
+            continue
+        register_subjects_from_schedule(schedule)
+        inserted += record_completed_lessons(schedule)
+        _mark_backfill_day_processed(GROUP_NAME, day)
+        day += timedelta(days=1)
+    return inserted
+
+
+run_backfill = backfill_lesson_history
 
 
 init_db()
@@ -1690,6 +2302,7 @@ def _lesson_from_normalized_item(item: dict) -> Lesson:
         start=start,
         end=end,
         subgroup=clean_text(item.get("subgroup") or "") or None,
+        groups=clean_text(item.get("groups", "")),
     )
 
 
@@ -1756,516 +2369,353 @@ def _change_summary_lines(changes: list) -> list:
     return lines[:SUMMARY_MAX_LINES]
 
 
+# ============================================================
+# РЕНДЕР: строгая горизонтальная лента карточек
+# ============================================================
+
+
 def render_schedule_image(
     schedule: Schedule,
     changes=None,
     title: Optional[str] = None,
 ) -> Path:
+    """Рисует расписание в одном горизонтальном ряду.
+
+    В отличие от старой вертикальной разметки, каждая пара — отдельная
+    колонка. Длинный текст переносится только внутри своей карточки, а
+    ширина изображения растёт вместе с числом пар. Для основной группы
+    прогресс предмета берётся из ``lesson_history``; незавершённая первая
+    пара не увеличивает историю.
     """
-    Создаёт PNG-картинку расписания.
+    changes = list(changes or [])
+    pairs = schedule.pairs
+    font_kicker = get_font(22, bold=True)
+    font_title = get_font(46, bold=True)
+    font_staff = get_font(28, bold=True)
+    font_date = get_font(25)
+    font_count = get_font(20, bold=True)
+    font_pair = get_font(24, bold=True)
+    font_time = get_font(25, bold=True)
+    font_subject = get_font(27, bold=True)
+    font_info = get_font(20)
+    font_small = get_font(18)
+    font_status = get_font(17, bold=True)
+    font_summary = get_font(20, bold=True)
+    font_footer = get_font(18)
 
-    - `changes=None`  -> обычная картинка без выделения изменений.
-    - `changes=[...]` -> изменённые блоки выделяются цветом/рамкой,
-      добавляется заголовок «РАСПИСАНИЕ ИЗМЕНИЛОСЬ» и блок
-      «Что изменилось».
-    - `title`         -> произвольный заголовок в шапке (например
-      «РАСПИСАНИЕ ОПУБЛИКОВАНО»).
-    """
-    try:
-        lessons = list(schedule.lessons)
-        changes = list(changes or [])
-        pairs = schedule.pairs
+    margin = 44
+    gap = 20
+    card_width = 360 if pairs else 620
+    # Увеличиваем ширину, когда в расписании есть очень длинные названия.
+    longest = max(
+        [len(clean_text(lesson.subject)) for pair in pairs for lesson in pair.lessons]
+        + [0]
+    )
+    if longest > 34:
+        card_width = min(520, max(card_width, 360 + (longest - 34) * 3))
+    card_width = max(320, card_width)
+    width = max(920, margin * 2 + max(1, len(pairs)) * card_width + max(0, len(pairs) - 1) * gap)
 
-        # Шрифты
-        font_label = get_font(24, bold=True)
-        font_group = get_font(72, bold=True)
-        font_date = get_font(30)
-        font_count = get_font(24, bold=True)
-        font_pair = get_font(28, bold=True)
-        font_time = get_font(32, bold=True)
-        font_break = get_font(22)
-        font_subject = get_font(34, bold=True)
-        font_info = get_font(26)
-        font_subg = get_font(24, bold=True)
-        font_status = get_font(22, bold=True)
-        font_detail = get_font(23, bold=True)
-        font_empty_title = get_font(44, bold=True)
-        font_empty_sub = get_font(30)
-        font_footer = get_font(24)
-        font_summary = get_font(25, bold=True)
-        font_summary_body = get_font(24)
+    inner = 24
+    text_width = card_width - inner * 2
+    header_height = 210
+    cards_top = header_height + 34
+    card_padding = 22
+    card_header_height = 82
 
-        # Геометрия
-        W = 1080
-        MARGIN = 58
-        HEADER_H = 250
-        card_gap = 28
-        x1 = MARGIN
-        x2 = W - MARGIN
-        inner = 48
-        text_w = (x2 - x1) - 2 * inner
-        circle_s = 68
-        top_pad = 26
-        pad_bottom = 24
-        item_gap = 16
-        # Вертикальные уровни шапки карточки:
-        #   1) время пары; 2) «перемена XX мин»; затем блоки занятий
-        #   (3) предмет, 4) аудитория/преподаватель — рисуются ниже).
-        time_line_h = _text_h(font_time)
-        break_line_h = _text_h(font_break)
-        break_gap = 6      # между строкой времени и строкой перемены
-        header_gap = 24    # между шапкой пары и первым блоком занятия
-        time_x_offset = 34  # отступ текстовой колонки от кружка пары
-        line_h = int(font_subject.size * 1.35)
-        chip_h = 44
-        subg_h = 30
-        status_h = 30
-        detail_h = 30
+    def pair_header_extra(pair: Pair) -> int:
+        return 26 if clean_text(pair.break_duration) else 0
 
-        change_by_key = {
-            (clean_text(c.pair).upper(), clean_text(c.subgroup) or None): c
-            for c in changes
-        }
-        removed_by_pair = {}
-        for c in changes:
-            if c.kind == "removed":
-                removed_by_pair.setdefault(
-                    clean_text(c.pair).upper(), []
-                ).append(c)
+    change_by_key = {
+        (clean_text(item.pair).upper(), clean_text(item.subgroup) or None): item
+        for item in changes
+    }
+    removed_by_pair: dict[str, list] = {}
+    for item in changes:
+        if item.kind == "removed":
+            removed_by_pair.setdefault(clean_text(item.pair).upper(), []).append(item)
 
-        def subject_lines_for(subject):
-            return _wrap_lines(
-                subject or "Предмет не указан", font_subject, text_w
-            )
+    def entries_for(pair: Pair) -> list[dict]:
+        result = []
+        for lesson in pair.lessons:
+            key = (clean_text(lesson.pair).upper(), clean_text(lesson.subgroup) or None)
+            change = change_by_key.get(key)
+            result.append({
+                "lesson": lesson,
+                "kind": change.kind if change else "normal",
+                "details": change.details if change else [],
+            })
+        for change in removed_by_pair.get(clean_text(pair.number).upper(), []):
+            result.append({
+                "lesson": _lesson_from_normalized_item(change.old or {}),
+                "kind": "removed",
+                "details": [],
+            })
+        return result
 
-        def item_block_height(item) -> int:
-            h = 8 + 10  # верхний/нижний отступ
-            if _subgroup_label(item["lesson"].subgroup):
-                h += subg_h
-            if item["kind"] != "normal":
-                h += status_h
-            h += line_h * len(subject_lines_for(item["lesson"].subject))
-            h += 14 + chip_h
-            if item["kind"] == "changed":
-                h += 8 + detail_h * len(item["details"])
-            return h
-
-        def pair_break_text(pair) -> str:
-            """«перемена XX мин» или пустая строка, если данных нет."""
-            duration = clean_text(getattr(pair, "break_duration", ""))
-            return f"перемена {duration}" if duration else ""
-
-        def pair_header_metrics(pair) -> tuple:
-            """Метрики шапки пары: (высота шапки, высота текст. блока,
-            высота содержимого шапки).
-
-            Строка «перемена» — часть текстового блока времени, поэтому
-            она не сдвигает предмет по горизонтали и не наезжает на него
-            по вертикали. Если перемены нет, строка не резервируется.
-            """
-            block_h = time_line_h
-            if pair_break_text(pair):
-                block_h += break_gap + break_line_h
-            content_h = max(circle_s, block_h)
-            return top_pad + content_h + header_gap, block_h, content_h
-
-        def pair_card_height(pair) -> int:
-            items = _render_items_for_pair(
-                pair, change_by_key, removed_by_pair
-            )
-            header_h = pair_header_metrics(pair)[0]
-            blocks_h = sum(item_block_height(i) for i in items)
-            blocks_gap = max(0, len(items) - 1) * item_gap
-            return header_h + blocks_h + blocks_gap + pad_bottom
-
-        # Пустое расписание.
-        if not lessons:
-            empty_h = 250
-            pairs = []
-            cards_h = empty_h
-        else:
-            cards_h = (
-                sum(pair_card_height(p) for p in pairs)
-                + max(0, len(pairs) - 1) * card_gap
-            )
-
-        summary_lines = _change_summary_lines(changes) if changes else []
-        if changes and not summary_lines:
-            summary_lines = ["Что изменилось:"]
-        summary_h = 0
-        if summary_lines:
-            summary_h = 50 + len(summary_lines) * 34 + 20
-
-        # ---------- layout по вертикали ----------
-        # Подвал — полноценная часть layout: сначала считаем нижнюю границу
-        # контента, затем добавляем отступ, строку подвала и нижний padding.
-        footer_text = "ИНК · расписание"
-        footer_h = _text_h(font_footer)
-        footer_gap = 44          # между последним блоком контента и подвалом
-        footer_pad_bottom = 40   # нижний padding изображения
-        card_shadow = 8          # тень карточек рисуется на 8px ниже
-
-        content_top = HEADER_H + 36
-        if lessons:
-            content_bottom = content_top + cards_h + card_shadow
-        else:
-            content_bottom = content_top + cards_h
-
-        summary_y = None
-        if summary_lines:
-            summary_y = content_top + cards_h + (36 if lessons else 0)
-            content_bottom = summary_y + summary_h
-
-        footer_y = content_bottom + footer_gap
-        H = int(footer_y + footer_h + footer_pad_bottom)
-
-        image = Image.new("RGB", (W, H), COL_BG)
-        draw = ImageDraw.Draw(image)
-
-        # ---------- шапка ----------
-        draw.rectangle((0, 0, W, HEADER_H), fill=COL_WHITE)
-        draw.rectangle((0, 0, 14, HEADER_H), fill=COL_ACCENT)
-
-        header_label = title or (
-            "РАСПИСАНИЕ ИЗМЕНИЛОСЬ" if changes else "РАСПИСАНИЕ"
+    def item_height(item: dict) -> int:
+        lesson = item["lesson"]
+        subject_lines = _wrap_lines(
+            lesson.subject or "Предмет не указан", font_subject, text_width
         )
-        draw.text((MARGIN + 20, 40), header_label,
-                  font=font_label, fill=COL_ACCENT)
-        draw.text((MARGIN + 20, 84), GROUP_NAME,
-                  font=font_group, fill=COL_INK)
-        draw.text((MARGIN + 22, 186),
-                  format_date_header(schedule.date),
-                  font=font_date, fill=COL_MUTED)
+        height = 16 + len(subject_lines) * 32 + 8
+        height += 27  # room
+        if clean_text(lesson.teacher) not in ("", "—"):
+            height += 52
+        if clean_text(getattr(lesson, "groups", "")):
+            height += 52
+        if clean_text(lesson.subgroup):
+            height += 24
+        if schedule.schedule_type == "group":
+            height += 25
+        if item["kind"] != "normal":
+            height += 23
+        if item["kind"] == "changed":
+            height += min(3, len(item["details"])) * 22
+        return height
 
-        # бейдж с количеством занятий (пары, а не подгруппы)
-        lesson_count = count_lessons(lessons)
-        if lesson_count:
-            count_text = f"{lesson_count} "
-            count_text += "занятие" if lesson_count == 1 \
-                else "занятия" if lesson_count < 5 else "занятий"
-        else:
-            count_text = "занятий нет"
+    card_heights = []
+    for pair in pairs:
+        entries = entries_for(pair)
+        entries_height = sum(item_height(item) for item in entries)
+        entries_height += max(0, len(entries) - 1) * 12
+        card_heights.append(
+            card_padding + card_header_height + pair_header_extra(pair)
+            + entries_height + card_padding
+        )
+    card_height = max(card_heights or [230])
 
-        # ВАЖНО: у бейджа своя высота (`count_chip_h`); переиспользовать
-        # `chip_h` нельзя — он участвует в расчёте высоты карточек.
-        cw = draw.textlength(count_text, font=font_count)
-        chip_pad_x = 26
-        chip_w = cw + chip_pad_x * 2
-        count_chip_h = 54
-        chip_x = W - MARGIN - chip_w
-        chip_y = 48
+    summary_lines = _change_summary_lines(changes) if changes else []
+    summary_height = 0
+    if summary_lines:
+        summary_height = 42 + len(summary_lines) * 27 + 18
+    footer_gap = 50
+    footer_height = 28
+    content_bottom = cards_top + card_height
+    summary_top = content_bottom + 26 if summary_lines else None
+    if summary_lines:
+        content_bottom = summary_top + summary_height
+    footer_top = content_bottom + footer_gap
+    image_height = footer_top + footer_height + 28
+
+    # Очень светлый нейтральный фон вокруг белых карточек сохраняет
+    # минималистичный белый вид и не перегружает изображение.
+    image = Image.new("RGB", (width, image_height), COL_BG)
+    draw = ImageDraw.Draw(image)
+
+    # Шапка — белая и спокойная, без логотипа.
+    draw.rectangle((0, 0, width, header_height), fill=COL_WHITE)
+    draw.rectangle((0, header_height - 1, width, header_height), fill=COL_BORDER)
+    draw.text((margin, 28), title or ("РАСПИСАНИЕ ИЗМЕНИЛОСЬ" if changes else "РАСПИСАНИЕ"),
+              font=font_kicker, fill=COL_ACCENT)
+    if schedule.schedule_type == "staff":
+        draw.text((margin, 64), "Преподаватель", font=font_staff, fill=COL_INK)
+        name = schedule.staff_name or schedule.group
+        name_lines = _wrap_lines(name, font_title, width - margin * 2 - 270)
+        for index, line in enumerate(name_lines[:2]):
+            draw.text((margin, 96 + index * 48), line, font=font_title, fill=COL_INK)
+        date_y = 96 + min(2, len(name_lines)) * 48 + 6
+    else:
+        draw.text((margin, 64), schedule.group, font=font_title, fill=COL_INK)
+        date_y = 132
+    date_label = (
+        f"Дата: {format_date_full(schedule.date)}"
+        if schedule.schedule_type == "staff"
+        else format_date_full(schedule.date)
+    )
+    draw.text((margin, date_y), date_label, font=font_date, fill=COL_MUTED)
+
+    count = count_lessons(schedule)
+    count_text = f"{count} " + (
+        "занятие" if count == 1 else "занятия" if count < 5 else "занятий"
+    )
+    count_w = draw.textlength(count_text, font=font_count) + 34
+    draw.rounded_rectangle(
+        (width - margin - count_w, 42, width - margin, 84),
+        radius=21, fill=COL_ACCENT_LIGHT,
+    )
+    draw.text((width - margin - count_w + 17, 54), count_text,
+              font=font_count, fill=COL_ACCENT)
+
+    # Новый предмет регистрируется сразу при появлении, а история
+    # пополняется только после фактического окончания пары.
+    if schedule.schedule_type == "group":
+        register_subjects_from_schedule(schedule)
+    # История читается один раз на изображение.
+    totals = load_subject_totals() if schedule.schedule_type == "group" else {}
+
+    def progress_text(lesson: Lesson) -> str:
+        if schedule.schedule_type != "group":
+            return ""
+        normalized = normalize_subject_name(lesson.subject)
+        minutes = totals.get(normalized, 0)
+        if minutes:
+            return f"Изучено: {format_duration(minutes)}"
+        return "Первое занятие по предмету"
+
+    def draw_wrapped(x, y, text, font, fill, max_lines=3):
+        lines = _wrap_lines(text, font, text_width)
+        for index, line in enumerate(lines[:max_lines]):
+            draw.text((x, y + index * int(font.size * 1.2)), line, font=font, fill=fill)
+        return min(len(lines), max_lines) * int(font.size * 1.2)
+
+    if not pairs:
+        empty_left, empty_top = margin, cards_top
         draw.rounded_rectangle(
-            (chip_x, chip_y, chip_x + chip_w, chip_y + count_chip_h),
-            radius=count_chip_h / 2,
-            fill=COL_ACCENT_LIGHT,
+            (empty_left, empty_top, width - margin, empty_top + card_height),
+            radius=20, fill=COL_WHITE, outline=COL_BORDER, width=2,
         )
-        draw.text(
-            (chip_x + chip_pad_x,
-             chip_y + (count_chip_h - _text_h(font_count)) // 2),
-            count_text,
-            font=font_count,
-            fill=COL_ACCENT,
-        )
-
-        # ---------- пустое расписание ----------
-        if not lessons:
-            by = HEADER_H + 36
+        text = "Занятий нет"
+        tw = draw.textlength(text, font=font_staff)
+        draw.text(((width - tw) / 2, empty_top + 58), text, font=font_staff, fill=COL_INK)
+        sub = "Расписание на этот день не опубликовано."
+        sw = draw.textlength(sub, font=font_info)
+        draw.text(((width - sw) / 2, empty_top + 112), sub, font=font_info, fill=COL_MUTED)
+    else:
+        for index, pair in enumerate(pairs):
+            x = margin + index * (card_width + gap)
+            y = cards_top
+            entries = entries_for(pair)
+            has_change = any(item["kind"] != "normal" for item in entries)
             draw.rounded_rectangle(
-                (x1, by, x2, by + empty_h),
-                radius=30,
-                fill=COL_WHITE,
-                outline=COL_BORDER,
-                width=2,
+                (x + 3, y + 5, x + card_width + 3, y + card_height + 5),
+                radius=20, fill="#E8EDF4",
             )
-            title_txt = "Занятий нет"
-            tw = draw.textlength(title_txt, font=font_empty_title)
-            draw.text(((W - tw) / 2, by + 62), title_txt,
-                      font=font_empty_title, fill=COL_INK)
-            sub = "Расписание на этот день не опубликовано."
-            sw = draw.textlength(sub, font=font_empty_sub)
-            draw.text(((W - sw) / 2, by + 140), sub,
-                      font=font_empty_sub, fill=COL_MUTED)
-
-        # ---------- карточки пар ----------
-        else:
-            y = HEADER_H + 36
-            for pair in pairs:
-                left = x1 + inner
-                top = y
-                ch = pair_card_height(pair)
-                items = _render_items_for_pair(
-                    pair, change_by_key, removed_by_pair
-                )
-                pair_has_change = any(
-                    it["kind"] != "normal" for it in items
-                )
-
-                # тень
-                draw.rounded_rectangle(
-                    (x1 + 6, top + 8, x2 + 6, top + ch + 8),
-                    radius=30,
-                    fill="#E6EAF3",
-                )
-                # карточка
-                draw.rounded_rectangle(
-                    (x1, top, x2, top + ch),
-                    radius=30,
-                    fill=COL_WHITE,
-                    outline=COL_ACCENT if pair_has_change else COL_BORDER,
-                    width=3 if pair_has_change else 2,
-                )
-
-                # --- шапка пары: кружок + время + перемена ---
-                header_h, block_h, content_h = pair_header_metrics(pair)
-                header_top = top + top_pad
-
-                # --- кружок пары ---
-                cy_top = header_top + (content_h - circle_s) / 2
-                cx = left
-                draw.ellipse(
-                    (cx, cy_top, cx + circle_s, cy_top + circle_s),
-                    fill=COL_ACCENT,
-                )
-                roman = clean_text(pair.number).upper()
-                rw = draw.textlength(roman, font=font_pair)
-                rh = _text_h(font_pair)
-                draw.text(
-                    (cx + (circle_s - rw) / 2,
-                     cy_top + (circle_s - rh) / 2),
-                    roman,
-                    font=font_pair,
-                    fill=COL_WHITE,
-                )
-
-                # --- время (уровень 1) и перемена (уровень 2) ---
-                # Обе строки лежат в одной текстовой колонке, поэтому
-                # положение времени стабильно при любой длине текста.
-                text_x = left + circle_s + time_x_offset
-                text_max_w = (x2 - inner) - text_x
-                time_y = header_top + (content_h - block_h) / 2
-                draw.text((text_x, time_y),
-                          f"{pair.start} — {pair.end}",
-                          font=font_time, fill=COL_ACCENT)
-
-                break_text = pair_break_text(pair)
-                if break_text:
-                    draw.text(
-                        (text_x, time_y + time_line_h + break_gap),
-                        _truncate(break_text, font_break, text_max_w),
-                        font=font_break,
-                        fill=COL_MUTED,
-                    )
-
-                # --- блоки занятий/подгрупп (уровни 3 и 4) ---
-                by = top + header_h
-                for item in items:
-                    lesson = item["lesson"]
-                    kind = item["kind"]
-                    h = item_block_height(item)
-
-                    # Подсветка изменений.
-                    if kind == "changed":
-                        fill = COL_WARN_LIGHT
-                        outline = COL_WARN
-                    elif kind == "added":
-                        fill = COL_GREEN_LIGHT
-                        outline = COL_GREEN
-                    elif kind == "removed":
-                        fill = COL_RED_LIGHT
-                        outline = COL_RED
-                    else:
-                        fill = None
-                        outline = None
-
-                    if fill is not None:
-                        draw.rounded_rectangle(
-                            (left - 6, by, x2 - inner + 6, by + h),
-                            radius=14,
-                            fill=fill,
-                            outline=outline,
-                            width=2,
-                        )
-
-                    inner_y = by + 8
-
-                    # Подгруппа.
-                    subgroup_txt = _subgroup_label(lesson.subgroup)
-                    if subgroup_txt:
-                        draw.rounded_rectangle(
-                            (left, inner_y, left + draw.textlength(
-                                subgroup_txt, font=font_subg
-                            ) + 24, inner_y + subg_h),
-                            radius=subg_h / 2,
-                            fill=COL_ACCENT_LIGHT,
-                        )
-                        draw.text(
-                            (left + 12,
-                             inner_y + (subg_h - _text_h(font_subg)) / 2),
-                            subgroup_txt,
-                            font=font_subg,
-                            fill=COL_ACCENT,
-                        )
-                        inner_y += subg_h + 6
-
-                    # Статус изменения (без эмодзи: шрифт DejaVu их не рисует).
-                    if kind == "changed":
-                        status = "ИЗМЕНЕНО"
-                        color = COL_WARN
-                    elif kind == "added":
-                        status = "ДОБАВЛЕНО"
-                        color = COL_GREEN
-                    elif kind == "removed":
-                        status = "УДАЛЕНО"
-                        color = COL_RED
-                    else:
-                        status = ""
-
-                    if status:
-                        sw2 = draw.textlength(status, font=font_status)
-                        draw.text(
-                            (x2 - inner - sw2, inner_y),
-                            status,
-                            font=font_status,
-                            fill=color,
-                        )
-                        inner_y += status_h
-
-                    # Предмет.
-                    subject = clean_text(lesson.subject) or "Предмет не указан"
-                    subj_lines = subject_lines_for(subject)
-                    for idx, line in enumerate(subj_lines):
-                        draw.text(
-                            (left, inner_y + idx * line_h),
-                            line,
-                            font=font_subject,
-                            fill=COL_INK,
-                        )
-                    inner_y += line_h * len(subj_lines)
-
-                    # Аудитория + преподаватель.
-                    inner_y += 14
-                    meta_y = inner_y
-                    room_text = (
-                        f"ауд. {lesson.room}"
-                        if clean_text(lesson.room) not in ("", "—")
-                        else "ауд. —"
-                    )
-                    room_color = COL_RED if kind == "removed" else COL_GREEN
-                    room_fill = (
-                        COL_RED_LIGHT if kind == "removed" else COL_GREEN_LIGHT
-                    )
-                    room_w = draw.textlength(room_text, font=font_info)
-                    room_chip_pad = 18
-                    room_chip_w = room_w + room_chip_pad * 2
+            draw.rounded_rectangle(
+                (x, y, x + card_width, y + card_height), radius=20,
+                fill=COL_WHITE, outline=COL_ACCENT if has_change else COL_BORDER,
+                width=2 if not has_change else 3,
+            )
+            # Верх карточки: номер и время — горизонтально.
+            draw.ellipse((x + inner, y + 18, x + inner + 48, y + 66), fill=COL_ACCENT)
+            roman = clean_text(pair.number).upper()
+            rw = draw.textlength(roman, font=font_pair)
+            draw.text((x + inner + (48 - rw) / 2, y + 30), roman,
+                      font=font_pair, fill=COL_WHITE)
+            draw.text((x + inner + 62, y + 22), f"{pair.start} — {pair.end}",
+                      font=font_time, fill=COL_ACCENT)
+            if clean_text(pair.break_duration):
+                draw.text((x + inner + 62, y + 50),
+                          f"перемена {pair.break_duration}",
+                          font=font_small, fill=COL_MUTED)
+            by = y + card_padding + card_header_height + pair_header_extra(pair)
+            for entry_index, item in enumerate(entries):
+                lesson = item["lesson"]
+                kind = item["kind"]
+                ih = item_height(item)
+                if kind != "normal":
+                    fill = {"added": COL_GREEN_LIGHT, "changed": COL_WARN_LIGHT,
+                            "removed": COL_RED_LIGHT}.get(kind, COL_WHITE)
+                    outline = {"added": COL_GREEN, "changed": COL_WARN,
+                               "removed": COL_RED}.get(kind, COL_BORDER)
                     draw.rounded_rectangle(
-                        (left, meta_y,
-                         left + room_chip_w, meta_y + chip_h),
-                        radius=chip_h / 2,
-                        fill=room_fill,
+                        (x + inner - 8, by - 5, x + card_width - inner + 8, by + ih),
+                        radius=10, fill=fill, outline=outline, width=1,
                     )
-                    draw.text(
-                        (left + room_chip_pad,
-                         meta_y + (chip_h - _text_h(font_info)) / 2),
-                        room_text,
-                        font=font_info,
-                        fill=room_color,
-                    )
+                iy = by + 8
+                status = {"added": "ДОБАВЛЕНО", "changed": "ИЗМЕНЕНО",
+                          "removed": "УДАЛЕНО"}.get(kind)
+                if status:
+                    draw.text((x + inner, iy), status, font=font_status,
+                              fill={"ДОБАВЛЕНО": COL_GREEN, "ИЗМЕНЕНО": COL_WARN,
+                                    "УДАЛЕНО": COL_RED}[status])
+                    iy += 23
+                if clean_text(lesson.subgroup):
+                    draw.text((x + inner, iy), f"{lesson.subgroup} п/гр.",
+                              font=font_small, fill=COL_ACCENT)
+                    iy += 24
+                used = draw_wrapped(x + inner, iy, lesson.subject or "Предмет не указан",
+                                    font_subject, COL_INK)
+                iy += used + 3
+                room = clean_text(lesson.room) or "—"
+                draw.text((x + inner, iy), f"ауд. {room}", font=font_info, fill=COL_MUTED)
+                iy += 26
+                teacher = clean_text(lesson.teacher)
+                if teacher and teacher != "—":
+                    draw_wrapped(x + inner, iy, f"Преподаватель: {teacher}",
+                                 font_info, COL_MUTED, max_lines=2)
+                    iy += 52
+                groups = clean_text(getattr(lesson, "groups", ""))
+                if groups:
+                    draw_wrapped(x + inner, iy, f"Группы: {groups}", font_info, COL_INK, max_lines=2)
+                    iy += 52
+                if schedule.schedule_type == "group":
+                    draw.text((x + inner, iy), progress_text(lesson),
+                              font=font_small, fill=COL_GREEN if totals.get(normalize_subject_name(lesson.subject), 0) else COL_MUTED)
+                    iy += 25
+                if kind == "changed":
+                    for detail in item["details"][:3]:
+                        before = clean_text(detail.get("old", "")) or "—"
+                        after = clean_text(detail.get("new", "")) or "—"
+                        draw.text((x + inner, iy), _truncate(
+                            f"{detail.get('label', detail.get('field', ''))}: {before} → {after}",
+                            font_small, text_width), font=font_small, fill=COL_WARN)
+                        iy += 22
+                by += ih + 12
 
-                    teacher = (
-                        clean_text(lesson.teacher)
-                        if clean_text(lesson.teacher) not in ("", "—")
-                        else "Преподаватель не указан"
-                    )
-                    teacher_x = left + room_chip_w + 24
-                    teacher_max_w = (x2 - inner) - teacher_x
-                    teacher = _truncate(teacher, font_info, teacher_max_w)
-                    draw.text(
-                        (teacher_x, meta_y + (chip_h - _text_h(font_info)) / 2),
-                        teacher,
-                        font=font_info,
-                        fill=COL_MUTED,
-                    )
-                    inner_y += chip_h
+    if summary_lines:
+        sy = summary_top
+        draw.rounded_rectangle((margin, sy, width - margin, sy + summary_height),
+                               radius=18, fill=COL_WHITE, outline=COL_WARN, width=2)
+        draw.text((margin + 20, sy + 14), "Что изменилось:", font=font_summary, fill=COL_WARN)
+        sy += 43
+        for line in summary_lines:
+            draw.text((margin + 28, sy), _truncate(line, font_info, width - margin * 2 - 56),
+                      font=font_info, fill=COL_INK)
+            sy += 27
 
-                    # Было -> стало для изменённых полей.
-                    if kind == "changed":
-                        inner_y += 8
-                        for detail in item["details"]:
-                            label_name = detail.get("label") or detail.get(
-                                "field", ""
-                            )
-                            old_val = clean_text(detail.get("old", ""))
-                            new_val = clean_text(detail.get("new", ""))
-                            line = (
-                                f"{label_name}: "
-                                f"{old_val or '—'} -> {new_val or '—'}"
-                            )
-                            draw.text(
-                                (left, inner_y),
-                                _truncate(line, font_detail, text_w),
-                                font=font_detail,
-                                fill=COL_WARN,
-                            )
-                            inner_y += detail_h
+    footer = BOT_NAME
+    fw = draw.textlength(footer, font=font_footer)
+    draw.text((width - margin - fw, footer_top), footer, font=font_footer, fill=COL_FOOTER)
 
-                    # --- подвал блока ---
-                    by += h + item_gap
-
-                y += ch + card_gap
-
-        # ---------- блок «Что изменилось» ----------
-        if summary_lines:
-            sy = summary_y
-            draw.rounded_rectangle(
-                (x1, sy, x2, sy + summary_h),
-                radius=30,
-                fill=COL_WHITE,
-                outline=COL_WARN,
-                width=2,
-            )
-            tys = sy + 24
-            heading = "Что изменилось:"
-            draw.text((x1 + inner, tys), heading,
-                      font=font_summary, fill=COL_WARN)
-            tys += 44
-            for line in summary_lines:
-                draw.text(
-                    (x1 + inner + 8, tys),
-                    _truncate(line, font_summary_body, text_w - 16),
-                    font=font_summary_body,
-                    fill=COL_INK,
-                )
-                tys += 34
-
-        # ---------- подвал ----------
-        # footer_y и высота изображения посчитаны заранее: подвал не
-        # накладывается на контент и не обрезается снизу.
-        draw.text(
-            (x2 - draw.textlength(footer_text, font=font_footer),
-             footer_y),
-            footer_text,
-            font=font_footer,
-            fill=COL_FOOTER,
-        )
-
-        # ---------- сохранение ----------
-        suffix = "_changed" if changes else ""
-        filename = (
-            f"schedule_{schedule.date.isoformat()}_{len(lessons)}{suffix}.png"
-        )
-        path = IMAGE_DIR / filename
-        image.save(path, "PNG", optimize=True)
-        logger.info("Изображение сохранено: %s (%sx%s)", path, W, H)
-        return path
-
-    except Exception:
-        logger.exception("Ошибка генерации изображения")
-        raise
+    kind = "staff" if schedule.schedule_type == "staff" else "group"
+    staff_part = f"_{schedule.staff_id}" if schedule.staff_id else ""
+    suffix = "_changed" if changes else ""
+    path = IMAGE_DIR / f"schedule_{kind}{staff_part}_{schedule.date.isoformat()}{suffix}.png"
+    image.save(path, "PNG", optimize=True)
+    logger.info("Горизонтальное изображение сохранено: %s (%sx%s)", path, width, image_height)
+    return path
 
 
 # ============================================================
 # КЛАВИАТУРА
 # ============================================================
+
+def staff_keyboard(staff_id: int, target_day: date) -> InlineKeyboardMarkup:
+    """Навигация staff-расписания: callback type:id:date."""
+    if int(staff_id) not in STAFF_BY_ID:
+        raise ValueError(f"Неизвестный STAFF_ID: {staff_id}")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="◀️ Предыдущий день",
+                    callback_data=f"staff:{int(staff_id)}:{(target_day - timedelta(days=1)).isoformat()}",
+                ),
+                InlineKeyboardButton(
+                    text="📅 Сегодня",
+                    callback_data=f"staff:{int(staff_id)}:{get_today().isoformat()}",
+                ),
+                InlineKeyboardButton(
+                    text="Следующий день ▶️",
+                    callback_data=f"staff:{int(staff_id)}:{(target_day + timedelta(days=1)).isoformat()}",
+                ),
+            ]
+        ]
+    )
+
+
+def staff_choice_keyboard(matches: list[StaffMember], target_day: date) -> InlineKeyboardMarkup:
+    rows = []
+    for member in matches:
+        rows.append([
+            InlineKeyboardButton(
+                text=member.short_name,
+                callback_data=f"staff:{member.staff_id}:{target_day.isoformat()}",
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def main_keyboard(is_subscribed: bool) -> InlineKeyboardMarkup:
     """Кнопки «Сегодня» (/today) и «Завтра» (/schedule)."""
@@ -2300,28 +2750,34 @@ def main_keyboard(is_subscribed: bool) -> InlineKeyboardMarkup:
 # ============================================================
 
 def _photo_caption(schedule: Schedule) -> str:
-    lines = [
-        f"📚 <b>{schedule.group}</b>",
-        f"📅 {format_date_full(schedule.date)}",
-    ]
+    if schedule.schedule_type == "staff":
+        lines = [
+            "👨‍🏫 <b>Преподаватель</b>",
+            f"<b>{schedule.staff_name or schedule.group}</b>",
+            f"📅 {format_date_full(schedule.date)}",
+        ]
+    else:
+        lines = [
+            f"📚 <b>{schedule.group}</b>",
+            f"📅 {format_date_full(schedule.date)}",
+        ]
     if schedule.lessons:
         lines.append(f"🕐 Занятий: {count_lessons(schedule)}")
     return "\n".join(lines)
 
 
-async def _send_photo(destination, schedule: Schedule) -> bool:
+async def _send_photo(destination, schedule: Schedule, reply_markup=None) -> bool:
     """Генерирует PNG и отправляет его. Временный файл удаляется после отправки."""
     path = render_schedule_image(schedule)
     try:
         caption = _photo_caption(schedule)
+        kwargs = {"caption": caption}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
         if isinstance(destination, Message):
-            await destination.answer_photo(
-                FSInputFile(path), caption=caption
-            )
+            await destination.answer_photo(FSInputFile(path), **kwargs)
         else:
-            await destination.message.answer_photo(
-                FSInputFile(path), caption=caption
-            )
+            await destination.message.answer_photo(FSInputFile(path), **kwargs)
         return True
     except Exception:
         logger.exception("Ошибка отправки изображения")
@@ -2335,7 +2791,7 @@ async def _send_photo(destination, schedule: Schedule) -> bool:
 
 async def _send_text(destination, text: str) -> None:
     try:
-        if isinstance(destination, Message):
+        if _is_message_destination(destination):
             await destination.answer(text)
         else:
             await destination.message.answer(text)
@@ -2352,6 +2808,8 @@ async def _handle_today(destination):
     try:
         today = get_today()
         schedule = await get_schedule(today)
+        register_subjects_from_schedule(schedule)
+        record_completed_lessons(schedule)
 
         if not schedule.lessons:
             await _send_text(
@@ -2385,6 +2843,8 @@ async def _handle_schedule(destination):
     try:
         tomorrow = get_tomorrow()
         schedule = await get_schedule(tomorrow)
+        register_subjects_from_schedule(schedule)
+        record_completed_lessons(schedule)
 
         if not schedule.lessons:
             await _send_text(
@@ -2423,6 +2883,8 @@ async def _handle_date(destination, target: date):
             return
 
         schedule = await get_schedule(target)
+        register_subjects_from_schedule(schedule)
+        record_completed_lessons(schedule)
 
         if not schedule.lessons:
             await _send_text(
@@ -2444,6 +2906,116 @@ async def _handle_date(destination, target: date):
         )
     except Exception:
         logger.exception("Ошибка /date")
+
+
+def _is_message_destination(destination) -> bool:
+    return isinstance(destination, Message) or (
+        hasattr(destination, "answer") and not isinstance(destination, CallbackQuery)
+    )
+
+
+async def _send_staff_schedule(
+    destination,
+    member: StaffMember,
+    target_day: date,
+    *,
+    edit_existing: bool = False,
+) -> bool:
+    """Получает и отправляет staff-расписание с навигацией."""
+    try:
+        schedule = await get_staff_schedule(member.staff_id, target_day)
+        keyboard = staff_keyboard(member.staff_id, target_day)
+        if not schedule.lessons:
+            text = (
+                "👨‍🏫 <b>Расписание преподавателя</b>\n"
+                f"<b>{member.full_name}</b>\n\n"
+                f"📅 {format_date_full(target_day)}\n\n"
+                "Занятий нет или расписание ещё не опубликовано."
+            )
+            if _is_message_destination(destination):
+                await destination.answer(text, reply_markup=keyboard)
+            else:
+                await destination.message.answer(text, reply_markup=keyboard)
+            return True
+
+        path = render_schedule_image(schedule)
+        try:
+            caption = _photo_caption(schedule)
+            if edit_existing and isinstance(destination, CallbackQuery):
+                try:
+                    await destination.message.edit_media(
+                        media=InputMediaPhoto(
+                            media=FSInputFile(path),
+                            caption=caption,
+                        ),
+                        reply_markup=keyboard,
+                    )
+                except Exception:
+                    # Старые сообщения или тестовые mock-и могут не уметь
+                    # edit_media; сохраняем функциональность отправкой новой
+                    # картинки, а не теряем ответ навигации.
+                    await destination.message.answer_photo(
+                        FSInputFile(path), caption=caption, reply_markup=keyboard
+                    )
+            elif _is_message_destination(destination):
+                await destination.answer_photo(
+                    FSInputFile(path), caption=caption, reply_markup=keyboard
+                )
+            else:
+                await destination.message.answer_photo(
+                    FSInputFile(path), caption=caption, reply_markup=keyboard
+                )
+            return True
+        finally:
+            path.unlink(missing_ok=True)
+    except ScheduleUnavailable:
+        text = (
+            "😔 Не удалось получить расписание преподавателя. "
+            "Сайт недоступен, попробуй позже."
+        )
+        if _is_message_destination(destination):
+            await destination.answer(text)
+        else:
+            await destination.message.answer(text)
+        return False
+    except Exception:
+        logger.exception("Ошибка отправки расписания преподавателя")
+        return False
+
+
+async def _handle_staff_request(destination, request: ScheduleTextRequest) -> None:
+    if request.error:
+        await _send_text(
+            destination,
+            "Не удалось определить преподавателя или дату.\n\n"
+            "Примеры:\n"
+            "• расписание преподавателя Аглиуллиной\n"
+            "• расписание Аглиуллина на сегодня\n"
+            "• расписание преподавателя Аглиуллиной на 9 сентября\n"
+            "• расписание преподавателя Аглиуллиной на 09.09.2026",
+        )
+        return
+    matches = search_staff(request.staff_query)
+    if not matches:
+        await _send_text(
+            destination,
+            f"👨‍🏫 Преподаватель «{clean_text(request.staff_query)}» не найден.\n"
+            "Попробуй указать фамилию, имя, ФИО или инициалы.",
+        )
+        return
+    target_day = request.date or get_tomorrow()
+    if len(matches) > 1:
+        text = "👨‍🏫 <b>Выберите преподавателя:</b>"
+        if _is_message_destination(destination):
+            await destination.answer(
+                text, reply_markup=staff_choice_keyboard(matches, target_day)
+            )
+        else:
+            await destination.message.answer(
+                text, reply_markup=staff_choice_keyboard(matches, target_day)
+            )
+        return
+    await _send_staff_schedule(destination, matches[0], target_day)
 
 
 async def _status_text(chat_id: int) -> str:
@@ -2471,6 +3043,45 @@ async def _status_text(chat_id: int) -> str:
 dp = Dispatcher()
 
 
+async def _send_rate_warning(event) -> None:
+    try:
+        if isinstance(event, Message):
+            await event.answer(SPAM_WARNING_TEXT)
+        elif isinstance(event, CallbackQuery):
+            await event.answer(SPAM_WARNING_TEXT, show_alert=False)
+        elif hasattr(event, "answer"):
+            await event.answer(SPAM_WARNING_TEXT)
+    except Exception:
+        logger.exception("Не удалось отправить предупреждение rate limit")
+
+
+class AntiSpamMiddleware(BaseMiddleware):
+    """Самый ранний фильтр update для сообщений и callback-ов."""
+
+    async def __call__(self, handler, event, data):
+        actor = getattr(event, "from_user", None)
+        user_id = getattr(actor, "id", None)
+        if user_id is None:
+            return await handler(event, data)
+        # Blacklist проверяется до любых handler/parser/site операций.
+        if is_blacklisted(user_id):
+            return None
+        decision = check_rate_limit(user_id)
+        if decision.blacklisted:
+            return None
+        if not decision.allowed:
+            if decision.warning:
+                await _send_rate_warning(event)
+            return None
+        return await handler(event, data)
+
+
+_spam_middleware = AntiSpamMiddleware()
+dp.message.outer_middleware(_spam_middleware)
+dp.callback_query.outer_middleware(_spam_middleware)
+dp.my_chat_member.outer_middleware(_spam_middleware)
+
+
 def _is_subscribed(user_id: int) -> bool:
     return subscriber_info(user_id) is not None
 
@@ -2494,17 +3105,61 @@ async def _is_group_admin(message: Message) -> bool:
         return False
 
 
+def _configured_admin_ids() -> set[int]:
+    values = set()
+    for raw in os.getenv("ADMIN_IDS", "").split(","):
+        raw = raw.strip()
+        if raw:
+            try:
+                values.add(int(raw))
+            except ValueError:
+                continue
+    return values
+
+
+async def _is_administrator(message: Message) -> bool:
+    user_id = getattr(message.from_user, "id", None)
+    if user_id in _configured_admin_ids():
+        return True
+    if message.chat.type in ("group", "supergroup"):
+        return await _is_group_admin(message)
+    return False
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    """Административное снятие внутреннего blacklist."""
+    if not await _is_administrator(message):
+        await message.answer("⛔ Команда доступна только администраторам.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Использование: /unban USER_ID")
+        return
+    try:
+        target_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("USER_ID должен быть числом.")
+        return
+    removed = remove_from_blacklist(target_id)
+    await message.answer(
+        "✅ Пользователь разблокирован." if removed
+        else "Пользователь не найден во внутреннем blacklist."
+    )
+
+
 @dp.message(Command("start", "help"))
 async def cmd_start(message: Message):
     chat_id = message.chat.id
     text = (
         f"👋 Привет!\n\n"
-        f"Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
+        f"Я бот <b>{BOT_NAME}</b> для группы <b>{GROUP_NAME}</b>.\n\n"
         f"Доступные действия:\n"
         f"📅 <b>Сегодня</b> — /today\n"
         f"📅 <b>Завтра</b> — /schedule\n"
         f"✍️ <b>Текстом</b> — просто напиши «расписание»\n"
         f"    или «расписание на 4 сентября»\n"
+        f"👨‍🏫 <b>Преподаватель</b> — «расписание преподавателя Фамилия»\n"
         f"🔎 <b>Поиск по дате</b> — /date 04.09.2026 или /date сегодня\n"
         f"🔔 <b>Уведомления</b> — /subscribe\n"
         f"🔕 <b>Отключить уведомления</b> — /unsubscribe\n"
@@ -2645,6 +3300,10 @@ async def cmd_text_schedule(message: Message):
         # Сообщение не про расписание — молчим.
         return
 
+    if request.schedule_type == "staff":
+        await _handle_staff_request(message, request)
+        return
+
     if request.error:
         await message.answer(SCHEDULE_TEXT_HELP)
         return
@@ -2666,7 +3325,7 @@ async def on_chat_member_update(event: ChatMemberUpdated):
     if new_status in ("member", "administrator"):
         await event.bot.send_message(
             chat.id,
-            f"👋 Привет! Я бот расписания группы <b>{GROUP_NAME}</b>.\n\n"
+            f"👋 Привет! Я бот <b>{BOT_NAME}</b> для группы <b>{GROUP_NAME}</b>.\n\n"
             f"• /today — расписание на сегодня\n"
             f"• /schedule — расписание на завтра\n"
             f"• Напиши «расписание» или «расписание на дату» — без слэша\n"
@@ -2684,6 +3343,43 @@ async def on_chat_member_update(event: ChatMemberUpdated):
 # ============================================================
 # INLINE-КНОПКИ
 # ============================================================
+
+
+def _parse_staff_callback(data: str, prefix: str = "staff"):
+    parts = (data or "").split(":")
+    if len(parts) != 3 or parts[0] != prefix:
+        return None
+    try:
+        staff_id = int(parts[1])
+        target_day = date.fromisoformat(parts[2])
+    except (TypeError, ValueError):
+        return None
+    if staff_id not in STAFF_BY_ID:
+        return None
+    return STAFF_BY_ID[staff_id], target_day
+
+
+@dp.callback_query(F.data.startswith("staffpick:"))
+async def cb_staff_pick(callback: CallbackQuery):
+    parsed = _parse_staff_callback(callback.data or "", prefix="staffpick")
+    if parsed is None:
+        await callback.answer("Некорректный преподаватель", show_alert=True)
+        return
+    member, target_day = parsed
+    await callback.answer()
+    await _send_staff_schedule(callback, member, target_day, edit_existing=False)
+
+
+@dp.callback_query(F.data.startswith("staff:"))
+async def cb_staff_navigation(callback: CallbackQuery):
+    parsed = _parse_staff_callback(callback.data or "", prefix="staff")
+    if parsed is None:
+        await callback.answer("Некорректная дата", show_alert=True)
+        return
+    member, target_day = parsed
+    await callback.answer()
+    await _send_staff_schedule(callback, member, target_day, edit_existing=True)
+
 
 @dp.callback_query(F.data == "schedule")
 async def cb_schedule(callback: CallbackQuery):
@@ -2758,6 +3454,8 @@ async def cb_help(callback: CallbackQuery):
         f"• /schedule — расписание только на завтра\n"
         f"• Просто напиши «расписание» или «расписание на дату» "
         f"(без слэша)\n"
+        f"• Для преподавателя: «расписание преподавателя Фамилия» "
+        f"или «расписание Фамилия на сегодня»\n"
         f"• /date ДАТА — расписание на любую дату "
         f"(например <code>/date сегодня</code>)\n"
         f"• /subscribe — уведомления об изменениях\n"
@@ -2767,6 +3465,353 @@ async def cb_help(callback: CallbackQuery):
         f"<code>2026-09-04</code>, <code>4 сентября</code>, "
         f"<code>понедельник</code>."
     )
+
+
+# ============================================================
+# СКРЫТАЯ ЕЖЕДНЕВНАЯ ПРОВЕРКА ДНЕЙ РОЖДЕНИЯ
+# ============================================================
+
+@dataclass(frozen=True)
+class BirthdayPerson:
+    name: str
+    group: str = GROUP_NAME
+
+
+_BIRTHDAY_SECTION_TITLE = "поздравляем с днем рождения!"
+_BIRTHDAY_GROUP_RE = re.compile(
+    r"(?:\(\s*)?(?:гр\.?\s*)?эс\s*7\s*[-–—]\s*24\b\s*(?:\))?",
+    re.IGNORECASE,
+)
+
+
+def _is_target_birthday_group(text: str, group_name: str = GROUP_NAME) -> bool:
+    normalized = clean_text(text).casefold().replace("ё", "е")
+    target = clean_text(group_name).casefold().replace("ё", "е")
+    # Для основной группы допускаем небольшие пробелы/скобки, но не
+    # подменяем ЭС7-24 другими группами.
+    if target == "эс7-24":
+        return bool(_BIRTHDAY_GROUP_RE.search(normalized))
+    escaped = re.escape(target).replace(r"\-", r"\s*[-–—]\s*")
+    return bool(re.search(rf"(?:гр\.?\s*)?{escaped}(?!\d)", normalized))
+
+
+def parse_birthdays(html: str, group_name: str = GROUP_NAME) -> list[BirthdayPerson]:
+    """Извлекает только людей после заголовка «Поздравляем…».
+
+    Блок «Готовимся поздравлять…» намеренно не рассматривается: обход
+    останавливается на первом следующем h4.
+    """
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    card = soup.find(id="happyCard")
+    if card is None:
+        return []
+
+    heading = None
+    for item in card.find_all("h4"):
+        text = clean_text(item.get_text(" ", strip=True)).casefold().replace("ё", "е")
+        if text == _BIRTHDAY_SECTION_TITLE:
+            heading = item
+            break
+    if heading is None:
+        return []
+
+    result: list[BirthdayPerson] = []
+    seen = set()
+    for node in heading.next_elements:
+        if getattr(node, "name", None) == "h4":
+            break
+        if getattr(node, "name", None) not in ("span", "a", "li"):
+            continue
+        if node.find_parent(id="happyCard") is not card and node is not card:
+            continue
+        visible = clean_text(node.get_text(" ", strip=True))
+        raw_group_text = " ".join(
+            part for part in (visible, clean_text(node.get("title", ""))) if part
+        )
+        if not _is_target_birthday_group(raw_group_text, group_name):
+            continue
+        name = clean_text(node.get("title", ""))
+        if not name:
+            name = re.sub(
+                r"\(?\s*гр\.?\s*[А-ЯЁA-Z0-9]+\s*[-–—]\s*\d+\s*\)?",
+                "",
+                visible,
+                flags=re.IGNORECASE,
+            )
+            name = clean_text(name).strip("-—,;:")
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(BirthdayPerson(name=name, group=group_name))
+    return result
+
+
+extract_birthdays = parse_birthdays
+
+
+def birthday_message(people: list[BirthdayPerson]) -> str:
+    if not people:
+        return ""
+    if len(people) == 1:
+        return (
+            "🎉 Сегодня день рождения!\n"
+            f"Поздравляем {people[0].name}! 🎂\n"
+            "Желаем отличного настроения, успехов в учёбе и всего самого лучшего! 🥳"
+        )
+    lines = ["🎉 Сегодня день рождения!", "Сегодня поздравляем:"]
+    lines.extend(f"🎂 {person.name}" for person in people)
+    lines.append("С днём рождения! Желаем отличного настроения, успехов и всего самого лучшего! 🥳")
+    return "\n".join(lines)
+
+
+def birthday_notification_sent(day: date, group_name: str = GROUP_NAME) -> bool:
+    try:
+        with db_connect() as conn:
+            return conn.execute(
+                "SELECT 1 FROM birthday_notifications WHERE date = ? AND group_name = ?",
+                (day.isoformat(), group_name),
+            ).fetchone() is not None
+    except Exception:
+        logger.exception("Ошибка чтения marker поздравления")
+        return False
+
+
+def record_birthday_notification(
+    day: date, group_name: str, people: list[BirthdayPerson]
+) -> bool:
+    try:
+        with db_connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO birthday_notifications "
+                "(date, group_name, sent_at, people) VALUES (?, ?, ?, ?)",
+                (
+                    day.isoformat(), group_name,
+                    now_local().strftime("%Y-%m-%d %H:%M:%S"),
+                    json.dumps([person.name for person in people], ensure_ascii=False),
+                ),
+            )
+            return cursor.rowcount > 0
+    except Exception:
+        logger.exception("Ошибка сохранения marker поздравления")
+        return False
+
+
+def _birthday_destination() -> Optional[int]:
+    if BIRTHDAY_CHAT_ID is not None:
+        return BIRTHDAY_CHAT_ID
+    # Если отдельный ID не задан, используем уже зарегистрированный
+    # Telegram-групповой чат с названием основной группы.
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT user_id, title FROM subscribers WHERE chat_type IN ('group', 'supergroup')"
+            ).fetchall()
+        target = GROUP_NAME.casefold()
+        for row in rows:
+            title = clean_text(row["title"] or "").casefold()
+            if title == target or target in title:
+                return int(row["user_id"])
+    except Exception:
+        logger.exception("Ошибка определения чата для поздравления")
+    return None
+
+
+_BIRTHDAY_LOCK = asyncio.Lock()
+
+
+async def _check_birthdays_locked(bot: Bot, day: Optional[date] = None) -> Optional[bool]:
+    """Проверяет поздравления один раз в календарную дату Екатеринбурга.
+
+    ``True`` — marker записан после успешной отправки, ``False`` — страница
+    успешно проверена, но именинников нет/marker уже есть, ``None`` — ошибка
+    источника или Telegram, поэтому следующая проверка может повторить попытку.
+    """
+    target_day = day or get_today()
+    if birthday_notification_sent(target_day, GROUP_NAME):
+        return False
+    html = await fetch_birthday_html()
+    if html is None:
+        return None
+    people = parse_birthdays(html, GROUP_NAME)
+    if not people:
+        return False
+    destination = _birthday_destination()
+    if destination is None:
+        logger.warning("Не задан Telegram-чат для скрытого поздравления %s", GROUP_NAME)
+        return None
+    try:
+        await bot.send_message(destination, birthday_message(people))
+    except Exception:
+        # Marker намеренно НЕ создаётся: следующая проверка повторит попытку.
+        logger.exception("Ошибка отправки поздравления")
+        return None
+    return True if record_birthday_notification(target_day, GROUP_NAME, people) else None
+
+
+async def check_birthdays(bot: Bot, day: Optional[date] = None) -> Optional[bool]:
+    async with _BIRTHDAY_LOCK:
+        return await _check_birthdays_locked(bot, day)
+
+
+check_birthday = check_birthdays
+
+
+# ============================================================
+# ANTI-SPAM / BLACKLIST
+# ============================================================
+
+@dataclass(frozen=True)
+class RateLimitDecision:
+    allowed: bool
+    warning: bool = False
+    blacklisted: bool = False
+
+
+def is_blacklisted(user_id: int) -> bool:
+    try:
+        with db_connect() as conn:
+            return conn.execute(
+                "SELECT 1 FROM blacklist WHERE user_id = ?", (int(user_id),)
+            ).fetchone() is not None
+    except Exception:
+        # При проблеме чтения не блокируем всех пользователей, но пишем лог.
+        logger.exception("Ошибка проверки blacklist")
+        return False
+
+
+def add_to_blacklist(user_id: int, reason: str = "rate_limit") -> bool:
+    try:
+        with db_connect() as conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO blacklist (user_id, added_at, reason) VALUES (?, ?, ?)",
+                (int(user_id), now_local().strftime("%Y-%m-%d %H:%M:%S"), clean_text(reason)),
+            )
+            return cursor.rowcount > 0
+    except Exception:
+        logger.exception("Ошибка добавления в blacklist")
+        return False
+
+
+blacklist_user = add_to_blacklist
+check_blacklist = is_blacklisted
+
+
+def remove_from_blacklist(user_id: int) -> bool:
+    try:
+        with db_connect() as conn:
+            cursor = conn.execute("DELETE FROM blacklist WHERE user_id = ?", (int(user_id),))
+            return cursor.rowcount > 0
+    except Exception:
+        logger.exception("Ошибка снятия blacklist")
+        return False
+
+
+unblacklist_user = remove_from_blacklist
+
+
+def check_rate_limit(
+    user_id: int,
+    current: Optional[datetime] = None,
+) -> RateLimitDecision:
+    """Атомарный sliding-window limiter.
+
+    Решение и обновление счётчиков происходят в одной BEGIN IMMEDIATE
+    транзакции, поэтому параллельные update не видят устаревшее состояние.
+    Первый выход за лимит только предупреждает; следующий устойчивый шквал
+    добавляет пользователя в сохраняемый blacklist.
+    """
+    user_id = int(user_id)
+    timestamp = (
+        _local_aware(current).timestamp() if current is not None else time.time()
+    )
+    cutoff = timestamp - max(1, RATE_LIMIT_WINDOW_SECONDS)
+    try:
+        with db_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM blacklist WHERE user_id = ?", (user_id,)
+            ).fetchone() is not None:
+                conn.commit()
+                return RateLimitDecision(False, blacklisted=True)
+
+            row = conn.execute(
+                "SELECT events_json, warning_count, last_warning_at "
+                "FROM rate_limit_state WHERE user_id = ?", (user_id,)
+            ).fetchone()
+            events = []
+            warnings = 0
+            last_warning = 0.0
+            if row:
+                try:
+                    events = [float(value) for value in json.loads(row["events_json"] or "[]")]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    events = []
+                warnings = int(row["warning_count"] or 0)
+                last_warning = float(row["last_warning_at"] or 0)
+            events = [value for value in events if value > cutoff]
+            had_recent_events = bool(events)
+            events.append(timestamp)
+
+            if len(events) <= max(1, RATE_LIMIT_MAX_REQUESTS):
+                # После спокойного окна старое предупреждение не превращает
+                # новый обычный всплеск в мгновенный бан.
+                if not had_recent_events:
+                    warnings = 0
+                conn.execute(
+                    "INSERT OR REPLACE INTO rate_limit_state "
+                    "(user_id, events_json, warning_count, last_warning_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (user_id, json.dumps(events), warnings, last_warning,
+                     now_local().strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                conn.commit()
+                return RateLimitDecision(True)
+
+            warnings += 1
+            if warnings >= max(1, RATE_LIMIT_BLACKLIST_AFTER):
+                conn.execute(
+                    "INSERT OR IGNORE INTO blacklist (user_id, added_at, reason) VALUES (?, ?, ?)",
+                    (user_id, now_local().strftime("%Y-%m-%d %H:%M:%S"), "rate_limit"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO rate_limit_state "
+                    "(user_id, events_json, warning_count, last_warning_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (user_id, json.dumps(events), warnings, timestamp,
+                     now_local().strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                conn.commit()
+                return RateLimitDecision(False, blacklisted=True)
+
+            should_warn = (
+                last_warning <= 0
+                or timestamp - last_warning >= RATE_LIMIT_WARNING_COOLDOWN
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO rate_limit_state "
+                "(user_id, events_json, warning_count, last_warning_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, json.dumps(events), warnings,
+                 timestamp if should_warn else last_warning,
+                 now_local().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            conn.commit()
+            return RateLimitDecision(False, warning=should_warn)
+    except sqlite3.OperationalError:
+        logger.exception("SQLite busy/error in rate limiter")
+        # При ошибке БД безопаснее не запускать тяжёлую операцию.
+        return RateLimitDecision(False, warning=True)
+    except Exception:
+        logger.exception("Ошибка rate limiter")
+        return RateLimitDecision(False, warning=True)
+
+
+rate_limit_check = check_rate_limit
 
 
 # ============================================================
@@ -2849,7 +3894,9 @@ def _notification_caption(
     """
     label = day_label_for(day)
     if label in ("Сегодня", "Завтра"):
-        day_str = f"{label}, {format_date_full(day)}"
+        # Сохраняем короткий относительный маркер и полный календарный день:
+        # уведомление однозначно читается и до, и после полуночи.
+        day_str = f"{label}, {format_date_header(day)} {day.year}"
     else:
         day_str = label  # полный заголовок, без дублирования
     if first_time:
@@ -2929,7 +3976,6 @@ async def _notify_changed(
                 )
                 record_schedule_notification(user_id, date_key, signature)
                 delivered += 1
-                await asyncio.sleep(0.08)
             except Exception as error:
                 text = str(error).lower()
                 if any(
@@ -2986,24 +4032,32 @@ async def _check_date(bot: Bot, day: date) -> None:
         logger.info("Проверка %s: воскресенье, пропускаем.", date_key)
         return
 
-    if not load_subscribers():
-        # Некому отправлять — не ходим на сайт и не фиксируем baseline,
-        # чтобы первый подписавшийся получил уведомление о расписании.
-        logger.info("Проверка %s: подписчиков нет, пропускаем.", date_key)
-        return
-
+    subscribers = load_subscribers()
     try:
         schedule = await get_schedule(day)
     except ScheduleUnavailable:
-        # Ошибка загрузки/парсинга — не считается изменением.
+        # Ошибка загрузки/парсинга — не считается изменением и также не
+        # завершает backfill/историю.
         logger.warning(
             "Проверка %s: источник недоступен — изменением не считаем.",
             date_key,
         )
         return
 
+    # Накопление не зависит от наличия подписчиков. Предметы регистрируются
+    # при первом появлении, завершённые пары — только после своего конца.
+    if schedule.schedule_type == "group":
+        register_subjects_from_schedule(schedule)
+        record_completed_lessons(schedule)
+
+    if not subscribers:
+        # Некому отправлять — baseline не фиксируем, чтобы первый подписавшийся
+        # получил уведомление о текущем опубликованном расписании.
+        logger.info("Проверка %s: подписчиков нет, уведомление пропускаем.", date_key)
+        return
+
     if not schedule.lessons:
-        # Отсутствие расписания — тоже не «новая версия».
+        # Отсутствие расписания — тоже не изменение.
         logger.info(
             "Проверка %s: расписание отсутствует — состояние не меняем.",
             date_key,
@@ -3080,130 +4134,35 @@ async def _check_date(bot: Bot, day: date) -> None:
 
 
 # ============================================================
-# CHANGELOG
+# МОНИТОРИНГ ИЗМЕНЕНИЙ
 # ============================================================
-
-_changelog_warned = set()
-
-
-async def _deliver_changelog(bot: Bot, user_id: int, version: str) -> bool:
-    """Отправляет changelog. True — только при реальной доставке."""
-    text = changelog_text(version)
-    try:
-        await bot.send_message(user_id, text)
-        return True
-    except Exception as error:
-        error_text = str(error).lower()
-        if any(
-            marker in error_text
-            for marker in (
-                "bot was blocked",
-                "bot was kicked",
-                "chat not found",
-                "user is deactivated",
-                "group chat was upgraded",
-            )
-        ):
-            unsubscribe_user(user_id)
-            logger.info(
-                "Чат %s недоступен — подписка снята.", user_id
-            )
-        else:
-            logger.warning(
-                "Не удалось отправить changelog %s в %s: %s",
-                version,
-                user_id,
-                error,
-            )
-        return False
-
-
-async def _process_changelog(bot: Bot) -> None:
-    """Рассылка changelog. Вызывается в каждом цикле мониторинга.
-
-    Правила (для каждой версии отдельно):
-    - changelog получают только пользователи, существовавшие ДО релиза
-      версии (created_at < released_at);
-    - новые пользователи (created_at >= released_at) версию не получают;
-    - после успешной отправки last_notified_version обновляется в БД,
-      поэтому перезапуск повторно ничего не шлёт;
-    - при ошибке отправки версия НЕ помечается доставленной —
-      попытка повторится в следующем цикле;
-    - если для версии не задан released_at — она не рассылается.
-    """
-    rows = load_subscriber_rows()
-    sent = 0
-
-    for row in rows:
-        user_id = int(row["user_id"])
-        last = row["last_notified_version"] or ""
-
-        for version in pending_versions(last):
-            released = get_released_at(version)
-            if released is None:
-                if version not in _changelog_warned:
-                    _changelog_warned.add(version)
-                    logger.warning(
-                        "Для версии %s не задан released_at (%s) — "
-                        "changelog не рассылается.",
-                        version,
-                        CHANGELOG.get(version, {}).get(
-                            "released_at_env", ""
-                        ),
-                    )
-                # Версия ещё не выпущена — не считаем пропуском.
-                continue
-
-            created = parse_db_datetime(row["created_at"])
-            if created is None:
-                created = parse_db_datetime("1970-01-01 00:00:00")
-
-            # НЕЛЬЗЯ просто «last != текущая версия -> отправить»:
-            # новые пользователи созданы после релиза и старый
-            # changelog не получают.
-            if created >= released:
-                logger.info(
-                    "Changelog %s: пользователь %s создан после релиза "
-                    "(%s >= %s) — пропускаем.",
-                    version,
-                    user_id,
-                    created,
-                    released,
-                )
-                continue
-
-            ok = await _deliver_changelog(bot, user_id, version)
-            if ok:
-                mark_changelog_notified(user_id, version)
-                sent += 1
-                await asyncio.sleep(0.08)
-            else:
-                # Не помечаем: в следующем цикле повторим. Старшие
-                # версии не обгоняем — сохраняем порядок.
-                break
-
-    if sent:
-        logger.info("Changelog отправлен: %s сообщения(й).", sent)
-
 
 async def schedule_monitor(bot: Bot) -> None:
     """Фоновая задача. Не блокирует polling, одна на процесс.
 
     Каждые 5 минут даты сегодня/завтра пересчитываются заново
     (переход через полночь обрабатывается автоматически), обе даты
-    проверяются независимо, затем рассылается changelog.
+    проверяются независимо.
     """
     logger.info(
-        "Мониторинг запущен. Интервал: %s сек (%s мин). Версия: %s.",
+        "Мониторинг запущен. Интервал: %s сек (%s мин).",
         CHECK_INTERVAL,
         CHECK_INTERVAL // 60,
-        BOT_VERSION,
     )
 
+    birthday_checked_dates: set[str] = set()
     while True:
+        # История запускается в существующем scheduler, а не во втором
+        # независимом фоне. Уже обработанные даты пропускаются по БД.
+        try:
+            await backfill_lesson_history()
+        except Exception:
+            logger.exception("Ошибка backfill истории занятий")
+
         # Каждый цикл даты вычисляются заново через Asia/Yekaterinburg.
+        today = get_today()
         for day, label in (
-            (get_today(), "сегодня"),
+            (today, "сегодня"),
             (get_tomorrow(), "завтра"),
         ):
             try:
@@ -3215,10 +4174,13 @@ async def schedule_monitor(bot: Bot) -> None:
                     day.isoformat(),
                 )
 
-        try:
-            await _process_changelog(bot)
-        except Exception:
-            logger.exception("Ошибка рассылки changelog")
+        if today.isoformat() not in birthday_checked_dates:
+            try:
+                birthday_result = await check_birthdays(bot, today)
+                if birthday_result is not None:
+                    birthday_checked_dates.add(today.isoformat())
+            except Exception:
+                logger.exception("Ошибка скрытой ежедневной проверки")
 
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -3254,7 +4216,7 @@ async def _setup_commands(bot: Bot) -> None:
 
 async def main() -> None:
     logger.info("=" * 60)
-    logger.info("Бот расписания группы %s (версия %s)", GROUP_NAME, BOT_VERSION)
+    logger.info("Бот расписания группы %s", GROUP_NAME)
     logger.info("Group ID: %s", GROUP_ID)
     logger.info("URL: %s", BASE_URL)
     logger.info("Check interval: %s сек (%s мин)", CHECK_INTERVAL, CHECK_INTERVAL // 60)
