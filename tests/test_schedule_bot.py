@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Проверки логики бота версии 2.1.4.
+"""Проверки логики бота версии 2.1.5.
 
 Запуск:  python -m unittest discover -s tests -v
 (из корня репозитория, с установленными зависимостями)
@@ -107,8 +107,8 @@ class DBTestCase(unittest.TestCase):
 
 class TestVersionSystem(unittest.TestCase):
     def test_bot_version(self):
-        self.assertEqual(BOT_VERSION, "2.1.4")
-        self.assertEqual(bot.BOT_VERSION, "2.1.4")
+        self.assertEqual(BOT_VERSION, "2.1.5")
+        self.assertEqual(bot.BOT_VERSION, "2.1.5")
 
     def test_changelog_2_1_4_exists(self):
         self.assertIn("2.1.4", CHANGELOG)
@@ -122,10 +122,10 @@ class TestVersionSystem(unittest.TestCase):
     def test_version_key_and_pending(self):
         self.assertEqual(version_key("2.1.4"), (2, 1, 4))
         self.assertLess(version_key("2.1.4"), version_key("2.1.5"))
-        self.assertEqual(pending_versions(""), ["2.1.4"])
-        self.assertEqual(pending_versions("2.1.4"), [])
+        self.assertEqual(pending_versions(""), ["2.1.4", "2.1.5"])
+        self.assertEqual(pending_versions("2.1.4"), ["2.1.5"])
         # Пользователь после 2.1.4 (до 2.1.5) получит 2.1.5
-        self.assertEqual(pending_versions("2.1.4"), [])
+        self.assertEqual(pending_versions("2.1.4"), ["2.1.5"])
 
     def test_released_at_comes_from_config(self):
         released = get_released_at("2.1.4")
