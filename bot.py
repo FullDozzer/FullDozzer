@@ -106,7 +106,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 # но защищают сайт и генератор от автоматического шквала запросов.
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "10"))
 RATE_LIMIT_MAX_REQUESTS = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", "8"))
-RATE_LIMIT_BLACKLIST_AFTER = int(os.getenv("RATE_LIMIT_BLACKLIST_AFTER", "2"))
 RATE_LIMIT_WARNING_COOLDOWN = int(
     os.getenv("RATE_LIMIT_WARNING_COOLDOWN", "30")
 )
@@ -1509,7 +1508,7 @@ def db_connect() -> sqlite3.Connection:
     """Открывает короткое SQLite-соединение с безопасными настройками.
 
     Включён WAL и busy timeout: middleware и фоновые задачи могут обратиться
-    к БД параллельно, не теряя атомарные решения rate limiter/blacklist.
+    к БД параллельно, не теряя атомарные решения rate limiter.
     """
     conn = sqlite3.connect(str(DB_PATH), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -1656,16 +1655,7 @@ def init_db() -> None:
                 """
             )
 
-            # Rate limiter и внутренний blacklist переживают перезапуск.
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS blacklist (
-                    user_id  INTEGER PRIMARY KEY,
-                    added_at TEXT NOT NULL,
-                    reason   TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
+            # Rate limiter — предупреждения переживают перезапуск.
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS rate_limit_state (
@@ -3402,12 +3392,7 @@ class AntiSpamMiddleware(BaseMiddleware):
         user_id = getattr(actor, "id", None)
         if user_id is None:
             return await handler(event, data)
-        # Blacklist проверяется до любых handler/parser/site операций.
-        if is_blacklisted(user_id):
-            return None
         decision = check_rate_limit(user_id)
-        if decision.blacklisted:
-            return None
         if not decision.allowed:
             if decision.warning:
                 await _send_rate_warning(event)
@@ -3442,49 +3427,6 @@ async def _is_group_admin(message: Message) -> bool:
     except Exception:
         logger.exception("Не удалось проверить права администратора")
         return False
-
-
-def _configured_admin_ids() -> set[int]:
-    values = set()
-    for raw in os.getenv("ADMIN_IDS", "").split(","):
-        raw = raw.strip()
-        if raw:
-            try:
-                values.add(int(raw))
-            except ValueError:
-                continue
-    return values
-
-
-async def _is_administrator(message: Message) -> bool:
-    user_id = getattr(message.from_user, "id", None)
-    if user_id in _configured_admin_ids():
-        return True
-    if message.chat.type in ("group", "supergroup"):
-        return await _is_group_admin(message)
-    return False
-
-
-@dp.message(Command("unban"))
-async def cmd_unban(message: Message):
-    """Административное снятие внутреннего blacklist."""
-    if not await _is_administrator(message):
-        await message.answer("⛔ Команда доступна только администраторам.")
-        return
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2:
-        await message.answer("Использование: /unban USER_ID")
-        return
-    try:
-        target_id = int(parts[1].strip())
-    except ValueError:
-        await message.answer("USER_ID должен быть числом.")
-        return
-    removed = remove_from_blacklist(target_id)
-    await message.answer(
-        "✅ Пользователь разблокирован." if removed
-        else "Пользователь не найден во внутреннем blacklist."
-    )
 
 
 @dp.message(Command("start", "help"))
@@ -4001,56 +3943,13 @@ check_birthday = check_birthdays
 
 
 # ============================================================
-# ANTI-SPAM / BLACKLIST
+# ANTI-SPAM / RATE LIMIT
 # ============================================================
 
 @dataclass(frozen=True)
 class RateLimitDecision:
     allowed: bool
     warning: bool = False
-    blacklisted: bool = False
-
-
-def is_blacklisted(user_id: int) -> bool:
-    try:
-        with db_connect() as conn:
-            return conn.execute(
-                "SELECT 1 FROM blacklist WHERE user_id = ?", (int(user_id),)
-            ).fetchone() is not None
-    except Exception:
-        # При проблеме чтения не блокируем всех пользователей, но пишем лог.
-        logger.exception("Ошибка проверки blacklist")
-        return False
-
-
-def add_to_blacklist(user_id: int, reason: str = "rate_limit") -> bool:
-    try:
-        with db_connect() as conn:
-            cursor = conn.execute(
-                "INSERT OR IGNORE INTO blacklist (user_id, added_at, reason) VALUES (?, ?, ?)",
-                (int(user_id), now_local().strftime("%Y-%m-%d %H:%M:%S"), clean_text(reason)),
-            )
-            return cursor.rowcount > 0
-    except Exception:
-        logger.exception("Ошибка добавления в blacklist")
-        return False
-
-
-blacklist_user = add_to_blacklist
-check_blacklist = is_blacklisted
-
-
-def remove_from_blacklist(user_id: int) -> bool:
-    try:
-        with db_connect() as conn:
-            cursor = conn.execute("DELETE FROM blacklist WHERE user_id = ?", (int(user_id),))
-            return cursor.rowcount > 0
-    except Exception:
-        logger.exception("Ошибка снятия blacklist")
-        return False
-
-
-unblacklist_user = remove_from_blacklist
 
 
 def check_rate_limit(
@@ -4061,8 +3960,7 @@ def check_rate_limit(
 
     Решение и обновление счётчиков происходят в одной BEGIN IMMEDIATE
     транзакции, поэтому параллельные update не видят устаревшее состояние.
-    Первый выход за лимит только предупреждает; следующий устойчивый шквал
-    добавляет пользователя в сохраняемый blacklist.
+    При превышении лимита — только предупреждение, без банов.
     """
     user_id = int(user_id)
     timestamp = (
@@ -4072,11 +3970,6 @@ def check_rate_limit(
     try:
         with db_connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            if conn.execute(
-                "SELECT 1 FROM blacklist WHERE user_id = ?", (user_id,)
-            ).fetchone() is not None:
-                conn.commit()
-                return RateLimitDecision(False, blacklisted=True)
 
             row = conn.execute(
                 "SELECT events_json, warning_count, last_warning_at "
@@ -4111,26 +4004,11 @@ def check_rate_limit(
                 conn.commit()
                 return RateLimitDecision(True)
 
-            warnings += 1
-            if warnings >= max(1, RATE_LIMIT_BLACKLIST_AFTER):
-                conn.execute(
-                    "INSERT OR IGNORE INTO blacklist (user_id, added_at, reason) VALUES (?, ?, ?)",
-                    (user_id, now_local().strftime("%Y-%m-%d %H:%M:%S"), "rate_limit"),
-                )
-                conn.execute(
-                    "INSERT OR REPLACE INTO rate_limit_state "
-                    "(user_id, events_json, warning_count, last_warning_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (user_id, json.dumps(events), warnings, timestamp,
-                     now_local().strftime("%Y-%m-%d %H:%M:%S")),
-                )
-                conn.commit()
-                return RateLimitDecision(False, blacklisted=True)
-
             should_warn = (
                 last_warning <= 0
                 or timestamp - last_warning >= RATE_LIMIT_WARNING_COOLDOWN
             )
+            warnings += 1
             conn.execute(
                 "INSERT OR REPLACE INTO rate_limit_state "
                 "(user_id, events_json, warning_count, last_warning_at, updated_at) "
@@ -4150,7 +4028,6 @@ def check_rate_limit(
         return RateLimitDecision(False, warning=True)
 
 
-rate_limit_check = check_rate_limit
 
 
 # ============================================================
