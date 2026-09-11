@@ -676,13 +676,19 @@ class TestMonitoring(DBTestCase):
 
     def test_tomorrow_checked_independently(self):
         bot.subscribe_user(1001)
-        tomorrow = bot.get_tomorrow()
+        # Фиксируем «сейчас»: тест не должен зависеть от перехода через
+        # полночь между получением tomorrow и проверкой даты монитором.
+        with mock.patch.object(
+            bot, "now_local",
+            return_value=datetime(2026, 9, 11, 15, 0, 0),
+        ):
+            tomorrow = bot.get_tomorrow()
 
-        async def fake_get_schedule(day):
-            return make_schedule(day, "Завтрашний предмет")
+            async def fake_get_schedule(day):
+                return make_schedule(day, "Завтрашний предмет")
 
-        with mock.patch.object(bot, "get_schedule", fake_get_schedule):
-            run(bot._check_date(self.bot, tomorrow))
+            with mock.patch.object(bot, "get_schedule", fake_get_schedule):
+                run(bot._check_date(self.bot, tomorrow))
         self.assertEqual(len(self.bot.sent), 1)
         self.assertIn("Завтра", self.bot.sent[0][2])
         self.assertIn(bot.format_date_full(tomorrow), self.bot.sent[0][2])
@@ -728,8 +734,6 @@ class TestMonitoring(DBTestCase):
         """Один цикл монитора: сегодня и завтра без дублей."""
         bot.subscribe_user(1001)
         fake_bot = FakeBot()
-        today = bot.get_today()
-        tomorrow = bot.get_tomorrow()
 
         class StopLoop(Exception):
             pass
@@ -744,20 +748,23 @@ class TestMonitoring(DBTestCase):
         async def fake_get_schedule(day):
             return make_schedule(day, "Предмет")
 
-        with mock.patch.object(bot, "get_schedule", fake_get_schedule), \
+        # Фиксируем «сейчас»: даты внутри монитора не должны отличаться
+        # от дат в проверках, даже если тест запущен у полуночи.
+        with mock.patch.object(
+            bot, "now_local", return_value=datetime(2026, 9, 11, 15, 0, 0)
+        ), mock.patch.object(bot, "get_schedule", fake_get_schedule), \
              mock.patch.object(bot, "render_schedule_image",
                                return_value=Path("/tmp/x.png")), \
              mock.patch("asyncio.sleep", fake_sleep):
+            today = bot.get_today()
+            tomorrow = bot.get_tomorrow()
             with self.assertRaises(StopLoop):
                 run(bot.schedule_monitor(fake_bot))
 
-        # Сегодня воскресенье (если так) -> пропуск; завтра -> уведомление.
-        if bot.is_day_off(today):
-            self.assertEqual(len(fake_bot.sent), 1)
-            self.assertIn("Завтра", fake_bot.sent[0][2])
-            self.assertIn(tomorrow.isoformat(), bot.load_state())
-        else:
+            # Сегодня (2026-09-11, пятница) и завтра -> оба уведомления.
+            self.assertFalse(bot.is_day_off(today))
             self.assertGreaterEqual(len(fake_bot.sent), 1)
+            self.assertIn("Завтра", fake_bot.sent[-1][2])
             self.assertIn(tomorrow.isoformat(), bot.load_state())
 
     def test_sunday_skipped(self):
