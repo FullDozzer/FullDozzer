@@ -2007,10 +2007,13 @@ class TestStudyForecast(StudyDBTestCase):
             forecast.pace_minutes_per_day, 266.0, places=6
         )
 
-        # Бейдж «Изучено: Xч/Yч».
+        # Бейдж «Изучено: X / Y акад. ч» (академический час = 40 мин):
+        # 2660 мин = 66,5 акад. ч; Y = (2660 + R) / 40.
         self.assertEqual(
             bot.study_badge_text(forecast),
-            f"Изучено: 44 ч / {(2660 + expected_remaining) // 60} ч",
+            f"Изучено: 66,5 / "
+            f"{bot._format_academic_units((2660 + expected_remaining) / 40)}"
+            " акад. ч",
         )
 
     def test_no_history_no_forecast(self):
@@ -2018,7 +2021,9 @@ class TestStudyForecast(StudyDBTestCase):
         self.assertEqual(forecast.studied_minutes, 0)
         self.assertIsNone(forecast.remaining_minutes)
         self.assertEqual(forecast.total_minutes, 0)
-        self.assertEqual(bot.study_badge_text(forecast), "Изучено: 0 мин")
+        self.assertEqual(bot.study_badge_text(forecast), "Изучено: 0 акад. ч")
+        # Без истории сноска не формируется.
+        self.assertEqual(bot.study_note_lines(forecast), [])
 
     def test_year_finished_nothing_remains(self):
         bot.record_completed_lesson(
@@ -2030,7 +2035,200 @@ class TestStudyForecast(StudyDBTestCase):
         self.assertEqual(forecast.remaining_minutes, 0)
         self.assertEqual(forecast.total_minutes, forecast.studied_minutes)
         # Учебный год закончился — бейдж без прогнозной части.
-        self.assertEqual(bot.study_badge_text(forecast), "Изучено: 1 ч")
+        self.assertEqual(bot.study_badge_text(forecast), "Изучено: 2 акад. ч")
+        # В сноске — только факт, без «/ Y».
+        self.assertEqual(
+            bot.study_note_lines(forecast),
+            [
+                "Время считается по академическому часу: 1 акад. ч = 40 мин.",
+                "По обыкновенному времени: 1 ч 20 мин",
+            ],
+        )
+
+
+class TestAcademicHours(StudyDBTestCase):
+    """Академический час (40 минут) в бейдже, сноске и подписях предметов."""
+
+    def test_synthetic_italic_slant(self):
+        """Курсивная сноска: верх штрихов сдвинут вправо (~12°)."""
+        font = bot.get_font(30)
+        img = Image.new("RGB", (600, 100), (255, 255, 255))
+        bot._draw_italic_text(
+            img, (100, 30), "HHHHH", font, (100, 116, 139)
+        )
+        px = img.load()
+        rows = {}
+        for y in range(100):
+            xs = [
+                x for x in range(600)
+                if px[x, y] == (100, 116, 139)
+            ]
+            if xs:
+                rows[y] = (min(xs), max(xs))
+        self.assertTrue(rows, "курсивный текст не нарисован")
+        ys = sorted(rows)
+        top_y, bottom_y = ys[0], ys[-1]
+        height = bottom_y - top_y
+        shift = rows[top_y][0] - rows[bottom_y][0]
+        # Наклон = shear * высота: 0.21 * ~21px ≈ 4-5px.
+        self.assertGreater(height, 10)
+        self.assertGreater(shift, 0.21 * height * 0.5)
+        self.assertLess(shift, 0.21 * height * 1.5)
+
+    def test_format_academic_hours(self):
+        cases = {
+            0: "0 акад. ч",
+            20: "0,5 акад. ч",
+            30: "0,75 акад. ч",
+            40: "1 акад. ч",
+            60: "1,5 акад. ч",
+            80: "2 акад. ч",
+            90: "2,25 акад. ч",
+            95: "2,38 акад. ч",
+            160: "4 акад. ч",
+            2660: "66,5 акад. ч",
+            69160: "1729 акад. ч",
+        }
+        for minutes, expected in cases.items():
+            self.assertEqual(
+                bot.format_academic_hours(minutes), expected,
+                f"неверный перевод {minutes} минут",
+            )
+
+    def test_academic_hour_constant(self):
+        self.assertEqual(bot.ACADEMIC_HOUR_MINUTES, 40)
+
+    def test_note_lines_with_regular_time(self):
+        minutes_by_day = {date(2026, 9, 1): 180, date(2026, 9, 2): 320}
+        for day, minutes in minutes_by_day.items():
+            bot.record_completed_lesson(
+                bot.GROUP_NAME, day, "I", "08:30", "09:50", "НГПО",
+                duration=minutes,
+            )
+        forecast = bot.get_study_forecast(today=date(2026, 9, 2))
+        self.assertEqual(forecast.studied_minutes, 500)
+
+        lines = bot.study_note_lines(forecast)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(
+            lines[0],
+            "Время считается по академическому часу: 1 акад. ч = 40 мин.",
+        )
+        # Обыкновенное время — в формате «X / Y» с прогнозом.
+        self.assertTrue(lines[1].startswith("По обыкновенному времени: 8 ч 20 мин / "))
+        self.assertEqual(
+            bot.format_academic_hours(forecast.studied_minutes), "12,5 акад. ч"
+        )
+
+    def test_subject_progress_in_academic_hours(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
+            "НГПО", duration=160,
+        )
+        self.assertEqual(
+            bot.get_subject_progress("НГПО"), "Изучено: 4 акад. ч"
+        )
+
+    def test_note_rendered_on_schedule_image(self):
+        """Серая курсивная сноска — под карточками, над подвалом."""
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
+            "НГПО", duration=320,
+        )
+        schedule = bot.Schedule(
+            date=date(2026, 9, 7), group=bot.GROUP_NAME,
+            lessons=[lesson("I", None, "НГПО", "ПК217", "Степанов С.В.")],
+        )
+        path = bot.render_schedule_image(schedule)
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            card_rows = [
+                y for y in range(im.height)
+                if any(px[x, y] == (255, 255, 255)
+                       for x in range(150, im.width - 150, 6))
+            ]
+            last_card = max(card_rows)
+            muted = [
+                y for y in range(last_card + 6, im.height)
+                if any(px[x, y] == (100, 116, 139)
+                       for x in range(60, im.width - 60, 2))
+            ]
+        self.assertTrue(muted, "сноска про академический час не найдена")
+        clusters = []
+        for y in muted:
+            if not clusters or y > clusters[-1][-1] + 4:
+                clusters.append([y])
+            else:
+                clusters[-1].append(y)
+        # Две строки: пояснение + обыкновенное время.
+        self.assertGreaterEqual(len(clusters), 2)
+
+    def test_note_expands_image_but_pairs_stay_list(self):
+        """Картинка с историей выше (сноска), карточки — по-прежнему список."""
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
+            "НГПО", duration=320,
+        )
+        lessons = [
+            lesson("I", None, "НГПО", "ПК217", "Степанов С.В."),
+            lesson("II", None, "Физ-ра", "бол зал 2", "Кинзябаев А.И.",
+                   "10:00", "11:20"),
+        ]
+        with_history = bot.render_schedule_image(bot.Schedule(
+            date=date(2026, 9, 7), group=bot.GROUP_NAME, lessons=lessons))
+        # Убираем историю — второй рендер без бейджа и сноски.
+        with bot.db_connect() as conn:
+            conn.execute("DELETE FROM lesson_history")
+        without_history = bot.render_schedule_image(bot.Schedule(
+            date=date(2026, 9, 8), group=bot.GROUP_NAME, lessons=lessons))
+        with Image.open(with_history) as a, \
+                Image.open(without_history) as b:
+            self.assertGreater(a.size[1], b.size[1])
+            # Обе карточки (пары) остались вертикальным списком.
+            for img in (a, b):
+                px = img.convert("RGB").load()
+                card_rows = [
+                    y for y in range(288, img.size[1])
+                    if any(px[x, y] == (255, 255, 255)
+                           for x in range(150, img.size[0] - 150, 6))
+                ]
+                clusters = []
+                for y in card_rows:
+                    if not clusters or y > clusters[-1][-1] + 12:
+                        clusters.append([y])
+                    else:
+                        clusters[-1].append(y)
+                # Две карточки пар — вертикальный список.
+                self.assertGreaterEqual(len(clusters), 2)
+
+    def test_note_absent_on_staff_image(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
+            "НГПО", duration=320,
+        )
+        staff = bot.Schedule(
+            date=date(2026, 9, 8), group="Степанов Сергей Владимирович",
+            schedule_type="staff", staff_id=321,
+            staff_name="Степанов Сергей Владимирович",
+            lessons=[lesson("I", None, "НГПО", "ПК217", "—")],
+        )
+        path = bot.render_schedule_image(staff)
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            card_rows = [
+                y for y in range(im.height)
+                if any(px[x, y] == (255, 255, 255)
+                       for x in range(150, im.width - 150, 6))
+            ]
+            last_card = max(card_rows)
+            muted = [
+                y for y in range(last_card + 6, im.height)
+                if any(px[x, y] == (100, 116, 139)
+                       for x in range(60, im.width - 60, 2))
+            ]
+        self.assertEqual(muted, [])
 
 
 class TestHistoryMigration(unittest.TestCase):

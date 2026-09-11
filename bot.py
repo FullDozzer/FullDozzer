@@ -13,8 +13,10 @@ Telegram-бот расписания группы ЭС7-24 (Институт н�
 - Расписание преподавателей использует единый справочник staff_directory.py.
 - История учёбы: каждая подгруппа пары пишется отдельной строкой со своим
   предметом, но в общей сумме группы пара считается один раз.
-- Прогноз «Изучено: X ч / Y ч»: X — фактическое время с 1 сентября,
-  Y — экстраполяция темпа до 30 июня (R = X * Dr / De).
+- Прогноз «Изучено: X / Y акад. ч»: время считается академическими
+  часами (1 акад. ч = 40 мин), X — фактическое время с 1 сентября,
+  Y — экстраполяция темпа до 30 июня (R = X * Dr / De); обыкновенное
+  время приводится в серой курсивной сноске внизу картинки.
 - /status — PNG-карточка состояния бота в дизайне расписания
   (подписки, прогресс учёбы, текущее потребление ресурсов).
 
@@ -2435,27 +2437,75 @@ def get_study_forecast(
     )
 
 
-def format_study_hours(minutes: int) -> str:
-    """Компактные часы для бейджа: «49 ч», до часа — «40 мин»."""
+# Академический час колледжа: ровно 40 минут.
+ACADEMIC_HOUR_MINUTES = 40
+
+
+def _format_academic_units(units: float) -> str:
+    """Число академических часов без единицы: «2», «66,5», «0,75»."""
+    if abs(units - round(units)) < 1e-9:
+        return str(int(round(units)))
+    for digits in (1, 2):
+        text = f"{units:.{digits}f}"
+        if abs(units - float(text)) < 1e-9:
+            return text.replace(".", ",")
+    return f"{units:.2f}".replace(".", ",")
+
+
+def format_academic_hours(minutes: int) -> str:
+    """Время в академических часах: «2 акад. ч», «66,5 акад. ч».
+
+    Дробная часть — до двух знаков, без лишних нулей: 80 мин = «2 акад. ч»,
+    60 мин = «1,5 акад. ч», 30 мин = «0,75 акад. ч».
+    """
     minutes = max(0, int(minutes or 0))
-    hours = minutes // 60
-    if hours > 0:
-        return f"{hours} ч"
-    return f"{minutes} мин"
+    return _format_academic_units(minutes / ACADEMIC_HOUR_MINUTES) + " акад. ч"
 
 
 def study_badge_text(forecast: StudyForecast) -> str:
-    """Текст бейджа шапки: «Изучено: 49 ч / 1282 ч».
+    """Текст бейджа шапки: «Изучено: 66,5 / 1729 акад. ч».
 
+    Время считается академическими часами (1 акад. ч = 40 мин);
+    обыкновенное время приводится в сноске внизу картинки.
     До первых занятий бейдж не показывается вовсе; когда прогноз
     недоступен (или учебный год закончился) — только фактическое время.
     """
-    studied = format_study_hours(forecast.studied_minutes)
+    studied = _format_academic_units(
+        forecast.studied_minutes / ACADEMIC_HOUR_MINUTES
+    )
     if forecast.remaining_minutes:
-        return (
-            f"Изучено: {studied} / {format_study_hours(forecast.total_minutes)}"
+        total = _format_academic_units(
+            forecast.total_minutes / ACADEMIC_HOUR_MINUTES
         )
-    return f"Изучено: {studied}"
+        return f"Изучено: {studied} / {total} акад. ч"
+    return f"Изучено: {format_academic_hours(forecast.studied_minutes)}"
+
+
+def regular_study_time_text(forecast: StudyForecast) -> str:
+    """То же время по обыкновенным часам: «44 ч 20 мин / 1152 ч 40 мин»."""
+    studied = format_duration(forecast.studied_minutes)
+    if forecast.remaining_minutes:
+        return f"{studied} / {format_duration(forecast.total_minutes)}"
+    return studied
+
+
+STUDY_NOTE_EXPLANATION = (
+    "Время считается по академическому часу: 1 акад. ч = 40 мин."
+)
+
+
+def study_note_lines(forecast: StudyForecast) -> list:
+    """Строки сноски внизу картинки с изученным временем.
+
+    Пояснение про академический час + тот же расчёт по обыкновенному
+    времени. Пока занятий не было — сноска не нужна.
+    """
+    if forecast.studied_minutes <= 0:
+        return []
+    return [
+        STUDY_NOTE_EXPLANATION,
+        f"По обыкновенному времени: {regular_study_time_text(forecast)}",
+    ]
 
 
 def register_subjects_from_schedule(schedule: Schedule) -> int:
@@ -2495,7 +2545,7 @@ def get_subject_progress(subject: str, group_name: str = GROUP_NAME) -> str:
         return ""
     minutes = get_subject_total_minutes(subject, group_name)
     if minutes > 0:
-        return f"Изучено: {format_duration(minutes)}"
+        return f"Изучено: {format_academic_hours(minutes)}"
     try:
         with db_connect() as conn:
             exists = conn.execute(
@@ -2677,6 +2727,50 @@ def _text_h(font) -> int:
     return int(font.size * 1.35)
 
 
+# Наклон синтетического курсива (~12°) для DejaVu без italic-файла.
+_ITALIC_SHEAR = 0.21
+
+
+def _draw_italic_text(image: Image.Image, xy, text: str, font, fill) -> None:
+    """Рисует текст курсивом: слой с текстом наклоняется аффинным сдвигом.
+
+    DejaVu поставляется без отдельного italic-начертания, поэтому курсив
+    получается сдвигом верхних пикселей вправо — как «synthetic italic»
+    в графических редакторах.
+    """
+    text = clean_text(text)
+    if not text:
+        return
+    bbox = font.getbbox(text)
+    if not bbox:
+        return
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    if tw <= 0 or th <= 0:
+        return
+    x, y = int(xy[0]), int(xy[1])
+    pad = 6
+    layer = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text(
+        (pad - bbox[0], pad - bbox[1]), text, font=font, fill=fill
+    )
+    width = layer.width + int(_ITALIC_SHEAR * layer.height)
+    # x_input = x_output + shear * y - shear * height: низ неподвижен,
+    # верх уезжает вправо. NEAREST — без интерполяции: штрихи остаются
+    # такими же чёткими, как у прямого начертания.
+    layer = layer.transform(
+        (width, layer.height),
+        Image.AFFINE,
+        (1, _ITALIC_SHEAR, -_ITALIC_SHEAR * layer.height, 0, 1, 0),
+        resample=Image.NEAREST,
+    )
+    image.paste(layer, (x - pad, y - pad), layer)
+
+
+def _italic_text_width(text: str, font) -> float:
+    """Ширина курсивного текста (с учётом наклона) для центрирования."""
+    return font.getlength(text) + _ITALIC_SHEAR * _text_h(font)
+
+
 def _truncate(text: str, font, max_width: float) -> str:
     text = clean_text(text)
     if not text or font.getlength(text) <= max_width:
@@ -2795,8 +2889,10 @@ def render_schedule_image(
     - для `schedule_type == "staff"` в шапке выводится ФИО
       преподавателя, а в карточках — группы пар (`lesson.groups`).
     - для расписания основной группы в правом нижнем углу шапки
-      показывается бейдж «Изучено: X ч / Y ч» с фактическим временем
-      и прогнозом на учебный год из истории завершённых пар.
+      показывается бейдж «Изучено: X / Y акад. ч» с фактическим временем
+      и прогнозом на учебный год из истории завершённых пар, а внизу —
+      серая курсивная сноска про академический час с расчётом по
+      обыкновенному времени.
     """
     try:
         lessons = list(schedule.lessons)
@@ -2873,7 +2969,10 @@ def render_schedule_image(
                 return "", COL_MUTED
             minutes = subject_totals.get(normalized, 0)
             if minutes > 0:
-                return f"Изучено: {format_duration(minutes)}", COL_GREEN
+                return (
+                    f"Изучено: {format_academic_hours(minutes)}",
+                    COL_GREEN,
+                )
             return "Первое занятие по предмету", COL_MUTED
 
         change_by_key = {
@@ -3005,9 +3104,10 @@ def render_schedule_image(
         # поэтому не пересекается ни с ним, ни с датой. Y — динамический
         # прогноз на учебный год при текущем темпе (см. get_study_forecast).
         # Показывается только когда в истории уже накоплены минуты.
+        # Прогноз нужен и бейджу в шапке, и сноске внизу картинки.
+        forecast = get_study_forecast() if is_group else None
         total_pill = None
-        if is_group:
-            forecast = get_study_forecast()
+        if is_group and forecast is not None:
             if forecast.studied_minutes > 0:
                 total_text = study_badge_text(forecast)
                 total_pad_x = 26
@@ -3037,7 +3137,27 @@ def render_schedule_image(
             summary_y = content_top + cards_h + (36 if lessons else 0)
             content_bottom = summary_y + summary_h
 
-        footer_y = content_bottom + footer_gap
+        # Сноска про академический час — часть layout: сначала строки,
+        # потом отступ до подвала. Пары остаются вертикальным списком,
+        # картинка просто становится выше.
+        note_lines = (
+            study_note_lines(forecast) if forecast is not None else []
+        )
+        font_note = get_font(21)
+        note_gap = 34          # между контентом и сноской
+        note_line_gap = 8      # между строками сноски
+        note_line_h = _text_h(font_note)
+        note_h = (
+            len(note_lines) * note_line_h
+            + max(0, len(note_lines) - 1) * note_line_gap
+            if note_lines else 0
+        )
+        note_y = content_bottom + note_gap if note_lines else None
+
+        footer_y = (
+            note_y + note_h + 26 if note_lines
+            else content_bottom + footer_gap
+        )
         H = int(footer_y + footer_h + footer_pad_bottom)
 
         image = Image.new("RGB", (W, H), COL_BG)
@@ -3390,6 +3510,19 @@ def render_schedule_image(
                 )
                 tys += 34
 
+        # ---------- сноска про академический час ----------
+        # Маленький серый курсив по центру: пояснение + расчёт по
+        # обыкновенному времени. Показывается вместе с бейджем «Изучено».
+        if note_lines:
+            ny = note_y
+            for note_line in note_lines:
+                line_w = _italic_text_width(note_line, font_note)
+                _draw_italic_text(
+                    image, ((W - line_w) / 2, ny), note_line,
+                    font_note, COL_MUTED,
+                )
+                ny += note_line_h + note_line_gap
+
         # ---------- подвал ----------
         # footer_y и высота изображения посчитаны заранее: подвал не
         # накладывается на контент и не обрезается снизу.
@@ -3613,7 +3746,7 @@ def render_status_image(chat_id: int) -> Path:
         now = now_local()
 
         # ---------- карточка «Учёба» ----------
-        study_headline = f"Изучено: {format_duration(forecast.studied_minutes)}"
+        study_headline = study_badge_text(forecast)
         if forecast.studied_minutes <= 0:
             study_note = "Прогноз появится после первых завершённых занятий"
         elif not forecast.remaining_minutes:
@@ -3625,16 +3758,16 @@ def render_status_image(chat_id: int) -> Path:
         if forecast.remaining_minutes:
             study_rows.append(
                 ("Прогноз на учебный год",
-                 f"≈ {format_study_hours(forecast.total_minutes)}")
+                 f"≈ {format_academic_hours(forecast.total_minutes)}")
             )
             study_rows.append(
                 ("Осталось при текущем темпе",
-                 f"≈ {format_study_hours(forecast.remaining_minutes)}")
+                 f"≈ {format_academic_hours(forecast.remaining_minutes)}")
             )
             if forecast.pace_minutes_per_day:
                 study_rows.append(
                     ("Темп",
-                     f"≈ {format_duration(int(round(forecast.pace_minutes_per_day)))}"
+                     f"≈ {format_academic_hours(int(round(forecast.pace_minutes_per_day)))}"
                      " в учебный день")
                 )
         study_rows.append(
@@ -3714,11 +3847,28 @@ def render_status_image(chat_id: int) -> Path:
         content_bottom = content_top + sum(heights) \
             + max(0, len(cards) - 1) * card_gap + 8
 
+        # Сноска про академический час — та же, что на картинке
+        # расписания: единая точка формирования study_note_lines().
+        note_lines = study_note_lines(forecast)
+        font_note = get_font(21)
+        note_gap = 34
+        note_line_gap = 8
+        note_line_h = _text_h(font_note)
+        note_h = (
+            len(note_lines) * note_line_h
+            + max(0, len(note_lines) - 1) * note_line_gap
+            if note_lines else 0
+        )
+        note_y = content_bottom + note_gap if note_lines else None
+
         footer_text = "ИНК · расписание"
         footer_h = _text_h(font_footer)
         footer_gap = 44
         footer_pad_bottom = 40
-        footer_y = content_bottom + footer_gap
+        footer_y = (
+            note_y + note_h + 26 if note_lines
+            else content_bottom + footer_gap
+        )
         H = int(footer_y + footer_h + footer_pad_bottom)
 
         image = Image.new("RGB", (W, H), COL_BG)
@@ -3824,6 +3974,17 @@ def render_status_image(chat_id: int) -> Path:
                 inner_y += row_h + row_gap
 
             y += height + card_gap
+
+        # ---------- сноска про академический час ----------
+        if note_lines:
+            ny = note_y
+            for note_line in note_lines:
+                line_w = _italic_text_width(note_line, font_note)
+                _draw_italic_text(
+                    image, ((W - line_w) / 2, ny), note_line,
+                    font_note, COL_MUTED,
+                )
+                ny += note_line_h + note_line_gap
 
         # ---------- подвал ----------
         draw.text(
@@ -4206,11 +4367,13 @@ async def _status_text(chat_id: int) -> str:
     lines.append(f"Часовой пояс: <b>{TIMEZONE}</b> (UTC+5)")
     if forecast.studied_minutes > 0:
         lines.append(f"📖 {study_badge_text(forecast)}")
+        lines.append(f"По обыкновенному времени: {regular_study_time_text(forecast)}")
         if forecast.remaining_minutes:
             lines.append(
-                f"Осталось при текущем темпе: "
-                f"<b>≈ {format_study_hours(forecast.remaining_minutes)}</b>"
+                "Осталось при текущем темпе: "
+                f"<b>≈ {format_academic_hours(forecast.remaining_minutes)}</b>"
             )
+        lines.append(f"<i>{STUDY_NOTE_EXPLANATION}</i>")
     lines.append(
         f"⏱ Аптайм: {format_uptime(time.monotonic() - _PROCESS_STARTED_MONOTONIC)}"
     )
