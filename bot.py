@@ -2689,6 +2689,11 @@ COL_RED_LIGHT = "#FEE2E2"
 SUMMARY_MAX_LINES = 24
 SUMMARY_MAX_CHANGES = 20
 
+# Ширина PNG-картинок (расписание и статус). 1280 — максимум Telegram
+# по стороне: картинка не пережимается сильнее необходимого, а карточки
+# и текстовые строки становятся шире.
+IMAGE_WIDTH = 1280
+
 
 def _wrap_lines(text: str, font, max_width: float) -> list:
     """Переносит текст по словам; слишком длинное слово обрезается."""
@@ -2878,7 +2883,7 @@ def render_schedule_image(
     Создаёт PNG-картинку расписания (вертикальная лента карточек пар).
 
     Пары рисуются одна под другой, а ширина изображения фиксирована
-    (W = 1080) и не зависит от числа пар.
+    (W = IMAGE_WIDTH = 1280) и не зависит от числа пар.
 
     - `changes=None`  -> обычная картинка без выделения изменений.
     - `changes=[...]` -> изменённые блоки выделяются цветом/рамкой,
@@ -2930,7 +2935,7 @@ def render_schedule_image(
         font_summary_body = get_font(24)
 
         # Геометрия
-        W = 1080
+        W = IMAGE_WIDTH
         MARGIN = 58
         HEADER_H = 250
         card_gap = 28
@@ -3726,7 +3731,7 @@ def render_status_image(chat_id: int) -> Path:
         font_footer = get_font(24)
 
         # Геометрия — та же сетка, что у картинки расписания.
-        W = 1080
+        W = IMAGE_WIDTH
         MARGIN = 58
         x1, x2 = MARGIN, W - MARGIN
         inner = 48

@@ -1365,7 +1365,7 @@ class TestCancelledLessonRendering(unittest.TestCase):
             px = im.load()
             return [
                 y for y in range(300, im.height)
-                if any(px[x, y] == color for x in range(100, 980, 2))
+                if any(px[x, y] == color for x in range(100, im.width - 40, 2))
             ]
 
     def test_cancelled_block_has_no_room_chip_and_shows_muted_text(self):
@@ -1408,6 +1408,13 @@ class TestCancelledLessonRendering(unittest.TestCase):
 
 class TestImageLayoutFixes(unittest.TestCase):
     """Разметка картинки: блок «перемена» и подвал."""
+
+    def test_schedule_image_width(self):
+        """Картинки широкие (1280 — максимум Telegram по стороне)."""
+        self.assertEqual(bot.IMAGE_WIDTH, 1280)
+        path = bot.render_schedule_image(empty_schedule(date(2026, 9, 8)))
+        with Image.open(path) as img:
+            self.assertEqual(img.size[0], bot.IMAGE_WIDTH)
 
     BG = (243, 245, 250)
 
@@ -1535,7 +1542,7 @@ class TestTotalStudyBadge(DBTestCase):
             return [
                 y for y in range(y0, y1)
                 if any(px[x, y] == self.ACCENT_LIGHT
-                       for x in range(x0, 1040, 2))
+                       for x in range(x0, im.width - 40, 2))
             ]
 
     def color_rows(self, path, color, y0=520):
@@ -1545,7 +1552,7 @@ class TestTotalStudyBadge(DBTestCase):
             px = im.load()
             return [
                 y for y in range(y0, im.height)
-                if any(px[x, y] == color for x in range(100, 980))
+                if any(px[x, y] == color for x in range(100, im.width - 40))
             ]
 
     def color_clusters(self, rows):
@@ -2662,7 +2669,7 @@ class TestStatusImage(DBTestCase):
             self.assertTrue(path.exists())
             with Image.open(path) as img:
                 im = img.convert("RGB")
-                self.assertEqual(im.width, 1080)
+                self.assertEqual(im.width, bot.IMAGE_WIDTH)
                 self.assertGreater(im.height, 600)
                 self.assertLess(im.height, 3500)
                 px = im.load()
@@ -2673,14 +2680,14 @@ class TestStatusImage(DBTestCase):
                 chip_rows = [
                     y for y in range(40, 120)
                     if any(px[x, y] == self.GREEN_LIGHT
-                           for x in range(700, 1050, 4))
+                           for x in range(600, im.width - 40, 4))
                 ]
                 self.assertTrue(chip_rows, "бейдж РАБОТАЕТ не найден")
                 # Карточки (белые блоки) ниже шапки.
                 card_rows = [
                     y for y in range(300, im.height)
                     if any(px[x, y] == (255, 255, 255)
-                           for x in range(200, 880, 8))
+                           for x in range(200, im.width - 200, 8))
                 ]
                 self.assertTrue(card_rows, "карточки статуса не найдены")
         finally:
