@@ -2680,7 +2680,6 @@ COL_ACCENT_LIGHT = "#ECECFB"
 COL_GREEN = "#0E9F5F"
 COL_GREEN_LIGHT = "#E5F6ED"
 COL_BORDER = "#E2E7F0"
-COL_FOOTER = "#98A1B0"
 COL_WARN = "#B45309"
 COL_WARN_LIGHT = "#FEF3C7"
 COL_RED = "#B91C1C"
@@ -2930,7 +2929,6 @@ def render_schedule_image(
         font_detail = get_font(23, bold=True)
         font_empty_title = get_font(44, bold=True)
         font_empty_sub = get_font(30)
-        font_footer = get_font(24)
         font_summary = get_font(25, bold=True)
         font_summary_body = get_font(24)
 
@@ -3123,11 +3121,9 @@ def render_schedule_image(
                 total_pill = (total_x, total_y, total_w, total_h,
                               total_text, total_pad_x)
 
-        # Подвал — полноценная часть layout: сначала считаем нижнюю границу
-        # контента, затем добавляем отступ, строку подвала и нижний padding.
-        footer_text = "ИНК · расписание"
-        footer_h = _text_h(font_footer)
-        footer_gap = 44          # между последним блоком контента и подвалом
+        # Низ картинки: подписи «ИНК · расписание» больше нет, поэтому
+        # после последнего элемента контента остаётся только нижний
+        # padding — ничего не прижато к краю и не обрезается.
         footer_pad_bottom = 40   # нижний padding изображения
         card_shadow = 8          # тень карточек рисуется на 8px ниже
 
@@ -3143,7 +3139,7 @@ def render_schedule_image(
             content_bottom = summary_y + summary_h
 
         # Сноска про академический час — часть layout: сначала строки,
-        # потом отступ до подвала. Пары остаются вертикальным списком,
+        # потом высота картинки. Пары остаются вертикальным списком,
         # картинка просто становится выше.
         note_lines = (
             study_note_lines(forecast) if forecast is not None else []
@@ -3159,11 +3155,10 @@ def render_schedule_image(
         )
         note_y = content_bottom + note_gap if note_lines else None
 
-        footer_y = (
-            note_y + note_h + 26 if note_lines
-            else content_bottom + footer_gap
-        )
-        H = int(footer_y + footer_h + footer_pad_bottom)
+        # Последний нарисованный элемент — сноска про академический час,
+        # а если её нет — последняя карточка или блок «Что изменилось».
+        last_drawn_y = note_y + note_h if note_lines else content_bottom
+        H = int(last_drawn_y + footer_pad_bottom)
 
         image = Image.new("RGB", (W, H), COL_BG)
         draw = ImageDraw.Draw(image)
@@ -3528,17 +3523,6 @@ def render_schedule_image(
                 )
                 ny += note_line_h + note_line_gap
 
-        # ---------- подвал ----------
-        # footer_y и высота изображения посчитаны заранее: подвал не
-        # накладывается на контент и не обрезается снизу.
-        draw.text(
-            (x2 - draw.textlength(footer_text, font=font_footer),
-             footer_y),
-            footer_text,
-            font=font_footer,
-            fill=COL_FOOTER,
-        )
-
         # ---------- сохранение ----------
         kind = "staff" if schedule.schedule_type == "staff" else "group"
         staff_part = f"_{schedule.staff_id}" if schedule.staff_id else ""
@@ -3728,7 +3712,6 @@ def render_status_image(chat_id: int) -> Path:
         font_key = get_font(26)
         font_value = get_font(26, bold=True)
         font_small = get_font(24)
-        font_footer = get_font(24)
 
         # Геометрия — та же сетка, что у картинки расписания.
         W = IMAGE_WIDTH
@@ -3866,15 +3849,12 @@ def render_status_image(chat_id: int) -> Path:
         )
         note_y = content_bottom + note_gap if note_lines else None
 
-        footer_text = "ИНК · расписание"
-        footer_h = _text_h(font_footer)
-        footer_gap = 44
+        # Последний нарисованный элемент — сноска про академический час,
+        # а если её нет — последняя карточка. Снизу остаётся только
+        # нижний padding.
         footer_pad_bottom = 40
-        footer_y = (
-            note_y + note_h + 26 if note_lines
-            else content_bottom + footer_gap
-        )
-        H = int(footer_y + footer_h + footer_pad_bottom)
+        last_drawn_y = note_y + note_h if note_lines else content_bottom
+        H = int(last_drawn_y + footer_pad_bottom)
 
         image = Image.new("RGB", (W, H), COL_BG)
         draw = ImageDraw.Draw(image)
@@ -3990,14 +3970,6 @@ def render_status_image(chat_id: int) -> Path:
                     font_note, COL_MUTED,
                 )
                 ny += note_line_h + note_line_gap
-
-        # ---------- подвал ----------
-        draw.text(
-            (x2 - draw.textlength(footer_text, font=font_footer), footer_y),
-            footer_text,
-            font=font_footer,
-            fill=COL_FOOTER,
-        )
 
         filename = (
             f"status_{now.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.png"
