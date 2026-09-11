@@ -2001,15 +2001,27 @@ def normalize_subject_name(value: str) -> str:
 normalize_subject = normalize_subject_name
 
 
-# Заглушка предмета: сайт рисует «~..............», когда график подгруппы
-# ещё не заполнен. Такое «предметом» не считается.
+# «Заглушка» предмета: сайт рисует «~..............», когда пара для
+# подгруппы ОТМЕНЕНА — занятия у этой подгруппы нет, подгруппа свободна.
+# Такое «предметом» не считается: ни в историю, ни в подсчёт времени.
 _PLACEHOLDER_SUBJECT_RE = re.compile(r"^[\s.\-–—~_=*#]+$")
 
 
 def is_placeholder_subject(value) -> bool:
-    """True для пустышек вроде «~..............» или «---»."""
+    """True для отменённых занятий («~..............», «---», пусто)."""
     text = clean_text(value)
     return not text or bool(_PLACEHOLDER_SUBJECT_RE.fullmatch(text))
+
+
+CANCELLED_SUBJECT_TEXT = "Занятие отменено"
+
+
+def display_subject_text(subject) -> str:
+    """Предмет для показа: отмена рисуется словами, а не точками сайта."""
+    text = clean_text(subject)
+    if text and is_placeholder_subject(text):
+        return CANCELLED_SUBJECT_TEXT
+    return text or "Предмет не указан"
 
 
 def _local_aware(value: Optional[datetime] = None) -> datetime:
@@ -2093,8 +2105,8 @@ def _pair_history_lessons(pair: Pair) -> list:
     """Занятия пары для записи в историю: по строке на каждую подгруппу.
 
     Пара без подгрупп — одно занятие (первое с осмысленным предметом).
-    Подгруппа с заглушкой предмета («~..............», график не
-    заполнен) в историю не попадает: реального предмета там нет.
+    Подгруппа с отменённым занятием («~..............» на сайте — пару
+    отменили, подгруппа свободна) в историю не попадает: занятия не было.
     """
     rows = []
     seen_keys = set()
@@ -2731,14 +2743,14 @@ def _change_summary_lines(changes: list) -> list:
         if change.kind == "added":
             new = change.new or {}
             lines.append(
-                f"Добавлено: {label} — {new.get('subject') or 'Предмет не указан'}"
+                f"Добавлено: {label} — {display_subject_text(new.get('subject'))}"
                 + (f", {new.get('room') or '—'}" if new.get("room") else "")
             )
             continue
         if change.kind == "removed":
             old = change.old or {}
             lines.append(
-                f"Удалено: {label} — {old.get('subject') or 'Предмет не указан'}"
+                f"Удалено: {label} — {display_subject_text(old.get('subject'))}"
                 + (f", {old.get('room') or '—'}" if old.get("room") else "")
             )
             continue
@@ -2748,6 +2760,10 @@ def _change_summary_lines(changes: list) -> list:
             label_name = detail.get("label") or detail.get("field", "")
             old_val = clean_text(detail.get("old", ""))
             new_val = clean_text(detail.get("new", ""))
+            if detail.get("field") == "subject" or label_name == "Предмет":
+                # «~..............» в уведомлении — это отмена занятия.
+                old_val = display_subject_text(old_val) if old_val else old_val
+                new_val = display_subject_text(new_val) if new_val else new_val
             if old_val or new_val:
                 lines.append(
                     f"* {label_name}: {old_val or '—'} -> {new_val or '—'}"
@@ -2873,22 +2889,27 @@ def render_schedule_image(
 
         def subject_lines_for(subject):
             return _wrap_lines(
-                subject or "Предмет не указан", font_subject, text_w
+                display_subject_text(subject), font_subject, text_w
             )
 
         def item_block_height(item) -> int:
+            lesson = item["lesson"]
+            cancelled = is_placeholder_subject(lesson.subject)
             h = 8 + 10  # верхний/нижний отступ
-            if _subgroup_label(item["lesson"].subgroup):
+            if _subgroup_label(lesson.subgroup):
                 h += subg_h
             if item["kind"] != "normal":
                 h += status_h
-            h += line_h * len(subject_lines_for(item["lesson"].subject))
-            h += 14 + chip_h
-            if clean_text(getattr(item["lesson"], "groups", "")):
-                h += 8 + _text_h(font_info)
-            progress_text, _ = progress_for_lesson(item["lesson"])
-            if progress_text:
-                h += progress_gap + progress_h
+            h += line_h * len(subject_lines_for(lesson.subject))
+            # У отменённого занятия нет ни аудитории, ни преподавателя,
+            # ни прогресса — только строка «Занятие отменено».
+            if not cancelled:
+                h += 14 + chip_h
+                if clean_text(getattr(lesson, "groups", "")):
+                    h += 8 + _text_h(font_info)
+                progress_text, _ = progress_for_lesson(lesson)
+                if progress_text:
+                    h += progress_gap + progress_h
             if item["kind"] == "changed":
                 h += 8 + detail_h * len(item["details"])
             return h
@@ -3235,86 +3256,89 @@ def render_schedule_image(
                         )
                         inner_y += status_h
 
-                    # Предмет.
-                    subject = clean_text(lesson.subject) or "Предмет не указан"
-                    subj_lines = subject_lines_for(subject)
+                    # Предмет. Отменённое занятие — серым, без мета-строки.
+                    cancelled = is_placeholder_subject(lesson.subject)
+                    subj_lines = subject_lines_for(lesson.subject)
+                    subj_color = COL_MUTED if cancelled else COL_INK
                     for idx, line in enumerate(subj_lines):
                         draw.text(
                             (left, inner_y + idx * line_h),
                             line,
                             font=font_subject,
-                            fill=COL_INK,
+                            fill=subj_color,
                         )
                     inner_y += line_h * len(subj_lines)
 
-                    # Аудитория + преподаватель.
-                    inner_y += 14
-                    meta_y = inner_y
-                    room_text = (
-                        f"ауд. {lesson.room}"
-                        if clean_text(lesson.room) not in ("", "—")
-                        else "ауд. —"
-                    )
-                    room_color = COL_RED if kind == "removed" else COL_GREEN
-                    room_fill = (
-                        COL_RED_LIGHT if kind == "removed" else COL_GREEN_LIGHT
-                    )
-                    room_w = draw.textlength(room_text, font=font_info)
-                    room_chip_pad = 18
-                    room_chip_w = room_w + room_chip_pad * 2
-                    draw.rounded_rectangle(
-                        (left, meta_y,
-                         left + room_chip_w, meta_y + chip_h),
-                        radius=chip_h / 2,
-                        fill=room_fill,
-                    )
-                    draw.text(
-                        (left + room_chip_pad,
-                         meta_y + (chip_h - _text_h(font_info)) / 2),
-                        room_text,
-                        font=font_info,
-                        fill=room_color,
-                    )
-
-                    teacher = (
-                        clean_text(lesson.teacher)
-                        if clean_text(lesson.teacher) not in ("", "—")
-                        else "Преподаватель не указан"
-                    )
-                    teacher_x = left + room_chip_w + 24
-                    teacher_max_w = (x2 - inner) - teacher_x
-                    teacher = _truncate(teacher, font_info, teacher_max_w)
-                    draw.text(
-                        (teacher_x, meta_y + (chip_h - _text_h(font_info)) / 2),
-                        teacher,
-                        font=font_info,
-                        fill=COL_MUTED,
-                    )
-                    inner_y += chip_h
-
-                    # Для расписания преподавателя показываем группы пары.
-                    groups = clean_text(getattr(lesson, "groups", ""))
-                    if groups:
+                    if not cancelled:
+                        # Аудитория + преподаватель.
+                        inner_y += 14
+                        meta_y = inner_y
+                        room_text = (
+                            f"ауд. {lesson.room}"
+                            if clean_text(lesson.room) not in ("", "—")
+                            else "ауд. —"
+                        )
+                        room_color = COL_RED if kind == "removed" else COL_GREEN
+                        room_fill = (
+                            COL_RED_LIGHT if kind == "removed" else COL_GREEN_LIGHT
+                        )
+                        room_w = draw.textlength(room_text, font=font_info)
+                        room_chip_pad = 18
+                        room_chip_w = room_w + room_chip_pad * 2
+                        draw.rounded_rectangle(
+                            (left, meta_y,
+                             left + room_chip_w, meta_y + chip_h),
+                            radius=chip_h / 2,
+                            fill=room_fill,
+                        )
                         draw.text(
-                            (left, inner_y + 8),
-                            _truncate(f"Группы: {groups}", font_info, text_w),
+                            (left + room_chip_pad,
+                             meta_y + (chip_h - _text_h(font_info)) / 2),
+                            room_text,
+                            font=font_info,
+                            fill=room_color,
+                        )
+
+                        teacher = (
+                            clean_text(lesson.teacher)
+                            if clean_text(lesson.teacher) not in ("", "—")
+                            else "Преподаватель не указан"
+                        )
+                        teacher_x = left + room_chip_w + 24
+                        teacher_max_w = (x2 - inner) - teacher_x
+                        teacher = _truncate(teacher, font_info, teacher_max_w)
+                        draw.text(
+                            (teacher_x,
+                             meta_y + (chip_h - _text_h(font_info)) / 2),
+                            teacher,
                             font=font_info,
                             fill=COL_MUTED,
                         )
-                        inner_y += 8 + _text_h(font_info)
+                        inner_y += chip_h
 
-                    # Накопленный прогресс — только в карточках основной
-                    # группы. Он идёт после аудитории/преподавателя и после
-                    # списка групп, но до деталей изменения.
-                    progress_text, progress_color = progress_for_lesson(lesson)
-                    if progress_text:
-                        draw.text(
-                            (left, inner_y + progress_gap),
-                            progress_text,
-                            font=font_break,
-                            fill=progress_color,
-                        )
-                        inner_y += progress_gap + progress_h
+                        # Для расписания преподавателя показываем группы пары.
+                        groups = clean_text(getattr(lesson, "groups", ""))
+                        if groups:
+                            draw.text(
+                                (left, inner_y + 8),
+                                _truncate(f"Группы: {groups}", font_info, text_w),
+                                font=font_info,
+                                fill=COL_MUTED,
+                            )
+                            inner_y += 8 + _text_h(font_info)
+
+                        # Накопленный прогресс — только в карточках основной
+                        # группы. Он идёт после аудитории/преподавателя и
+                        # списка групп, но до деталей изменения.
+                        progress_text, progress_color = progress_for_lesson(lesson)
+                        if progress_text:
+                            draw.text(
+                                (left, inner_y + progress_gap),
+                                progress_text,
+                                font=font_break,
+                                fill=progress_color,
+                            )
+                            inner_y += progress_gap + progress_h
 
                     # Было -> стало для изменённых полей.
                     if kind == "changed":
@@ -4926,7 +4950,7 @@ def _format_change_text(change) -> str:
         new = change.new or {}
         return (
             f"🟢 <b>Добавлено:</b> {label}\n"
-            f"{clean_text(new.get('subject') or 'Предмет не указан')}"
+            f"{display_subject_text(new.get('subject'))}"
             + (
                 f", {clean_text(new.get('room') or '—')}"
                 if new.get("room")
@@ -4937,7 +4961,7 @@ def _format_change_text(change) -> str:
         old = change.old or {}
         return (
             f"🔴 <b>Удалено:</b> {label}\n"
-            f"{clean_text(old.get('subject') or 'Предмет не указан')}"
+            f"{display_subject_text(old.get('subject'))}"
             + (
                 f", {clean_text(old.get('room') or '—')}"
                 if old.get("room")
@@ -4950,6 +4974,10 @@ def _format_change_text(change) -> str:
         field_label = detail.get("label") or detail.get("field", "")
         old_val = clean_text(detail.get("old", ""))
         new_val = clean_text(detail.get("new", ""))
+        if detail.get("field") == "subject" or field_label == "Предмет":
+            # Отмена занятия показывается словами, а не точками сайта.
+            old_val = display_subject_text(old_val) if old_val else old_val
+            new_val = display_subject_text(new_val) if new_val else new_val
         lines.append(
             f"• {field_label}: {old_val or '—'} → {new_val or '—'}"
         )

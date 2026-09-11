@@ -894,8 +894,9 @@ def site_september_2026():
 
     Итог по минутам: 180 + 320 + 400 + 320 + 320 + 240 + 240 + 320 + 320
     = 2660 минут (44 ч 20 мин). Пара II 7 сентября — две подгруппы
-    «Ин.яз.»; пара IV 11 сентября — подгруппа 1 «Ин.яз в проф» и
-    заглушка «~..............» у подгруппы 2.
+    «Ин.яз.»; пара IV 11 сентября — подгруппа 1 «Ин.яз в проф», а у
+    подгруппы 2 пара ОТМЕНЕНА («~..............»: подгруппа уходит
+    домой, занятие не проводится и в историю не пишется).
     """
     def one(pair, start, end, subject, room, teacher):
         return lesson(pair, None, subject, room, teacher, start, end)
@@ -1334,6 +1335,70 @@ class TestLessonCount(unittest.TestCase):
         self.assertNotIn("Занятий: 5", caption)
 
 
+class TestCancelledLessonRendering(unittest.TestCase):
+    """Отмена занятия («~..............») на картинке расписания."""
+
+    GREEN = (14, 159, 95)
+    GREEN_LIGHT = (229, 246, 237)
+    MUTED = (100, 116, 139)
+
+    def cancelled_schedule(self):
+        return bot.Schedule(
+            date=date(2026, 9, 11),
+            group=bot.GROUP_NAME,
+            lessons=[
+                lesson("IV", "2", "~..............", "—", "—",
+                       "13:25", "14:45"),
+            ],
+        )
+
+    def color_rows(self, path, color):
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            return [
+                y for y in range(300, im.height)
+                if any(px[x, y] == color for x in range(100, 980, 2))
+            ]
+
+    def test_cancelled_block_has_no_room_chip_and_shows_muted_text(self):
+        path = bot.render_schedule_image(self.cancelled_schedule())
+        # У отменённого занятия нет чипа аудитории (зелёного) вообще…
+        self.assertEqual(self.color_rows(path, self.GREEN), [])
+        self.assertEqual(self.color_rows(path, self.GREEN_LIGHT), [])
+        # …но есть серая надпись «Занятие отменено».
+        muted = self.color_rows(path, self.MUTED)
+        self.assertTrue(muted, "надпись «Занятие отменено» не найдена")
+
+    def test_cancelled_block_is_compact(self):
+        """Блок без аудитории/преподавателя короче обычного блока."""
+        cancelled = bot.render_schedule_image(self.cancelled_schedule())
+        # Другая дата -> другой файл: рендер не перезапишет первую картинку.
+        normal = bot.render_schedule_image(bot.Schedule(
+            date=date(2026, 9, 10),
+            group=bot.GROUP_NAME,
+            lessons=[lesson("IV", "2", "Ин.яз в проф", "ПК103",
+                            "Мурзабулатова Ф.Ф.", "13:25", "14:45")],
+        ))
+        with Image.open(cancelled) as a, Image.open(normal) as b:
+            self.assertLess(a.size[1], b.size[1])
+
+    def test_cancellation_in_change_notification_text(self):
+        """Уведомление об отмене — словами, без «~..............»."""
+        old = bot.Schedule(date=date(2026, 9, 11), group=bot.GROUP_NAME,
+                           lessons=[lesson("IV", "1", "Ин.яз в проф")])
+        new = bot.Schedule(date=date(2026, 9, 11), group=bot.GROUP_NAME,
+                           lessons=[lesson("IV", "1", "~..............")])
+        changes = bot.compare_schedules(old, new)
+        self.assertTrue(changes)
+        text = bot._format_change_text(changes[0])
+        self.assertIn("Занятие отменено", text)
+        self.assertNotIn("~", text)
+        summary = "\n".join(bot._change_summary_lines(changes))
+        self.assertIn("Занятие отменено", summary)
+        self.assertNotIn("~", summary)
+
+
 class TestImageLayoutFixes(unittest.TestCase):
     """Разметка картинки: блок «перемена» и подвал."""
 
@@ -1681,6 +1746,43 @@ class TestSubgroupStudyTime(StudyDBTestCase):
         self.assertFalse(bot.is_placeholder_subject("Ин.яз."))
         self.assertFalse(bot.is_placeholder_subject("Тек (под) рем"))
 
+    def test_display_subject_text(self):
+        # Отмена на сайте показывается словами, а не точками.
+        self.assertEqual(
+            bot.display_subject_text("~.............."), "Занятие отменено"
+        )
+        self.assertEqual(bot.display_subject_text("..."), "Занятие отменено")
+        self.assertEqual(
+            bot.display_subject_text(""), "Предмет не указан"
+        )
+        self.assertEqual(
+            bot.display_subject_text(None), "Предмет не указан"
+        )
+        self.assertEqual(bot.display_subject_text("НГПО"), "НГПО")
+
+    def test_fully_cancelled_pair_records_nothing(self):
+        """Отмена у ВСЕХ подгрупп пары — пара не даёт времени группе."""
+        schedule = study_day_schedule(date(2026, 9, 7), [
+            ("II", "10:00", "11:20", [
+                lesson("II", "1", "~..............", "—", "—"),
+                lesson("II", "2", "~..............", "—", "—"),
+            ]),
+        ])
+        self.record(schedule)
+        self.assertEqual(self.history_rows(), [])
+        self.assertEqual(bot.load_total_study_minutes(), 0)
+        self.assertEqual(bot.load_subject_totals(), {})
+
+    def test_cancelled_whole_pair_without_subgroups(self):
+        """Карточка без подгрупп, но с отменой — тоже не пишется."""
+        schedule = study_day_schedule(date(2026, 9, 7), [
+            ("II", "10:00", "11:20",
+             [lesson("II", None, "~..............", "—", "—")]),
+        ])
+        self.record(schedule)
+        self.assertEqual(self.history_rows(), [])
+        self.assertEqual(bot.load_total_study_minutes(), 0)
+
     def test_two_subgroups_same_subject_one_slot(self):
         schedule = study_day_schedule(date(2026, 9, 7), [
             ("II", "10:00", "11:20", [
@@ -1763,10 +1865,11 @@ class TestSubgroupStudyTime(StudyDBTestCase):
         self.assertEqual(self.history_rows(), [])
 
     def test_realistic_placeholder_html_from_site(self):
-        """Реальная структура 11.09.2026: у 2-й подгруппы график не заполнен.
+        """Реальная структура 11.09.2026: у 2-й подгруппы пара ОТМЕНЕНА.
 
-        Сайт рисует «~..............» вместо предмета — в историю такая
-        подгруппа не попадает, но время пары не теряется.
+        Сайт рисует «~..............» — занятия у подгруппы нет, она
+        свободна. В историю такая подгруппа не попадает, но время пары
+        для остальной группы не теряется.
         """
         html = """
         <html><body>
