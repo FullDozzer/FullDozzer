@@ -11,6 +11,14 @@ Telegram-бот расписания группы ЭС7-24 (Институт н�
 - Все даты считаются в часовом поясе Asia/Yekaterinburg (UTC+5),
   локальное время сервера не используется.
 - Расписание преподавателей использует единый справочник staff_directory.py.
+- История учёбы: каждая подгруппа пары пишется отдельной строкой со своим
+  предметом, но в общей сумме группы пара считается один раз.
+- Прогноз «Изучено: X / Y акад. ч»: время считается академическими
+  часами (1 акад. ч = 40 мин), X — фактическое время с 1 сентября,
+  Y — экстраполяция темпа до 30 июня (R = X * Dr / De); обыкновенное
+  время приводится в серой курсивной сноске внизу картинки.
+- /status — PNG-карточка состояния бота в дизайне расписания
+  (подписки, прогресс учёбы, текущее потребление ресурсов).
 
 """
 
@@ -21,6 +29,7 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -1517,6 +1526,146 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
+# ============================================================
+# СХЕМА БД: v2 — история занятий с записью по подгруппам
+# ============================================================
+
+SCHEMA_VERSION = 2
+
+
+def _ensure_meta_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+
+
+def _meta_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute(
+        "SELECT value FROM bot_meta WHERE key = ?", (key,)
+    ).fetchone()
+    return row["value"] if row else default
+
+
+def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO bot_meta (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, str(value)),
+    )
+
+
+def get_meta_value(key: str, default: str = "") -> str:
+    try:
+        with db_connect() as conn:
+            return _meta_get(conn, key, default)
+    except Exception:
+        logger.exception("Ошибка чтения bot_meta[%s]", key)
+        return default
+
+
+def set_meta_value(key: str, value: str) -> None:
+    try:
+        with db_connect() as conn:
+            _meta_set(conn, key, value)
+    except Exception:
+        logger.exception("Ошибка записи bot_meta[%s]", key)
+
+
+def _migrate_lesson_history(conn: sqlite3.Connection) -> None:
+    """Переводит lesson_history на схему v2 (строка на подгруппу).
+
+    v1: UNIQUE(group_name, date, pair_number) — одна строка на пару,
+    предмет только у «представителя», время подгрупп терялось.
+    v2: UNIQUE(group_name, date, pair_number, subgroup_key) — каждая
+    подгруппа пишет свою строку со своим предметом.
+
+    После миграции строки и backfill-метки текущего учебного года
+    сбрасываются и ставится флаг study_recalc_from: при старте монитора
+    дни пересчитываются заново уже по подгруппам.
+    """
+    _ensure_meta_table(conn)
+
+    version_raw = _meta_get(conn, "schema_version", "")
+    try:
+        version = int(version_raw) if version_raw else 1
+    except ValueError:
+        version = 1
+
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(lesson_history)")
+    }
+    rebuilt = "subgroup_key" not in columns
+    if rebuilt:
+        logger.info("Миграция lesson_history: v1 -> v2 (строка на подгруппу)")
+        # IF NOT EXISTS и INSERT OR IGNORE — защита от «полу-мigrated»
+        # состояния, если прошлый запуск упал между CREATE и COMMIT.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lesson_history_v2 (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_name         TEXT NOT NULL,
+                date               TEXT NOT NULL,
+                pair_number        TEXT NOT NULL,
+                subgroup_key       TEXT NOT NULL DEFAULT '',
+                start_time         TEXT NOT NULL,
+                end_time           TEXT NOT NULL,
+                subject            TEXT NOT NULL,
+                normalized_subject TEXT NOT NULL,
+                duration_minutes   INTEGER NOT NULL,
+                subgroup_info      TEXT NOT NULL DEFAULT '',
+                teacher            TEXT NOT NULL DEFAULT '',
+                room               TEXT NOT NULL DEFAULT '',
+                completed_at       TEXT NOT NULL,
+                created_at         TEXT NOT NULL,
+                UNIQUE (group_name, date, pair_number, subgroup_key)
+            )
+            """
+        )
+        # Старые строки сохраняются (даты прошлых лет считаются «пара один
+        # раз» и без подгрупп); текущий учебный год ниже пересчитается.
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO lesson_history_v2
+                (group_name, date, pair_number, subgroup_key, start_time,
+                 end_time, subject, normalized_subject, duration_minutes,
+                 subgroup_info, teacher, room, completed_at, created_at)
+            SELECT group_name, date, pair_number, '', start_time,
+                   end_time, subject, normalized_subject, duration_minutes,
+                   subgroup_info, teacher, room, completed_at, created_at
+            FROM lesson_history
+            """
+        )
+        conn.execute("DROP TABLE lesson_history")
+        conn.execute("ALTER TABLE lesson_history_v2 RENAME TO lesson_history")
+
+    if version < SCHEMA_VERSION:
+        if rebuilt:
+            # Старые строки текущего года записаны «представителем» пары:
+            # сбрасываем их и метки backfill, дни пересчитаются по подгруппам.
+            start = get_academic_year_start()
+            conn.execute(
+                "DELETE FROM lesson_history WHERE date >= ?",
+                (start.isoformat(),),
+            )
+            conn.execute(
+                "DELETE FROM lesson_backfill_days WHERE date >= ?",
+                (start.isoformat(),),
+            )
+            _meta_set(conn, "study_recalc_from", start.isoformat())
+            logger.info(
+                "История занятий с %s будет пересчитана по подгруппам",
+                start.isoformat(),
+            )
+        _meta_set(conn, "schema_version", str(SCHEMA_VERSION))
+
+
 def init_db() -> None:
     try:
         with db_connect() as conn:
@@ -1590,8 +1739,9 @@ def init_db() -> None:
                 """
             )
 
-            # Источник истины накопления — одна запись на фактически
-            # завершённую пару. Подгруппы не входят в уникальный ключ.
+            # Источник истины накопления — записи завершённых пар.
+            # Схема v2: каждая подгруппа пары даёт свою строку со своим
+            # предметом; уникальность — (группа, дата, пара, подгруппа).
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS subjects (
@@ -1609,6 +1759,7 @@ def init_db() -> None:
                     group_name         TEXT NOT NULL,
                     date               TEXT NOT NULL,
                     pair_number        TEXT NOT NULL,
+                    subgroup_key       TEXT NOT NULL DEFAULT '',
                     start_time         TEXT NOT NULL,
                     end_time           TEXT NOT NULL,
                     subject            TEXT NOT NULL,
@@ -1619,14 +1770,8 @@ def init_db() -> None:
                     room               TEXT NOT NULL DEFAULT '',
                     completed_at       TEXT NOT NULL,
                     created_at         TEXT NOT NULL,
-                    UNIQUE (group_name, date, pair_number)
+                    UNIQUE (group_name, date, pair_number, subgroup_key)
                 )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_lesson_history_subject
-                ON lesson_history (group_name, normalized_subject, date)
                 """
             )
             # День считается обработанным только после успешного получения
@@ -1665,6 +1810,16 @@ def init_db() -> None:
                     last_warning_at  REAL NOT NULL DEFAULT 0,
                     updated_at       TEXT NOT NULL
                 )
+                """
+            )
+
+            # Миграция истории занятий на схему v2 выполняется в самом
+            # конце: ей нужны уже созданные lesson_backfill_days/bot_meta.
+            _migrate_lesson_history(conn)
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_lesson_history_subject
+                ON lesson_history (group_name, normalized_subject, date)
                 """
             )
         logger.info("База данных готова: %s", DB_PATH)
@@ -1848,6 +2003,29 @@ def normalize_subject_name(value: str) -> str:
 normalize_subject = normalize_subject_name
 
 
+# «Заглушка» предмета: сайт рисует «~..............», когда пара для
+# подгруппы ОТМЕНЕНА — занятия у этой подгруппы нет, подгруппа свободна.
+# Такое «предметом» не считается: ни в историю, ни в подсчёт времени.
+_PLACEHOLDER_SUBJECT_RE = re.compile(r"^[\s.\-–—~_=*#]+$")
+
+
+def is_placeholder_subject(value) -> bool:
+    """True для отменённых занятий («~..............», «---», пусто)."""
+    text = clean_text(value)
+    return not text or bool(_PLACEHOLDER_SUBJECT_RE.fullmatch(text))
+
+
+CANCELLED_SUBJECT_TEXT = "Занятие отменено"
+
+
+def display_subject_text(subject) -> str:
+    """Предмет для показа: отмена рисуется словами, а не точками сайта."""
+    text = clean_text(subject)
+    if text and is_placeholder_subject(text):
+        return CANCELLED_SUBJECT_TEXT
+    return text or "Предмет не указан"
+
+
 def _local_aware(value: Optional[datetime] = None) -> datetime:
     current = value or now_local()
     if current.tzinfo is None:
@@ -1925,22 +2103,27 @@ def is_lesson_completed(
 lesson_is_completed = is_lesson_completed
 
 
-def _pair_representative(pair: Pair) -> Optional[Lesson]:
-    if not pair.lessons:
-        return None
-    # Если подгруппы имеют один предмет, это ровно одна история пары. При
-    # различиях сохраняем первый элемент, не умножая длительность на число
-    # подгрупп.
-    return next((item for item in pair.lessons if clean_text(item.subject)), pair.lessons[0])
+def _pair_history_lessons(pair: Pair) -> list:
+    """Занятия пары для записи в историю: по строке на каждую подгруппу.
+
+    Пара без подгрупп — одно занятие (первое с осмысленным предметом).
+    Подгруппа с отменённым занятием («~..............» на сайте — пару
+    отменили, подгруппа свободна) в историю не попадает: занятия не было.
+    """
+    rows = []
+    seen_keys = set()
+    for lesson in pair.lessons:
+        if is_placeholder_subject(lesson.subject):
+            continue
+        key = clean_text(lesson.subgroup)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        rows.append(lesson)
+    return rows
 
 
-def _pair_subgroups(pair: Pair) -> str:
-    values = []
-    for item in pair.lessons:
-        value = clean_text(item.subgroup)
-        if value and value not in values:
-            values.append(value)
-    return ", ".join(values)
+history_lessons_for_pair = _pair_history_lessons
 
 
 def _upsert_subject(conn: sqlite3.Connection, original: str, normalized: str) -> None:
@@ -1970,19 +2153,22 @@ def record_completed_lesson(
     end_time: str,
     subject: str,
     *,
+    subgroup: Optional[str] = None,
     subgroup_info: str = "",
     teacher: str = "",
     room: str = "",
     duration: Optional[int] = None,
 ) -> bool:
-    """Идемпотично записывает одну завершённую пару.
+    """Идемпотично записывает одно завершённое занятие (подгруппу пары).
 
-    ``INSERT OR IGNORE`` и UNIQUE(group, date, pair_number) делают повторный
-    backfill/перезапуск безопасным и не считают подгруппы дважды.
+    ``INSERT OR IGNORE`` и UNIQUE(group, date, pair, subgroup_key) делают
+    повторный backfill/перезапуск безопасным: одна и та же подгруппа
+    пары не считается дважды, а разные подгруппы одной пары пишутся
+    отдельными строками — каждая со своим предметом.
     """
     normalized = normalize_subject_name(subject)
     minutes = duration if duration is not None else duration_minutes(start_time, end_time)
-    if not normalized or minutes <= 0:
+    if is_placeholder_subject(subject) or not normalized or minutes <= 0:
         return False
     stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -1991,15 +2177,16 @@ def record_completed_lesson(
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO lesson_history
-                (group_name, date, pair_number, start_time, end_time, subject,
-                 normalized_subject, duration_minutes, subgroup_info, teacher,
-                 room, completed_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (group_name, date, pair_number, subgroup_key, start_time,
+                 end_time, subject, normalized_subject, duration_minutes,
+                 subgroup_info, teacher, room, completed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     clean_text(group_name) or GROUP_NAME,
                     day.isoformat(),
                     clean_text(pair_number).upper() or f"{start_time}-{end_time}",
+                    clean_text(subgroup),
                     clean_text(start_time),
                     clean_text(end_time),
                     clean_text(subject),
@@ -2021,7 +2208,13 @@ def record_completed_lesson(
 def record_completed_lessons(
     schedule: Schedule, current: Optional[datetime] = None
 ) -> int:
-    """Добавляет завершённые пары расписания основной группы."""
+    """Добавляет завершённые пары расписания основной группы.
+
+    Пара, разбитая на подгруппы, даёт по строке на подгруппу — у каждой
+    своё время (длительность пары) и свой предмет. В общей сумме группы
+    такая пара всё равно считается один раз: агрегация идёт по слоту
+    (дата + пара), а не по строкам (см. load_total_study_minutes).
+    """
     if schedule.schedule_type != "group":
         return 0
     if schedule.group != GROUP_NAME:
@@ -2034,22 +2227,23 @@ def record_completed_lessons(
         if not is_lesson_completed(schedule.date, pair.end, current):
             continue
         minutes = duration_minutes(pair.start, pair.end)
-        representative = _pair_representative(pair)
-        if representative is None or minutes <= 0:
+        if minutes <= 0:
             continue
-        if record_completed_lesson(
-            schedule.group,
-            schedule.date,
-            pair.number,
-            pair.start,
-            pair.end,
-            representative.subject,
-            subgroup_info=_pair_subgroups(pair),
-            teacher=representative.teacher,
-            room=representative.room,
-            duration=minutes,
-        ):
-            inserted += 1
+        for lesson in _pair_history_lessons(pair):
+            if record_completed_lesson(
+                schedule.group,
+                schedule.date,
+                pair.number,
+                pair.start,
+                pair.end,
+                lesson.subject,
+                subgroup=lesson.subgroup,
+                subgroup_info=_subgroup_label(lesson.subgroup),
+                teacher=lesson.teacher,
+                room=lesson.room,
+                duration=minutes,
+            ):
+                inserted += 1
     return inserted
 
 
@@ -2062,7 +2256,13 @@ def load_subject_totals(
     start: Optional[date] = None,
     end: Optional[date] = None,
 ) -> dict[str, int]:
-    """Сумма фактически завершённых минут по нормализованному предмету."""
+    """Сумма фактически завершённых минут по нормализованному предмету.
+
+    Внутри одной пары предмет учитывается один раз: две подгруппы с
+    одинаковым предметом не удваивают его время. Подгруппы с разными
+    предметами получают время каждая — это и есть «своё время»
+    подгруппы.
+    """
     clauses = ["group_name = ?"]
     params: list = [group_name]
     if start is not None:
@@ -2071,14 +2271,17 @@ def load_subject_totals(
     if end is not None:
         clauses.append("date <= ?")
         params.append(end.isoformat())
+    sql = (
+        "SELECT normalized_subject, SUM(slot_minutes) AS minutes FROM ("
+        "  SELECT date, pair_number, normalized_subject,"
+        "         MAX(duration_minutes) AS slot_minutes"
+        "  FROM lesson_history WHERE " + " AND ".join(clauses) +
+        "  GROUP BY date, pair_number, normalized_subject"
+        ") GROUP BY normalized_subject"
+    )
     try:
         with db_connect() as conn:
-            rows = conn.execute(
-                "SELECT normalized_subject, SUM(duration_minutes) AS minutes "
-                "FROM lesson_history WHERE " + " AND ".join(clauses) +
-                " GROUP BY normalized_subject",
-                params,
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
             return {
                 row["normalized_subject"]: int(row["minutes"] or 0)
                 for row in rows
@@ -2089,15 +2292,220 @@ def load_subject_totals(
 
 
 def load_total_study_minutes(group_name: str = GROUP_NAME) -> int:
-    """Суммарное отученное время (минуты) по истории завершённых пар."""
+    """Суммарное отученное время (минуты) по истории завершённых пар.
+
+    Пара, разбитая на подгруппы, занимает ОДИН слот времени группы
+    (подгруппы занимаются параллельно), поэтому группировка — по
+    (дата, пара). Время подгрупп разделяется только на уровне строк и
+    предметов, в общую сумму группы оно попадает без разделения.
+    """
     try:
-        return sum(load_subject_totals(group_name).values())
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT SUM(slot_minutes) AS total FROM ("
+                "  SELECT date, pair_number, MAX(duration_minutes) AS slot_minutes"
+                "  FROM lesson_history WHERE group_name = ?"
+                "  GROUP BY date, pair_number"
+                ")",
+                (group_name,),
+            ).fetchone()
+            return int(row["total"] or 0) if row else 0
     except Exception:
         logger.exception("Ошибка подсчёта суммарного времени учёбы")
         return 0
 
 
 total_study_minutes = load_total_study_minutes
+
+
+def count_active_study_days(
+    group_name: str = GROUP_NAME,
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+) -> int:
+    """Сколько дней в диапазоне реально были завершённые пары."""
+    clauses = ["group_name = ?"]
+    params: list = [group_name]
+    if start is not None:
+        clauses.append("date >= ?")
+        params.append(start.isoformat())
+    if end is not None:
+        clauses.append("date <= ?")
+        params.append(end.isoformat())
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT date) AS days FROM lesson_history"
+                " WHERE " + " AND ".join(clauses),
+                params,
+            ).fetchone()
+            return int(row["days"] or 0) if row else 0
+    except Exception:
+        logger.exception("Ошибка подсчёта дней с занятиями")
+        return 0
+
+
+# ============================================================
+# ПРОГНОЗ ИЗУЧЕННОГО ВРЕМЕНИ (1 сентября — 30 июня)
+# ============================================================
+
+
+def get_academic_year_end(day: Optional[date] = None) -> date:
+    """30 июня учебного года: 1 сентября 2026 -> 30 июня 2027."""
+    start = get_academic_year_start(day)
+    return date(start.year + 1, 6, 30)
+
+
+def count_study_days(first: date, last: date) -> int:
+    """Учебные дни в диапазоне: все дни, кроме воскресений."""
+    if last < first:
+        return 0
+    total = 0
+    current = first
+    while current <= last:
+        if not is_day_off(current):
+            total += 1
+        current += timedelta(days=1)
+    return total
+
+
+@dataclass(frozen=True)
+class StudyForecast:
+    """Прогноз изученного времени на учебный год."""
+
+    studied_minutes: int                  # X — фактически изучено
+    remaining_minutes: Optional[int]      # R — осталось (None = нет данных)
+    total_minutes: int                    # Y = X + R — прогноз на год
+    elapsed_study_days: int               # De — учебных дней прошло
+    remaining_study_days: int             # Dr — учебных дней осталось
+    active_days: int                      # дни, когда реально были пары
+    pace_minutes_per_day: Optional[float] # X / De — минут на учебный день
+    start: date                           # 1 сентября
+    end: date                             # 30 июня
+
+
+def get_study_forecast(
+    group_name: str = GROUP_NAME,
+    today: Optional[date] = None,
+) -> StudyForecast:
+    """Сколько примерно осталось учиться при текущем темпе.
+
+    Учебный год: с 1 сентября по 30 июня. Учебный день — любой день,
+    кроме воскресенья (в субботу пары могут быть или не быть).
+
+    Модель — пропорциональная экстраполяция «такими темпами»:
+
+        X  — фактически изучено минут (каждая пара считается один раз)
+        De — учебных дней прошло с 1 сентября по сегодня
+        Dr — учебных дней осталось до 30 июня
+        R  = X * Dr / De   — сколько часов осталось учиться
+        Y  = X + R         — прогноз суммарного времени за учебный год
+
+    Средний темп X / De учитывает и «пустые» учебные дни (субботы без
+    пар, праздники): они входят в знаменатель с нулём часов, поэтому
+    прогноз не завышается. active_days — дни, когда пары действительно
+    были, — используется для справки в статусе бота.
+    """
+    today = today or get_today()
+    start = get_academic_year_start(today)
+    end = get_academic_year_end(today)
+
+    studied = load_total_study_minutes(group_name)
+    elapsed_last = min(today, end)
+    elapsed_study_days = count_study_days(start, elapsed_last)
+    remaining_study_days = count_study_days(
+        max(today + timedelta(days=1), start), end
+    )
+    active_days = count_active_study_days(group_name, start, elapsed_last)
+
+    remaining: Optional[int] = None
+    pace: Optional[float] = None
+    if studied > 0 and elapsed_study_days > 0:
+        pace = studied / elapsed_study_days
+        remaining = int(round(pace * remaining_study_days))
+
+    return StudyForecast(
+        studied_minutes=studied,
+        remaining_minutes=remaining,
+        total_minutes=studied + (remaining if remaining is not None else 0),
+        elapsed_study_days=elapsed_study_days,
+        remaining_study_days=remaining_study_days,
+        active_days=active_days,
+        pace_minutes_per_day=pace,
+        start=start,
+        end=end,
+    )
+
+
+# Академический час колледжа: ровно 40 минут.
+ACADEMIC_HOUR_MINUTES = 40
+
+
+def _format_academic_units(units: float) -> str:
+    """Число академических часов без единицы: «2», «66,5», «0,75»."""
+    if abs(units - round(units)) < 1e-9:
+        return str(int(round(units)))
+    for digits in (1, 2):
+        text = f"{units:.{digits}f}"
+        if abs(units - float(text)) < 1e-9:
+            return text.replace(".", ",")
+    return f"{units:.2f}".replace(".", ",")
+
+
+def format_academic_hours(minutes: int) -> str:
+    """Время в академических часах: «2 акад. ч», «66,5 акад. ч».
+
+    Дробная часть — до двух знаков, без лишних нулей: 80 мин = «2 акад. ч»,
+    60 мин = «1,5 акад. ч», 30 мин = «0,75 акад. ч».
+    """
+    minutes = max(0, int(minutes or 0))
+    return _format_academic_units(minutes / ACADEMIC_HOUR_MINUTES) + " акад. ч"
+
+
+def study_badge_text(forecast: StudyForecast) -> str:
+    """Текст бейджа шапки: «Изучено: 66,5 / 1729 акад. ч».
+
+    Время считается академическими часами (1 акад. ч = 40 мин);
+    обыкновенное время приводится в сноске внизу картинки.
+    До первых занятий бейдж не показывается вовсе; когда прогноз
+    недоступен (или учебный год закончился) — только фактическое время.
+    """
+    studied = _format_academic_units(
+        forecast.studied_minutes / ACADEMIC_HOUR_MINUTES
+    )
+    if forecast.remaining_minutes:
+        total = _format_academic_units(
+            forecast.total_minutes / ACADEMIC_HOUR_MINUTES
+        )
+        return f"Изучено: {studied} / {total} акад. ч"
+    return f"Изучено: {format_academic_hours(forecast.studied_minutes)}"
+
+
+def regular_study_time_text(forecast: StudyForecast) -> str:
+    """То же время по обыкновенным часам: «44 ч 20 мин / 1152 ч 40 мин»."""
+    studied = format_duration(forecast.studied_minutes)
+    if forecast.remaining_minutes:
+        return f"{studied} / {format_duration(forecast.total_minutes)}"
+    return studied
+
+
+STUDY_NOTE_EXPLANATION = (
+    "Время считается по академическому часу: 1 акад. ч = 40 мин."
+)
+
+
+def study_note_lines(forecast: StudyForecast) -> list:
+    """Строки сноски внизу картинки с изученным временем.
+
+    Пояснение про академический час + тот же расчёт по обыкновенному
+    времени. Пока занятий не было — сноска не нужна.
+    """
+    if forecast.studied_minutes <= 0:
+        return []
+    return [
+        STUDY_NOTE_EXPLANATION,
+        f"По обыкновенному времени: {regular_study_time_text(forecast)}",
+    ]
 
 
 def register_subjects_from_schedule(schedule: Schedule) -> int:
@@ -2107,6 +2515,8 @@ def register_subjects_from_schedule(schedule: Schedule) -> int:
     values = {}
     for lesson in schedule.lessons:
         original = clean_text(lesson.subject)
+        if is_placeholder_subject(original):
+            continue
         normalized = normalize_subject_name(original)
         if normalized:
             values.setdefault(normalized, original)
@@ -2131,9 +2541,11 @@ def get_subject_total_minutes(
 
 def get_subject_progress(subject: str, group_name: str = GROUP_NAME) -> str:
     normalized = normalize_subject_name(subject)
+    if is_placeholder_subject(subject) or not normalized:
+        return ""
     minutes = get_subject_total_minutes(subject, group_name)
     if minutes > 0:
-        return f"Изучено: {format_duration(minutes)}"
+        return f"Изучено: {format_academic_hours(minutes)}"
     try:
         with db_connect() as conn:
             exists = conn.execute(
@@ -2213,6 +2625,44 @@ async def backfill_lesson_history(
 run_backfill = backfill_lesson_history
 
 
+async def recalculate_study_history() -> int:
+    """Разовый пересчёт изученного времени текущего учебного года.
+
+    Запускается автоматически после миграции истории на запись по
+    подгруппам (флаг study_recalc_from в bot_meta): дни с 1 сентября
+    по сегодня заново скачиваются с сайта и записываются по подгруппам.
+    Флаг снимается ДО запуска — сбой посреди пересчёта не приводит к
+    бесконечным повторам, неотмеченные дни доберёт обычный backfill.
+    """
+    try:
+        raw = get_meta_value("study_recalc_from")
+        if not raw:
+            return 0
+        try:
+            start = date.fromisoformat(raw)
+        except ValueError:
+            logger.error("Некорректный флаг пересчёта: %s", raw)
+            set_meta_value("study_recalc_from", "")
+            return 0
+
+        set_meta_value("study_recalc_from", "")
+        today = get_today()
+        if today < start:
+            return 0
+
+        logger.info(
+            "Пересчёт изученного времени по подгруппам: %s — %s",
+            start.isoformat(),
+            today.isoformat(),
+        )
+        inserted = await backfill_lesson_history(start=start, end=today)
+        logger.info("Пересчёт завершён, добавлено записей: %s", inserted)
+        return inserted
+    except Exception:
+        logger.exception("Ошибка пересчёта изученного времени")
+        return 0
+
+
 init_db()
 
 
@@ -2238,6 +2688,11 @@ COL_RED_LIGHT = "#FEE2E2"
 
 SUMMARY_MAX_LINES = 24
 SUMMARY_MAX_CHANGES = 20
+
+# Ширина PNG-картинок (расписание и статус). 1280 — максимум Telegram
+# по стороне: картинка не пережимается сильнее необходимого, а карточки
+# и текстовые строки становятся шире.
+IMAGE_WIDTH = 1280
 
 
 def _wrap_lines(text: str, font, max_width: float) -> list:
@@ -2275,6 +2730,50 @@ def _wrap_lines(text: str, font, max_width: float) -> list:
 def _text_h(font) -> int:
     """Примерная высота строки с отступом."""
     return int(font.size * 1.35)
+
+
+# Наклон синтетического курсива (~12°) для DejaVu без italic-файла.
+_ITALIC_SHEAR = 0.21
+
+
+def _draw_italic_text(image: Image.Image, xy, text: str, font, fill) -> None:
+    """Рисует текст курсивом: слой с текстом наклоняется аффинным сдвигом.
+
+    DejaVu поставляется без отдельного italic-начертания, поэтому курсив
+    получается сдвигом верхних пикселей вправо — как «synthetic italic»
+    в графических редакторах.
+    """
+    text = clean_text(text)
+    if not text:
+        return
+    bbox = font.getbbox(text)
+    if not bbox:
+        return
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    if tw <= 0 or th <= 0:
+        return
+    x, y = int(xy[0]), int(xy[1])
+    pad = 6
+    layer = Image.new("RGBA", (tw + pad * 2, th + pad * 2), (0, 0, 0, 0))
+    ImageDraw.Draw(layer).text(
+        (pad - bbox[0], pad - bbox[1]), text, font=font, fill=fill
+    )
+    width = layer.width + int(_ITALIC_SHEAR * layer.height)
+    # x_input = x_output + shear * y - shear * height: низ неподвижен,
+    # верх уезжает вправо. NEAREST — без интерполяции: штрихи остаются
+    # такими же чёткими, как у прямого начертания.
+    layer = layer.transform(
+        (width, layer.height),
+        Image.AFFINE,
+        (1, _ITALIC_SHEAR, -_ITALIC_SHEAR * layer.height, 0, 1, 0),
+        resample=Image.NEAREST,
+    )
+    image.paste(layer, (x - pad, y - pad), layer)
+
+
+def _italic_text_width(text: str, font) -> float:
+    """Ширина курсивного текста (с учётом наклона) для центрирования."""
+    return font.getlength(text) + _ITALIC_SHEAR * _text_h(font)
 
 
 def _truncate(text: str, font, max_width: float) -> str:
@@ -2343,14 +2842,14 @@ def _change_summary_lines(changes: list) -> list:
         if change.kind == "added":
             new = change.new or {}
             lines.append(
-                f"Добавлено: {label} — {new.get('subject') or 'Предмет не указан'}"
+                f"Добавлено: {label} — {display_subject_text(new.get('subject'))}"
                 + (f", {new.get('room') or '—'}" if new.get("room") else "")
             )
             continue
         if change.kind == "removed":
             old = change.old or {}
             lines.append(
-                f"Удалено: {label} — {old.get('subject') or 'Предмет не указан'}"
+                f"Удалено: {label} — {display_subject_text(old.get('subject'))}"
                 + (f", {old.get('room') or '—'}" if old.get("room") else "")
             )
             continue
@@ -2360,6 +2859,10 @@ def _change_summary_lines(changes: list) -> list:
             label_name = detail.get("label") or detail.get("field", "")
             old_val = clean_text(detail.get("old", ""))
             new_val = clean_text(detail.get("new", ""))
+            if detail.get("field") == "subject" or label_name == "Предмет":
+                # «~..............» в уведомлении — это отмена занятия.
+                old_val = display_subject_text(old_val) if old_val else old_val
+                new_val = display_subject_text(new_val) if new_val else new_val
             if old_val or new_val:
                 lines.append(
                     f"* {label_name}: {old_val or '—'} -> {new_val or '—'}"
@@ -2380,7 +2883,7 @@ def render_schedule_image(
     Создаёт PNG-картинку расписания (вертикальная лента карточек пар).
 
     Пары рисуются одна под другой, а ширина изображения фиксирована
-    (W = 1080) и не зависит от числа пар.
+    (W = IMAGE_WIDTH = 1280) и не зависит от числа пар.
 
     - `changes=None`  -> обычная картинка без выделения изменений.
     - `changes=[...]` -> изменённые блоки выделяются цветом/рамкой,
@@ -2391,8 +2894,10 @@ def render_schedule_image(
     - для `schedule_type == "staff"` в шапке выводится ФИО
       преподавателя, а в карточках — группы пар (`lesson.groups`).
     - для расписания основной группы в правом нижнем углу шапки
-      показывается бейдж «Отучились суммарно» с накопленным временем
-      из истории завершённых пар.
+      показывается бейдж «Изучено: X / Y акад. ч» с фактическим временем
+      и прогнозом на учебный год из истории завершённых пар, а внизу —
+      серая курсивная сноска про академический час с расчётом по
+      обыкновенному времени.
     """
     try:
         lessons = list(schedule.lessons)
@@ -2430,7 +2935,7 @@ def render_schedule_image(
         font_summary_body = get_font(24)
 
         # Геометрия
-        W = 1080
+        W = IMAGE_WIDTH
         MARGIN = 58
         HEADER_H = 250
         card_gap = 28
@@ -2462,12 +2967,17 @@ def render_schedule_image(
             """Возвращает подпись и цвет прогресса для блока занятия."""
             if not is_group:
                 return "", COL_MUTED
+            if is_placeholder_subject(lesson.subject):
+                return "", COL_MUTED
             normalized = normalize_subject_name(lesson.subject)
             if not normalized:
                 return "", COL_MUTED
             minutes = subject_totals.get(normalized, 0)
             if minutes > 0:
-                return f"Изучено: {format_duration(minutes)}", COL_GREEN
+                return (
+                    f"Изучено: {format_academic_hours(minutes)}",
+                    COL_GREEN,
+                )
             return "Первое занятие по предмету", COL_MUTED
 
         change_by_key = {
@@ -2483,22 +2993,27 @@ def render_schedule_image(
 
         def subject_lines_for(subject):
             return _wrap_lines(
-                subject or "Предмет не указан", font_subject, text_w
+                display_subject_text(subject), font_subject, text_w
             )
 
         def item_block_height(item) -> int:
+            lesson = item["lesson"]
+            cancelled = is_placeholder_subject(lesson.subject)
             h = 8 + 10  # верхний/нижний отступ
-            if _subgroup_label(item["lesson"].subgroup):
+            if _subgroup_label(lesson.subgroup):
                 h += subg_h
             if item["kind"] != "normal":
                 h += status_h
-            h += line_h * len(subject_lines_for(item["lesson"].subject))
-            h += 14 + chip_h
-            if clean_text(getattr(item["lesson"], "groups", "")):
-                h += 8 + _text_h(font_info)
-            progress_text, _ = progress_for_lesson(item["lesson"])
-            if progress_text:
-                h += progress_gap + progress_h
+            h += line_h * len(subject_lines_for(lesson.subject))
+            # У отменённого занятия нет ни аудитории, ни преподавателя,
+            # ни прогресса — только строка «Занятие отменено».
+            if not cancelled:
+                h += 14 + chip_h
+                if clean_text(getattr(lesson, "groups", "")):
+                    h += 8 + _text_h(font_info)
+                progress_text, _ = progress_for_lesson(lesson)
+                if progress_text:
+                    h += progress_gap + progress_h
             if item["kind"] == "changed":
                 h += 8 + detail_h * len(item["details"])
             return h
@@ -2589,17 +3104,17 @@ def render_schedule_image(
         header_extra = max(0, len(title_lines) - 1) * title_step
         header_bottom = HEADER_H + header_extra
 
-        # Бейдж «Отучились суммарно: …» для расписания группы. Ставится в
+        # Бейдж «Изучено: X ч / Y ч» для расписания группы. Ставится в
         # правый нижний угол шапки — ниже бейджа занятий и ниже заголовка,
-        # поэтому не пересекается ни с ним, ни с датой. Показывается только
-        # когда в истории завершённых пар уже накоплены минуты.
+        # поэтому не пересекается ни с ним, ни с датой. Y — динамический
+        # прогноз на учебный год при текущем темпе (см. get_study_forecast).
+        # Показывается только когда в истории уже накоплены минуты.
+        # Прогноз нужен и бейджу в шапке, и сноске внизу картинки.
+        forecast = get_study_forecast() if is_group else None
         total_pill = None
-        if is_group:
-            total_minutes = sum(subject_totals.values())
-            if total_minutes > 0:
-                total_text = (
-                    f"Отучились суммарно: {format_duration(total_minutes)}"
-                )
+        if is_group and forecast is not None:
+            if forecast.studied_minutes > 0:
+                total_text = study_badge_text(forecast)
                 total_pad_x = 26
                 total_w = font_total.getlength(total_text) + total_pad_x * 2
                 total_h = 50
@@ -2627,7 +3142,27 @@ def render_schedule_image(
             summary_y = content_top + cards_h + (36 if lessons else 0)
             content_bottom = summary_y + summary_h
 
-        footer_y = content_bottom + footer_gap
+        # Сноска про академический час — часть layout: сначала строки,
+        # потом отступ до подвала. Пары остаются вертикальным списком,
+        # картинка просто становится выше.
+        note_lines = (
+            study_note_lines(forecast) if forecast is not None else []
+        )
+        font_note = get_font(21)
+        note_gap = 34          # между контентом и сноской
+        note_line_gap = 8      # между строками сноски
+        note_line_h = _text_h(font_note)
+        note_h = (
+            len(note_lines) * note_line_h
+            + max(0, len(note_lines) - 1) * note_line_gap
+            if note_lines else 0
+        )
+        note_y = content_bottom + note_gap if note_lines else None
+
+        footer_y = (
+            note_y + note_h + 26 if note_lines
+            else content_bottom + footer_gap
+        )
         H = int(footer_y + footer_h + footer_pad_bottom)
 
         image = Image.new("RGB", (W, H), COL_BG)
@@ -2846,86 +3381,89 @@ def render_schedule_image(
                         )
                         inner_y += status_h
 
-                    # Предмет.
-                    subject = clean_text(lesson.subject) or "Предмет не указан"
-                    subj_lines = subject_lines_for(subject)
+                    # Предмет. Отменённое занятие — серым, без мета-строки.
+                    cancelled = is_placeholder_subject(lesson.subject)
+                    subj_lines = subject_lines_for(lesson.subject)
+                    subj_color = COL_MUTED if cancelled else COL_INK
                     for idx, line in enumerate(subj_lines):
                         draw.text(
                             (left, inner_y + idx * line_h),
                             line,
                             font=font_subject,
-                            fill=COL_INK,
+                            fill=subj_color,
                         )
                     inner_y += line_h * len(subj_lines)
 
-                    # Аудитория + преподаватель.
-                    inner_y += 14
-                    meta_y = inner_y
-                    room_text = (
-                        f"ауд. {lesson.room}"
-                        if clean_text(lesson.room) not in ("", "—")
-                        else "ауд. —"
-                    )
-                    room_color = COL_RED if kind == "removed" else COL_GREEN
-                    room_fill = (
-                        COL_RED_LIGHT if kind == "removed" else COL_GREEN_LIGHT
-                    )
-                    room_w = draw.textlength(room_text, font=font_info)
-                    room_chip_pad = 18
-                    room_chip_w = room_w + room_chip_pad * 2
-                    draw.rounded_rectangle(
-                        (left, meta_y,
-                         left + room_chip_w, meta_y + chip_h),
-                        radius=chip_h / 2,
-                        fill=room_fill,
-                    )
-                    draw.text(
-                        (left + room_chip_pad,
-                         meta_y + (chip_h - _text_h(font_info)) / 2),
-                        room_text,
-                        font=font_info,
-                        fill=room_color,
-                    )
-
-                    teacher = (
-                        clean_text(lesson.teacher)
-                        if clean_text(lesson.teacher) not in ("", "—")
-                        else "Преподаватель не указан"
-                    )
-                    teacher_x = left + room_chip_w + 24
-                    teacher_max_w = (x2 - inner) - teacher_x
-                    teacher = _truncate(teacher, font_info, teacher_max_w)
-                    draw.text(
-                        (teacher_x, meta_y + (chip_h - _text_h(font_info)) / 2),
-                        teacher,
-                        font=font_info,
-                        fill=COL_MUTED,
-                    )
-                    inner_y += chip_h
-
-                    # Для расписания преподавателя показываем группы пары.
-                    groups = clean_text(getattr(lesson, "groups", ""))
-                    if groups:
+                    if not cancelled:
+                        # Аудитория + преподаватель.
+                        inner_y += 14
+                        meta_y = inner_y
+                        room_text = (
+                            f"ауд. {lesson.room}"
+                            if clean_text(lesson.room) not in ("", "—")
+                            else "ауд. —"
+                        )
+                        room_color = COL_RED if kind == "removed" else COL_GREEN
+                        room_fill = (
+                            COL_RED_LIGHT if kind == "removed" else COL_GREEN_LIGHT
+                        )
+                        room_w = draw.textlength(room_text, font=font_info)
+                        room_chip_pad = 18
+                        room_chip_w = room_w + room_chip_pad * 2
+                        draw.rounded_rectangle(
+                            (left, meta_y,
+                             left + room_chip_w, meta_y + chip_h),
+                            radius=chip_h / 2,
+                            fill=room_fill,
+                        )
                         draw.text(
-                            (left, inner_y + 8),
-                            _truncate(f"Группы: {groups}", font_info, text_w),
+                            (left + room_chip_pad,
+                             meta_y + (chip_h - _text_h(font_info)) / 2),
+                            room_text,
+                            font=font_info,
+                            fill=room_color,
+                        )
+
+                        teacher = (
+                            clean_text(lesson.teacher)
+                            if clean_text(lesson.teacher) not in ("", "—")
+                            else "Преподаватель не указан"
+                        )
+                        teacher_x = left + room_chip_w + 24
+                        teacher_max_w = (x2 - inner) - teacher_x
+                        teacher = _truncate(teacher, font_info, teacher_max_w)
+                        draw.text(
+                            (teacher_x,
+                             meta_y + (chip_h - _text_h(font_info)) / 2),
+                            teacher,
                             font=font_info,
                             fill=COL_MUTED,
                         )
-                        inner_y += 8 + _text_h(font_info)
+                        inner_y += chip_h
 
-                    # Накопленный прогресс — только в карточках основной
-                    # группы. Он идёт после аудитории/преподавателя и после
-                    # списка групп, но до деталей изменения.
-                    progress_text, progress_color = progress_for_lesson(lesson)
-                    if progress_text:
-                        draw.text(
-                            (left, inner_y + progress_gap),
-                            progress_text,
-                            font=font_break,
-                            fill=progress_color,
-                        )
-                        inner_y += progress_gap + progress_h
+                        # Для расписания преподавателя показываем группы пары.
+                        groups = clean_text(getattr(lesson, "groups", ""))
+                        if groups:
+                            draw.text(
+                                (left, inner_y + 8),
+                                _truncate(f"Группы: {groups}", font_info, text_w),
+                                font=font_info,
+                                fill=COL_MUTED,
+                            )
+                            inner_y += 8 + _text_h(font_info)
+
+                        # Накопленный прогресс — только в карточках основной
+                        # группы. Он идёт после аудитории/преподавателя и
+                        # списка групп, но до деталей изменения.
+                        progress_text, progress_color = progress_for_lesson(lesson)
+                        if progress_text:
+                            draw.text(
+                                (left, inner_y + progress_gap),
+                                progress_text,
+                                font=font_break,
+                                fill=progress_color,
+                            )
+                            inner_y += progress_gap + progress_h
 
                     # Было -> стало для изменённых полей.
                     if kind == "changed":
@@ -2977,6 +3515,19 @@ def render_schedule_image(
                 )
                 tys += 34
 
+        # ---------- сноска про академический час ----------
+        # Маленький серый курсив по центру: пояснение + расчёт по
+        # обыкновенному времени. Показывается вместе с бейджем «Изучено».
+        if note_lines:
+            ny = note_y
+            for note_line in note_lines:
+                line_w = _italic_text_width(note_line, font_note)
+                _draw_italic_text(
+                    image, ((W - line_w) / 2, ny), note_line,
+                    font_note, COL_MUTED,
+                )
+                ny += note_line_h + note_line_gap
+
         # ---------- подвал ----------
         # footer_y и высота изображения посчитаны заранее: подвал не
         # накладывается на контент и не обрезается снизу.
@@ -3003,6 +3554,461 @@ def render_schedule_image(
 
     except Exception:
         logger.exception("Ошибка генерации изображения")
+        raise
+
+
+# ============================================================
+# КАРТИНКА СОСТОЯНИЯ БОТА (/status)
+# ============================================================
+
+# Старт процесса и момент последней проверки расписания монитором.
+_PROCESS_STARTED_MONOTONIC = time.monotonic()
+_LAST_SCHEDULE_CHECK: dict = {"at": None}
+
+
+def format_uptime(seconds: float) -> str:
+    """Аптайм процесса: «2 д 4 ч», «5 ч 12 мин», «48 мин», «35 с»."""
+    seconds = max(0, int(seconds or 0))
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days} д {hours} ч"
+    if hours:
+        return f"{hours} ч {minutes:02d} мин"
+    if minutes:
+        return f"{minutes} мин"
+    return f"{secs} с"
+
+
+def _read_proc_status() -> dict:
+    """Поля /proc/self/status (Linux): текущее потребление процесса."""
+    info: dict = {}
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if ":" not in line:
+                    continue
+                key, _, value = line.partition(":")
+                info[key.strip()] = value.strip()
+    except OSError:
+        return {}
+    return info
+
+
+def _process_cpu_seconds() -> Optional[float]:
+    """Процессорное время процесса (utime+stime) в секундах."""
+    try:
+        with open("/proc/self/stat", "r", encoding="utf-8", errors="replace") as fh:
+            stat = fh.read()
+        # Поле comm может содержать пробелы и скобки — режем по последней «)».
+        end = stat.rfind(")")
+        fields = stat[end + 1:].split()
+        utime, stime = int(fields[11]), int(fields[12])
+        try:
+            clk = os.sysconf("SC_CLK_TCK")
+        except (ValueError, OSError):
+            clk = 100
+        if clk <= 0:
+            clk = 100
+        return (utime + stime) / clk
+    except (OSError, ValueError, IndexError):
+        # Запасной путь для Unix-систем без /proc.
+        try:
+            import resource
+
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            return usage.ru_utime + usage.ru_stime
+        except Exception:
+            return None
+
+
+def get_runtime_stats() -> dict:
+    """Текущее потребление ресурсов процессом — только факт, без лимитов."""
+    uptime = max(0.0, time.monotonic() - _PROCESS_STARTED_MONOTONIC)
+    status = _read_proc_status()
+
+    rss_kb: Optional[int] = None
+    match = re.search(r"(\d+)\s*kB", status.get("VmRSS", ""))
+    if match:
+        rss_kb = int(match.group(1))
+
+    threads: Optional[int] = None
+    if status.get("Threads", "").isdigit():
+        threads = int(status["Threads"])
+    if threads is None:
+        threads = threading.active_count()
+
+    cpu_seconds = _process_cpu_seconds()
+    cpu_percent: Optional[float] = None
+    # Средняя загрузка ЦП с момента запуска — устойчивая характеристика
+    # того, сколько бот потребляет сейчас; на старте процесса проценты
+    # нестабильны, поэтому первые секунды показываем только время ЦП.
+    if cpu_seconds is not None and uptime >= 10:
+        cpu_percent = min(999.0, cpu_seconds / uptime * 100)
+
+    return {
+        "uptime_seconds": uptime,
+        "cpu_seconds": cpu_seconds,
+        "cpu_percent": cpu_percent,
+        "rss_kb": rss_kb,
+        "threads": threads,
+    }
+
+
+def format_size(size_bytes: int) -> str:
+    """«132 КБ» / «1,2 МБ»."""
+    size = max(0, int(size_bytes or 0))
+    if size >= 1024 * 1024:
+        return f"{size / 1024 / 1024:.1f}".replace(".", ",") + " МБ"
+    if size >= 1024:
+        return f"{round(size / 1024)} КБ"
+    return f"{size} Б"
+
+
+def _database_stats() -> dict:
+    """Размер БД (с WAL) и количество накопленных записей."""
+    total = 0
+    try:
+        if DB_PATH.exists():
+            total = DB_PATH.stat().st_size
+        for suffix in ("-wal", "-shm"):
+            extra = DB_PATH.parent / (DB_PATH.name + suffix)
+            try:
+                total += extra.stat().st_size
+            except OSError:
+                pass
+    except OSError:
+        total = 0
+
+    lesson_rows = subjects = 0
+    try:
+        with db_connect() as conn:
+            lesson_rows = int(
+                conn.execute("SELECT COUNT(*) FROM lesson_history").fetchone()[0]
+            )
+            subjects = int(
+                conn.execute("SELECT COUNT(*) FROM subjects").fetchone()[0]
+            )
+    except Exception:
+        logger.exception("Ошибка статистики БД")
+    return {"size_bytes": total, "lesson_rows": lesson_rows, "subjects": subjects}
+
+
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    count = abs(int(count))
+    if count % 10 == 1 and count % 100 != 11:
+        return one
+    if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14:
+        return few
+    return many
+
+
+def render_status_image(chat_id: int) -> Path:
+    """PNG «Состояние бота» в дизайне картинки расписания.
+
+    Внутри — подписки (функции прежнего текстового /status), прогресс
+    учёбы с прогнозом и текущее потребление ресурсов процессом.
+    Максимумы/лимиты ресурсов намеренно не показываются — только то,
+    что бот использует сейчас.
+    """
+    try:
+        forecast = get_study_forecast()
+        runtime = get_runtime_stats()
+        db_stats = _database_stats()
+        created = subscriber_info(chat_id)
+        subscribers_total = len(load_subscribers())
+
+        # Шрифты
+        font_label = get_font(24, bold=True)
+        font_group = get_font(72, bold=True)
+        font_date = get_font(30)
+        font_title = get_font(26, bold=True)
+        font_big = get_font(40, bold=True)
+        font_key = get_font(26)
+        font_value = get_font(26, bold=True)
+        font_small = get_font(24)
+        font_footer = get_font(24)
+
+        # Геометрия — та же сетка, что у картинки расписания.
+        W = IMAGE_WIDTH
+        MARGIN = 58
+        x1, x2 = MARGIN, W - MARGIN
+        inner = 48
+        left = x1 + inner
+        right = x2 - inner
+        HEADER_H = 250
+        card_gap = 28
+        row_h = 44
+        row_gap = 12
+        title_gap = 26
+        card_top = 34
+        card_bottom = 38
+        bar_h = 22
+        bar_gap_top = 16
+        bar_gap_bottom = 24
+
+        now = now_local()
+
+        # ---------- карточка «Учёба» ----------
+        study_headline = study_badge_text(forecast)
+        if forecast.studied_minutes <= 0:
+            study_note = "Прогноз появится после первых завершённых занятий"
+        elif not forecast.remaining_minutes:
+            study_note = "Учебный год завершён"
+        else:
+            study_note = ""
+
+        study_rows = []
+        if forecast.remaining_minutes:
+            study_rows.append(
+                ("Прогноз на учебный год",
+                 f"≈ {format_academic_hours(forecast.total_minutes)}")
+            )
+            study_rows.append(
+                ("Осталось при текущем темпе",
+                 f"≈ {format_academic_hours(forecast.remaining_minutes)}")
+            )
+            if forecast.pace_minutes_per_day:
+                study_rows.append(
+                    ("Темп",
+                     f"≈ {format_academic_hours(int(round(forecast.pace_minutes_per_day)))}"
+                     " в учебный день")
+                )
+        study_rows.append(
+            ("Учебные дни (с 1 сентября по 30 июня)",
+             f"пройдено {forecast.elapsed_study_days}"
+             f" · осталось {forecast.remaining_study_days}")
+        )
+        if forecast.elapsed_study_days:
+            study_rows.append(
+                ("Дней с занятиями",
+                 f"{forecast.active_days} из {forecast.elapsed_study_days}")
+            )
+
+        # ---------- карточка «Ресурсы» ----------
+        res_rows = [("Аптайм", format_uptime(runtime["uptime_seconds"]))]
+        if runtime["cpu_percent"] is not None:
+            res_rows.append(
+                ("ЦП (в среднем с запуска)",
+                 f"{runtime['cpu_percent']:.1f}".replace(".", ",") + " %")
+            )
+        elif runtime["cpu_seconds"] is not None:
+            res_rows.append(("ЦП (накоплено)", f"{runtime['cpu_seconds']:.1f} с"))
+        if runtime["rss_kb"] is not None:
+            res_rows.append(
+                ("Память (RSS)", f"{round(runtime['rss_kb'] / 1024)} МБ")
+            )
+        if runtime["threads"] is not None:
+            res_rows.append(("Потоки", str(runtime["threads"])))
+        res_rows.append(("База данных", format_size(db_stats["size_bytes"])))
+        res_rows.append(
+            ("История занятий",
+             f"{db_stats['lesson_rows']} "
+             f"{_plural(db_stats['lesson_rows'], 'запись', 'записи', 'записей')}"
+             f" · {db_stats['subjects']} "
+             f"{_plural(db_stats['subjects'], 'предмет', 'предмета', 'предметов')}")
+        )
+
+        # ---------- карточка «Подписки» ----------
+        sub_rows = []
+        if created:
+            sub_rows.append(("Этот чат", f"подписан · с {created}"))
+        else:
+            sub_rows.append(("Этот чат", "не подписан"))
+        sub_rows.append(("Всего подписок", str(subscribers_total)))
+        sub_rows.append(
+            ("Проверка изменений", f"каждые {CHECK_INTERVAL // 60} мин")
+        )
+        last_check = _LAST_SCHEDULE_CHECK.get("at")
+        sub_rows.append(
+            ("Последняя проверка",
+             last_check.strftime("%d.%m %H:%M") if last_check else "—")
+        )
+        sub_rows.append(("Часовой пояс", f"{TIMEZONE} (UTC+5)"))
+
+        # ---------- размеры карточек ----------
+        def card_height(title: str, rows: list, *, big: str = "",
+                        note: str = "", bar: bool = False) -> int:
+            height = card_top + _text_h(font_title) + title_gap
+            if big:
+                height += _text_h(font_big) + 18
+            if bar:
+                height += bar_gap_top + bar_h + bar_gap_bottom
+            if note:
+                height += _text_h(font_small) + 10
+            height += len(rows) * row_h + max(0, len(rows) - 1) * row_gap
+            return height + card_bottom
+
+        show_bar = forecast.total_minutes > 0 and forecast.studied_minutes > 0
+        cards = [
+            ("УЧЁБА", study_rows,
+             {"big": study_headline, "note": study_note, "bar": show_bar}),
+            ("РЕСУРСЫ · СЕЙЧАС", res_rows, {}),
+            ("ПОДПИСКИ И УВЕДОМЛЕНИЯ", sub_rows, {}),
+        ]
+        heights = [card_height(t, r, **kw) for t, r, kw in cards]
+        content_top = HEADER_H + 36
+        content_bottom = content_top + sum(heights) \
+            + max(0, len(cards) - 1) * card_gap + 8
+
+        # Сноска про академический час — та же, что на картинке
+        # расписания: единая точка формирования study_note_lines().
+        note_lines = study_note_lines(forecast)
+        font_note = get_font(21)
+        note_gap = 34
+        note_line_gap = 8
+        note_line_h = _text_h(font_note)
+        note_h = (
+            len(note_lines) * note_line_h
+            + max(0, len(note_lines) - 1) * note_line_gap
+            if note_lines else 0
+        )
+        note_y = content_bottom + note_gap if note_lines else None
+
+        footer_text = "ИНК · расписание"
+        footer_h = _text_h(font_footer)
+        footer_gap = 44
+        footer_pad_bottom = 40
+        footer_y = (
+            note_y + note_h + 26 if note_lines
+            else content_bottom + footer_gap
+        )
+        H = int(footer_y + footer_h + footer_pad_bottom)
+
+        image = Image.new("RGB", (W, H), COL_BG)
+        draw = ImageDraw.Draw(image)
+
+        # ---------- шапка (как у расписания) ----------
+        draw.rectangle((0, 0, W, HEADER_H), fill=COL_WHITE)
+        draw.rectangle((0, 0, 14, HEADER_H), fill=COL_ACCENT)
+        draw.text((MARGIN + 20, 40), "СОСТОЯНИЕ БОТА",
+                  font=font_label, fill=COL_ACCENT)
+
+        big_title = GROUP_NAME
+        big_font = font_group
+        chip_text = "РАБОТАЕТ"
+        chip_pad_x = 26
+        chip_w = font_label.getlength(chip_text) + chip_pad_x * 2
+        chip_h = 54
+        chip_x = W - MARGIN - chip_w
+        title_max_w = (chip_x - 24) - (MARGIN + 20)
+        if big_font.getlength(big_title) > title_max_w:
+            for size in (64, 56, 48, 44, 40, 36, 32, 28, 24):
+                candidate = get_font(size, bold=True)
+                if candidate.getlength(big_title) <= title_max_w:
+                    big_font = candidate
+                    break
+        draw.text((MARGIN + 20, 84), big_title, font=big_font, fill=COL_INK)
+        draw.text(
+            (MARGIN + 22, 186),
+            f"{format_date_header(now.date())} · {now.strftime('%H:%M')}",
+            font=font_date,
+            fill=COL_MUTED,
+        )
+
+        # Зелёный бейдж «РАБОТАЕТ» в правом верхнем углу.
+        draw.rounded_rectangle(
+            (chip_x, 48, chip_x + chip_w, 48 + chip_h),
+            radius=chip_h / 2,
+            fill=COL_GREEN_LIGHT,
+        )
+        draw.text(
+            (chip_x + chip_pad_x, 48 + (chip_h - _text_h(font_label)) // 2),
+            chip_text,
+            font=font_label,
+            fill=COL_GREEN,
+        )
+
+        # ---------- карточки ----------
+        y = content_top
+        for (title, rows, kwargs), height in zip(cards, heights):
+            # тень + карточка — в стилистике пар расписания
+            draw.rounded_rectangle(
+                (x1 + 6, y + 8, x2 + 6, y + height + 8),
+                radius=30,
+                fill="#E6EAF3",
+            )
+            draw.rounded_rectangle(
+                (x1, y, x2, y + height),
+                radius=30,
+                fill=COL_WHITE,
+                outline=COL_BORDER,
+                width=2,
+            )
+
+            inner_y = y + card_top
+            draw.text((left, inner_y), title, font=font_title, fill=COL_ACCENT)
+            inner_y += _text_h(font_title) + title_gap
+
+            if kwargs.get("big"):
+                draw.text((left, inner_y), kwargs["big"],
+                          font=font_big, fill=COL_INK)
+                inner_y += _text_h(font_big) + 18
+
+            if kwargs.get("bar"):
+                inner_y += bar_gap_top
+                track_w = right - left
+                draw.rounded_rectangle(
+                    (left, inner_y, right, inner_y + bar_h),
+                    radius=bar_h / 2,
+                    fill=COL_ACCENT_LIGHT,
+                )
+                share = min(
+                    1.0, forecast.studied_minutes / forecast.total_minutes
+                )
+                fill_w = max(6, int(track_w * share))
+                draw.rounded_rectangle(
+                    (left, inner_y, left + fill_w, inner_y + bar_h),
+                    radius=bar_h / 2,
+                    fill=COL_ACCENT,
+                )
+                inner_y += bar_h + bar_gap_bottom
+
+            if kwargs.get("note"):
+                draw.text((left, inner_y), kwargs["note"],
+                          font=font_small, fill=COL_MUTED)
+                inner_y += _text_h(font_small) + 10
+
+            for key_text, value_text in rows:
+                draw.text((left, inner_y), key_text,
+                          font=font_key, fill=COL_MUTED)
+                value_w = draw.textlength(value_text, font=font_value)
+                draw.text((right - value_w, inner_y), value_text,
+                          font=font_value, fill=COL_INK)
+                inner_y += row_h + row_gap
+
+            y += height + card_gap
+
+        # ---------- сноска про академический час ----------
+        if note_lines:
+            ny = note_y
+            for note_line in note_lines:
+                line_w = _italic_text_width(note_line, font_note)
+                _draw_italic_text(
+                    image, ((W - line_w) / 2, ny), note_line,
+                    font_note, COL_MUTED,
+                )
+                ny += note_line_h + note_line_gap
+
+        # ---------- подвал ----------
+        draw.text(
+            (x2 - draw.textlength(footer_text, font=font_footer), footer_y),
+            footer_text,
+            font=font_footer,
+            fill=COL_FOOTER,
+        )
+
+        filename = (
+            f"status_{now.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.png"
+        )
+        path = IMAGE_DIR / filename
+        image.save(path, "PNG", optimize=True)
+        logger.info("Изображение статуса сохранено: %s (%sx%s)", path, W, H)
+        return path
+
+    except Exception:
+        logger.exception("Ошибка генерации изображения статуса")
         raise
 
 
@@ -3348,8 +4354,10 @@ async def _handle_staff_request(destination, request: ScheduleTextRequest) -> No
 
 
 async def _status_text(chat_id: int) -> str:
+    """Текстовый fallback картинки статуса (если PNG не сгенерировался)."""
     created = subscriber_info(chat_id)
     total = len(load_subscribers())
+    forecast = get_study_forecast()
     lines = [
         f"📚 <b>{GROUP_NAME}</b>",
         "—" * 18,
@@ -3362,7 +4370,67 @@ async def _status_text(chat_id: int) -> str:
     lines.append(f"Всего подписок: <b>{total}</b>")
     lines.append(f"Проверка изменений каждые {CHECK_INTERVAL // 60} мин.")
     lines.append(f"Часовой пояс: <b>{TIMEZONE}</b> (UTC+5)")
+    if forecast.studied_minutes > 0:
+        lines.append(f"📖 {study_badge_text(forecast)}")
+        lines.append(f"По обыкновенному времени: {regular_study_time_text(forecast)}")
+        if forecast.remaining_minutes:
+            lines.append(
+                "Осталось при текущем темпе: "
+                f"<b>≈ {format_academic_hours(forecast.remaining_minutes)}</b>"
+            )
+        lines.append(f"<i>{STUDY_NOTE_EXPLANATION}</i>")
+    lines.append(
+        f"⏱ Аптайм: {format_uptime(time.monotonic() - _PROCESS_STARTED_MONOTONIC)}"
+    )
     return "\n".join(lines)
+
+
+def _status_caption() -> str:
+    """Короткая подпись к картинке статуса."""
+    forecast = get_study_forecast()
+    lines = [f"🤖 <b>Статус бота</b> · 📚 <b>{GROUP_NAME}</b>"]
+    if forecast.studied_minutes > 0:
+        lines.append(f"📖 {study_badge_text(forecast)}")
+    lines.append(
+        "⏱ Аптайм: "
+        f"{format_uptime(time.monotonic() - _PROCESS_STARTED_MONOTONIC)}"
+    )
+    return "\n".join(lines)
+
+
+async def _send_status(destination) -> None:
+    """Отправляет картинку состояния бота; при сбое — текстовый fallback."""
+    # Message-подобный объект имеет .chat, CallbackQuery — только .message.
+    chat = getattr(destination, "chat", None)
+    if chat is not None:
+        chat_id = chat.id
+    else:
+        chat_id = destination.message.chat.id
+    caption = _status_caption()
+    path = None
+    try:
+        path = render_status_image(chat_id)
+    except Exception:
+        logger.exception("Не удалось сгенерировать картинку статуса")
+
+    if path is not None:
+        try:
+            if chat is not None:
+                await destination.answer_photo(FSInputFile(path),
+                                               caption=caption)
+            else:
+                await destination.message.answer_photo(FSInputFile(path),
+                                                       caption=caption)
+            return
+        except Exception:
+            logger.exception("Не удалось отправить картинку статуса")
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    await _send_text(destination, await _status_text(chat_id))
 
 
 # ============================================================
@@ -3549,7 +4617,7 @@ async def cmd_unsubscribe(message: Message):
 
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
-    await message.answer(await _status_text(message.chat.id))
+    await _send_status(message)
 
 
 # ============================================================
@@ -3707,7 +4775,7 @@ async def cb_unsubscribe(callback: CallbackQuery):
 @dp.callback_query(F.data == "status")
 async def cb_status(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.answer(await _status_text(callback.message.chat.id))
+    await _send_status(callback.message)
 
 
 @dp.callback_query(F.data == "date")
@@ -4050,7 +5118,7 @@ def _format_change_text(change) -> str:
         new = change.new or {}
         return (
             f"🟢 <b>Добавлено:</b> {label}\n"
-            f"{clean_text(new.get('subject') or 'Предмет не указан')}"
+            f"{display_subject_text(new.get('subject'))}"
             + (
                 f", {clean_text(new.get('room') or '—')}"
                 if new.get("room")
@@ -4061,7 +5129,7 @@ def _format_change_text(change) -> str:
         old = change.old or {}
         return (
             f"🔴 <b>Удалено:</b> {label}\n"
-            f"{clean_text(old.get('subject') or 'Предмет не указан')}"
+            f"{display_subject_text(old.get('subject'))}"
             + (
                 f", {clean_text(old.get('room') or '—')}"
                 if old.get("room")
@@ -4074,6 +5142,10 @@ def _format_change_text(change) -> str:
         field_label = detail.get("label") or detail.get("field", "")
         old_val = clean_text(detail.get("old", ""))
         new_val = clean_text(detail.get("new", ""))
+        if detail.get("field") == "subject" or field_label == "Предмет":
+            # Отмена занятия показывается словами, а не точками сайта.
+            old_val = display_subject_text(old_val) if old_val else old_val
+            new_val = display_subject_text(new_val) if new_val else new_val
         lines.append(
             f"• {field_label}: {old_val or '—'} → {new_val or '—'}"
         )
@@ -4368,6 +5440,13 @@ async def schedule_monitor(bot: Bot) -> None:
 
     birthday_checked_dates: set[str] = set()
     while True:
+        # Разовый пересчёт изученного времени после миграции истории на
+        # запись по подгруппам (срабатывает один раз, дальше — пустой флаг).
+        try:
+            await recalculate_study_history()
+        except Exception:
+            logger.exception("Ошибка разового пересчёта истории занятий")
+
         # История запускается в существующем scheduler, а не во втором
         # независимом фоне. Уже обработанные даты пропускаются по БД.
         try:
@@ -4397,6 +5476,9 @@ async def schedule_monitor(bot: Bot) -> None:
                     birthday_checked_dates.add(today.isoformat())
             except Exception:
                 logger.exception("Ошибка скрытой ежедневной проверки")
+
+        # Момент завершения цикла — для «Последняя проверка» в /status.
+        _LAST_SCHEDULE_CHECK["at"] = now_local()
 
         await asyncio.sleep(CHECK_INTERVAL)
 

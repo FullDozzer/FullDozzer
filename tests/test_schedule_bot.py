@@ -7,6 +7,7 @@
 
 import asyncio
 import os
+import sqlite3
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
@@ -675,13 +676,19 @@ class TestMonitoring(DBTestCase):
 
     def test_tomorrow_checked_independently(self):
         bot.subscribe_user(1001)
-        tomorrow = bot.get_tomorrow()
+        # Фиксируем «сейчас»: тест не должен зависеть от перехода через
+        # полночь между получением tomorrow и проверкой даты монитором.
+        with mock.patch.object(
+            bot, "now_local",
+            return_value=datetime(2026, 9, 11, 15, 0, 0),
+        ):
+            tomorrow = bot.get_tomorrow()
 
-        async def fake_get_schedule(day):
-            return make_schedule(day, "Завтрашний предмет")
+            async def fake_get_schedule(day):
+                return make_schedule(day, "Завтрашний предмет")
 
-        with mock.patch.object(bot, "get_schedule", fake_get_schedule):
-            run(bot._check_date(self.bot, tomorrow))
+            with mock.patch.object(bot, "get_schedule", fake_get_schedule):
+                run(bot._check_date(self.bot, tomorrow))
         self.assertEqual(len(self.bot.sent), 1)
         self.assertIn("Завтра", self.bot.sent[0][2])
         self.assertIn(bot.format_date_full(tomorrow), self.bot.sent[0][2])
@@ -727,8 +734,6 @@ class TestMonitoring(DBTestCase):
         """Один цикл монитора: сегодня и завтра без дублей."""
         bot.subscribe_user(1001)
         fake_bot = FakeBot()
-        today = bot.get_today()
-        tomorrow = bot.get_tomorrow()
 
         class StopLoop(Exception):
             pass
@@ -743,20 +748,23 @@ class TestMonitoring(DBTestCase):
         async def fake_get_schedule(day):
             return make_schedule(day, "Предмет")
 
-        with mock.patch.object(bot, "get_schedule", fake_get_schedule), \
+        # Фиксируем «сейчас»: даты внутри монитора не должны отличаться
+        # от дат в проверках, даже если тест запущен у полуночи.
+        with mock.patch.object(
+            bot, "now_local", return_value=datetime(2026, 9, 11, 15, 0, 0)
+        ), mock.patch.object(bot, "get_schedule", fake_get_schedule), \
              mock.patch.object(bot, "render_schedule_image",
                                return_value=Path("/tmp/x.png")), \
              mock.patch("asyncio.sleep", fake_sleep):
+            today = bot.get_today()
+            tomorrow = bot.get_tomorrow()
             with self.assertRaises(StopLoop):
                 run(bot.schedule_monitor(fake_bot))
 
-        # Сегодня воскресенье (если так) -> пропуск; завтра -> уведомление.
-        if bot.is_day_off(today):
-            self.assertEqual(len(fake_bot.sent), 1)
-            self.assertIn("Завтра", fake_bot.sent[0][2])
-            self.assertIn(tomorrow.isoformat(), bot.load_state())
-        else:
+            # Сегодня (2026-09-11, пятница) и завтра -> оба уведомления.
+            self.assertFalse(bot.is_day_off(today))
             self.assertGreaterEqual(len(fake_bot.sent), 1)
+            self.assertIn("Завтра", fake_bot.sent[-1][2])
             self.assertIn(tomorrow.isoformat(), bot.load_state())
 
     def test_sunday_skipped(self):
@@ -875,6 +883,127 @@ def lesson(
         end=end,
         subgroup=subgroup,
     )
+
+
+def study_day_schedule(day, pairs):
+    """Schedule из спецификации пар: [(pair, start, end, [lessons])].
+
+    lessons — список bot.Lesson (обычно 1 занятие или 2-3 подгруппы).
+    """
+    lessons = []
+    for pair_number, start, end, pair_lessons in pairs:
+        lessons.extend(pair_lessons)
+    return bot.Schedule(date=day, group=bot.GROUP_NAME, lessons=lessons)
+
+
+def site_september_2026():
+    """Реальное расписание ЭС7-24 на 1-11 сентября 2026 (данные сайта).
+
+    Итог по минутам: 180 + 320 + 400 + 320 + 320 + 240 + 240 + 320 + 320
+    = 2660 минут (44 ч 20 мин). Пара II 7 сентября — две подгруппы
+    «Ин.яз.»; пара IV 11 сентября — подгруппа 1 «Ин.яз в проф», а у
+    подгруппы 2 пара ОТМЕНЕНА («~..............»: подгруппа уходит
+    домой, занятие не проводится и в историю не пишется).
+    """
+    def one(pair, start, end, subject, room, teacher):
+        return lesson(pair, None, subject, room, teacher, start, end)
+
+    return {
+        date(2026, 9, 1): [
+            ("III", "10:50", "11:50",
+             [one("III", "10:50", "11:50", "кл.час", "УК202", "Мукалляпова А.И.")]),
+            ("IV", "12:00", "13:00",
+             [one("IV", "12:00", "13:00", "НГПО", "ПК217", "Степанов С.В.")]),
+            ("V", "13:15", "14:15",
+             [one("V", "13:15", "14:15", "Разраб н/г мест", "УК105", "Дроздов А.П.")]),
+        ],
+        date(2026, 9, 2): [
+            ("I", "08:30", "09:50",
+             [one("I", "08:30", "09:50", "Основы экономик", "УК303", "Кильдиярова Г.Р.")]),
+            ("II", "10:00", "11:20",
+             [one("II", "10:00", "11:20", "Основы экономик", "УК303", "Кильдиярова Г.Р.")]),
+            ("III", "11:35", "12:55",
+             [one("III", "11:35", "12:55", "Экспл Н/Г мест", "УК103", "Дроздов А.П.")]),
+            ("IV", "13:25", "14:45",
+             [one("IV", "13:25", "14:45", "Экспл Н/Г мест", "УК103", "Дроздов А.П.")]),
+        ],
+        date(2026, 9, 3): [
+            ("I", "08:30", "09:50",
+             [one("I", "08:30", "09:50", "Экспл Н/Г мест", "УК107", "Дроздов А.П.")]),
+            ("II", "10:00", "11:20",
+             [one("II", "10:00", "11:20", "Тек (под) рем", "ПК107", "Зубайдуллин З.Ш.")]),
+            ("III", "11:35", "12:55",
+             [one("III", "11:35", "12:55", "Основы экономик", "УК303", "Кильдиярова Г.Р.")]),
+            ("IV", "13:25", "14:45",
+             [one("IV", "13:25", "14:45", "Экспл Н/Г мест", "УК107", "Дроздов А.П.")]),
+            ("V", "14:55", "16:15",
+             [one("V", "14:55", "16:15", "НГПО", "ПК217", "Степанов С.В.")]),
+        ],
+        date(2026, 9, 4): [
+            ("I", "08:30", "09:50",
+             [one("I", "08:30", "09:50", "Пром безопас", "ПК108", "Гайзуллин И.Т.")]),
+            ("II", "10:00", "11:20",
+             [one("II", "10:00", "11:20", "Пожарная безоп", "ПК206", "Фахретдинов Р.Ф.")]),
+            ("III", "11:35", "12:55",
+             [one("III", "11:35", "12:55", "Экспл Н/Г мест", "ПК102", "Дроздов А.П.")]),
+            ("IV", "13:25", "14:45",
+             [one("IV", "13:25", "14:45", "Экспл Н/Г мест", "ПК102", "Дроздов А.П.")]),
+        ],
+        date(2026, 9, 7): [
+            ("I", "08:30", "09:50",
+             [one("I", "08:30", "09:50", "Химия Н и Г", "УК307", "Арнаутова А.В.")]),
+            ("II", "10:00", "11:20", [
+                lesson("II", "1", "Ин.яз.", "ПК103", "Мурзабулатова Ф.Ф.",
+                       "10:00", "11:20"),
+                lesson("II", "2", "Ин.яз.", "ПК303", "Амирханова Г.А.",
+                       "10:00", "11:20"),
+            ]),
+            ("III", "11:35", "12:55",
+             [one("III", "11:35", "12:55", "НГПО", "ПК217", "Степанов С.В.")]),
+            ("IV", "13:25", "14:45",
+             [one("IV", "13:25", "14:45", "Пром безопас", "ПК201", "Гайзуллин И.Т.")]),
+        ],
+        date(2026, 9, 8): [
+            ("I", "08:30", "09:50",
+             [one("I", "08:30", "09:50", "НГПО", "ПК217", "Степанов С.В.")]),
+            ("II", "10:00", "11:20",
+             [one("II", "10:00", "11:20", "НГПО", "ПК217", "Степанов С.В.")]),
+            ("III", "11:35", "12:55",
+             [one("III", "11:35", "12:55", "Физ-ра", "бол зал 2", "Кинзябаев А.И.")]),
+        ],
+        date(2026, 9, 9): [
+            ("I", "08:30", "09:50",
+             [one("I", "08:30", "09:50", "Основы экономик", "УК303", "Кильдиярова Г.Р.")]),
+            ("II", "10:00", "11:20",
+             [one("II", "10:00", "11:20", "Основы экономик", "УК303", "Кильдиярова Г.Р.")]),
+            ("III", "11:35", "12:55",
+             [one("III", "11:35", "12:55", "Тек (под) рем", "ПК218", "Зубайдуллин З.Ш.")]),
+        ],
+        date(2026, 9, 10): [
+            ("I", "08:30", "09:50",
+             [one("I", "08:30", "09:50", "НГПО", "ПК217", "Степанов С.В.")]),
+            ("II", "10:00", "11:20",
+             [one("II", "10:00", "11:20", "НГПО", "ПК217", "Степанов С.В.")]),
+            ("III", "11:35", "12:55",
+             [one("III", "11:35", "12:55", "Основы экономик", "УК303", "Кильдиярова Г.Р.")]),
+            ("IV", "13:25", "14:45",
+             [one("IV", "13:25", "14:45", "Тек (под) рем", "ПК218", "Зубайдуллин З.Ш.")]),
+        ],
+        date(2026, 9, 11): [
+            ("I", "08:30", "09:50",
+             [one("I", "08:30", "09:50", "Пожарная безоп", "ПК102", "Фахретдинов Р.Ф.")]),
+            ("II", "10:00", "11:20",
+             [one("II", "10:00", "11:20", "Химия Н и Г", "УК303", "Арнаутова А.В.")]),
+            ("III", "11:35", "12:55",
+             [one("III", "11:35", "12:55", "Химия Н и Г", "УК303", "Арнаутова А.В.")]),
+            ("IV", "13:25", "14:45", [
+                lesson("IV", "1", "Ин.яз в проф", "ПК103",
+                       "Мурзабулатова Ф.Ф.", "13:25", "14:45"),
+                lesson("IV", "2", "~..............", "—", "—",
+                       "13:25", "14:45"),
+            ]),
+        ],
+    }
 
 
 class TestSubgroupParsing(unittest.TestCase):
@@ -1213,8 +1342,79 @@ class TestLessonCount(unittest.TestCase):
         self.assertNotIn("Занятий: 5", caption)
 
 
+class TestCancelledLessonRendering(unittest.TestCase):
+    """Отмена занятия («~..............») на картинке расписания."""
+
+    GREEN = (14, 159, 95)
+    GREEN_LIGHT = (229, 246, 237)
+    MUTED = (100, 116, 139)
+
+    def cancelled_schedule(self):
+        return bot.Schedule(
+            date=date(2026, 9, 11),
+            group=bot.GROUP_NAME,
+            lessons=[
+                lesson("IV", "2", "~..............", "—", "—",
+                       "13:25", "14:45"),
+            ],
+        )
+
+    def color_rows(self, path, color):
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            return [
+                y for y in range(300, im.height)
+                if any(px[x, y] == color for x in range(100, im.width - 40, 2))
+            ]
+
+    def test_cancelled_block_has_no_room_chip_and_shows_muted_text(self):
+        path = bot.render_schedule_image(self.cancelled_schedule())
+        # У отменённого занятия нет чипа аудитории (зелёного) вообще…
+        self.assertEqual(self.color_rows(path, self.GREEN), [])
+        self.assertEqual(self.color_rows(path, self.GREEN_LIGHT), [])
+        # …но есть серая надпись «Занятие отменено».
+        muted = self.color_rows(path, self.MUTED)
+        self.assertTrue(muted, "надпись «Занятие отменено» не найдена")
+
+    def test_cancelled_block_is_compact(self):
+        """Блок без аудитории/преподавателя короче обычного блока."""
+        cancelled = bot.render_schedule_image(self.cancelled_schedule())
+        # Другая дата -> другой файл: рендер не перезапишет первую картинку.
+        normal = bot.render_schedule_image(bot.Schedule(
+            date=date(2026, 9, 10),
+            group=bot.GROUP_NAME,
+            lessons=[lesson("IV", "2", "Ин.яз в проф", "ПК103",
+                            "Мурзабулатова Ф.Ф.", "13:25", "14:45")],
+        ))
+        with Image.open(cancelled) as a, Image.open(normal) as b:
+            self.assertLess(a.size[1], b.size[1])
+
+    def test_cancellation_in_change_notification_text(self):
+        """Уведомление об отмене — словами, без «~..............»."""
+        old = bot.Schedule(date=date(2026, 9, 11), group=bot.GROUP_NAME,
+                           lessons=[lesson("IV", "1", "Ин.яз в проф")])
+        new = bot.Schedule(date=date(2026, 9, 11), group=bot.GROUP_NAME,
+                           lessons=[lesson("IV", "1", "~..............")])
+        changes = bot.compare_schedules(old, new)
+        self.assertTrue(changes)
+        text = bot._format_change_text(changes[0])
+        self.assertIn("Занятие отменено", text)
+        self.assertNotIn("~", text)
+        summary = "\n".join(bot._change_summary_lines(changes))
+        self.assertIn("Занятие отменено", summary)
+        self.assertNotIn("~", summary)
+
+
 class TestImageLayoutFixes(unittest.TestCase):
     """Разметка картинки: блок «перемена» и подвал."""
+
+    def test_schedule_image_width(self):
+        """Картинки широкие (1280 — максимум Telegram по стороне)."""
+        self.assertEqual(bot.IMAGE_WIDTH, 1280)
+        path = bot.render_schedule_image(empty_schedule(date(2026, 9, 8)))
+        with Image.open(path) as img:
+            self.assertEqual(img.size[0], bot.IMAGE_WIDTH)
 
     BG = (243, 245, 250)
 
@@ -1317,7 +1517,7 @@ class TestImageLayoutFixes(unittest.TestCase):
 
 
 class TestTotalStudyBadge(DBTestCase):
-    """Бейдж «Отучились суммарно» в шапке картинки и подсчёт минут истории."""
+    """Бейдж «Изучено: X ч / Y ч» в шапке картинки и подсчёт минут истории."""
 
     ACCENT_LIGHT = (236, 236, 251)  # hex COL_ACCENT_LIGHT ("#ECECFB")
     GREEN = (14, 159, 95)            # hex COL_GREEN
@@ -1342,7 +1542,7 @@ class TestTotalStudyBadge(DBTestCase):
             return [
                 y for y in range(y0, y1)
                 if any(px[x, y] == self.ACCENT_LIGHT
-                       for x in range(x0, 1040, 2))
+                       for x in range(x0, im.width - 40, 2))
             ]
 
     def color_rows(self, path, color, y0=520):
@@ -1352,7 +1552,7 @@ class TestTotalStudyBadge(DBTestCase):
             px = im.load()
             return [
                 y for y in range(y0, im.height)
-                if any(px[x, y] == color for x in range(100, 980))
+                if any(px[x, y] == color for x in range(100, im.width - 40))
             ]
 
     def color_clusters(self, rows):
@@ -1499,6 +1699,1035 @@ class TestTotalStudyBadge(DBTestCase):
         )
         path = bot.render_schedule_image(staff)
         self.assertEqual(self.badge_rows(path), [])
+
+
+class StudyDBTestCase(DBTestCase):
+    """База тестов истории учёбы: чистые lesson_*-таблицы и bot_meta."""
+
+    def setUp(self):
+        super().setUp()
+        self._clean_study_tables()
+
+    def tearDown(self):
+        self._clean_study_tables()
+        super().tearDown()
+
+    def _clean_study_tables(self):
+        with bot.db_connect() as conn:
+            conn.execute("DELETE FROM lesson_history")
+            conn.execute("DELETE FROM subjects")
+            conn.execute("DELETE FROM lesson_backfill_days")
+            conn.execute("DELETE FROM bot_meta")
+            conn.execute(
+                "INSERT INTO bot_meta (key, value) VALUES ('schema_version', ?)",
+                (str(bot.SCHEMA_VERSION),),
+            )
+
+
+class TestSubgroupStudyTime(StudyDBTestCase):
+    """Время подгрупп: строка на подгруппу, общая сумма — пара один раз."""
+
+    def record(self, schedule, current=None):
+        with mock.patch.object(
+            bot, "get_academic_year_start", return_value=date(2026, 9, 1)
+        ):
+            return bot.record_completed_lessons(
+                schedule, current or datetime(2026, 9, 12, 8, 0)
+            )
+
+    def history_rows(self, pair=None, day=None):
+        query = "SELECT * FROM lesson_history"
+        conditions, params = [], []
+        if day is not None:
+            conditions.append("date = ?")
+            params.append(day.isoformat())
+        if pair is not None:
+            conditions.append("pair_number = ?")
+            params.append(pair)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY subgroup_key"
+        with bot.db_connect() as conn:
+            return [dict(row) for row in conn.execute(query, params)]
+
+    def test_placeholder_subject_detection(self):
+        self.assertTrue(bot.is_placeholder_subject("~.............."))
+        self.assertTrue(bot.is_placeholder_subject("..........."))
+        self.assertTrue(bot.is_placeholder_subject("---"))
+        self.assertTrue(bot.is_placeholder_subject(""))
+        self.assertTrue(bot.is_placeholder_subject(None))
+        self.assertFalse(bot.is_placeholder_subject("НГПО"))
+        self.assertFalse(bot.is_placeholder_subject("Ин.яз."))
+        self.assertFalse(bot.is_placeholder_subject("Тек (под) рем"))
+
+    def test_display_subject_text(self):
+        # Отмена на сайте показывается словами, а не точками.
+        self.assertEqual(
+            bot.display_subject_text("~.............."), "Занятие отменено"
+        )
+        self.assertEqual(bot.display_subject_text("..."), "Занятие отменено")
+        self.assertEqual(
+            bot.display_subject_text(""), "Предмет не указан"
+        )
+        self.assertEqual(
+            bot.display_subject_text(None), "Предмет не указан"
+        )
+        self.assertEqual(bot.display_subject_text("НГПО"), "НГПО")
+
+    def test_fully_cancelled_pair_records_nothing(self):
+        """Отмена у ВСЕХ подгрупп пары — пара не даёт времени группе."""
+        schedule = study_day_schedule(date(2026, 9, 7), [
+            ("II", "10:00", "11:20", [
+                lesson("II", "1", "~..............", "—", "—"),
+                lesson("II", "2", "~..............", "—", "—"),
+            ]),
+        ])
+        self.record(schedule)
+        self.assertEqual(self.history_rows(), [])
+        self.assertEqual(bot.load_total_study_minutes(), 0)
+        self.assertEqual(bot.load_subject_totals(), {})
+
+    def test_cancelled_whole_pair_without_subgroups(self):
+        """Карточка без подгрупп, но с отменой — тоже не пишется."""
+        schedule = study_day_schedule(date(2026, 9, 7), [
+            ("II", "10:00", "11:20",
+             [lesson("II", None, "~..............", "—", "—")]),
+        ])
+        self.record(schedule)
+        self.assertEqual(self.history_rows(), [])
+        self.assertEqual(bot.load_total_study_minutes(), 0)
+
+    def test_two_subgroups_same_subject_one_slot(self):
+        schedule = study_day_schedule(date(2026, 9, 7), [
+            ("II", "10:00", "11:20", [
+                lesson("II", "1", "Ин.яз.", "ПК103", "Мурзабулатова Ф.Ф."),
+                lesson("II", "2", "Ин.яз.", "ПК303", "Амирханова Г.А."),
+            ]),
+        ])
+        inserted = self.record(schedule)
+        self.assertEqual(inserted, 2)  # по строке на каждую подгруппу
+
+        rows = self.history_rows(pair="II")
+        self.assertEqual([r["subgroup_key"] for r in rows], ["1", "2"])
+        self.assertEqual(
+            [r["teacher"] for r in rows],
+            ["Мурзабулатова Ф.Ф.", "Амирханова Г.А."],
+        )
+        self.assertEqual([r["room"] for r in rows], ["ПК103", "ПК303"])
+
+        # Общая сумма группы: пара считается ОДИН раз (80, а не 160).
+        self.assertEqual(bot.load_total_study_minutes(), 80)
+        # Предмет тоже не удваивается от двух подгрупп.
+        self.assertEqual(bot.load_subject_totals(), {"ин.яз": 80})
+
+    def test_different_subjects_get_own_time(self):
+        schedule = study_day_schedule(date(2026, 9, 7), [
+            ("II", "10:00", "11:20", [
+                lesson("II", "1", "Ин.яз.", "ПК103", "Мурзабулатова Ф.Ф."),
+                lesson("II", "2", "Нем.яз.", "ПК303", "Амирханова Г.А."),
+            ]),
+        ])
+        self.record(schedule)
+        # Общая сумма — по-прежнему один слот пары.
+        self.assertEqual(bot.load_total_study_minutes(), 80)
+        # Но каждая подгруппа засчитала время своему предмету.
+        totals = bot.load_subject_totals()
+        self.assertEqual(totals.get("ин.яз"), 80)
+        self.assertEqual(totals.get("нем.яз"), 80)
+
+    def test_placeholder_subgroup_not_recorded(self):
+        schedule = study_day_schedule(date(2026, 9, 11), [
+            ("IV", "13:25", "14:45", [
+                lesson("IV", "1", "Ин.яз в проф", "ПК103",
+                       "Мурзабулатова Ф.Ф."),
+                lesson("IV", "2", "~..............", "—", "—"),
+            ]),
+        ])
+        self.record(schedule)
+        rows = self.history_rows(pair="IV")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["subgroup_key"], "1")
+        self.assertEqual(rows[0]["subject"], "Ин.яз в проф")
+        # Время пары не потерялось и мусорный «предмет» не накопился.
+        self.assertEqual(bot.load_total_study_minutes(), 80)
+        self.assertNotIn("~..............", bot.load_subject_totals())
+        self.assertEqual(
+            bot.get_subject_progress("~.............."), ""
+        )
+
+    def test_record_is_idempotent(self):
+        schedule = study_day_schedule(date(2026, 9, 7), [
+            ("II", "10:00", "11:20", [
+                lesson("II", "1", "Ин.яз.", "ПК103"),
+                lesson("II", "2", "Ин.яз.", "ПК303"),
+            ]),
+        ])
+        self.assertEqual(self.record(schedule), 2)
+        self.assertEqual(self.record(schedule), 0)  # повтор — без дублей
+        self.assertEqual(len(self.history_rows()), 2)
+        self.assertEqual(bot.load_total_study_minutes(), 80)
+
+    def test_staff_schedule_not_recorded(self):
+        staff = bot.Schedule(
+            date=date(2026, 9, 7),
+            group="Степанов Сергей Владимирович",
+            schedule_type="staff",
+            staff_id=321,
+            lessons=[lesson("II", "1", "НГПО")],
+        )
+        self.assertEqual(self.record(staff), 0)
+        self.assertEqual(self.history_rows(), [])
+
+    def test_realistic_placeholder_html_from_site(self):
+        """Реальная структура 11.09.2026: у 2-й подгруппы пара ОТМЕНЕНА.
+
+        Сайт рисует «~..............» — занятия у подгруппы нет, она
+        свободна. В историю такая подгруппа не попадает, но время пары
+        для остальной группы не теряется.
+        """
+        html = """
+        <html><body>
+          <div class="card myCard">
+            <div class="card-header">
+              <span class="h3">IV</span> пара
+              <span class="pl-2 h4">13<sup>25</sup> - 14<sup>45</sup></span>
+              <span class="pl-1">перемена 10 мин</span>
+            </div>
+            <div class="card-body p-0">
+              <div class="d-flex flex-column subGroup1">
+                <span>1</span> п/гр.
+                <span>ауд.<span class="h5">ПК103</span></span>
+                <span class="Staff">Мурзабулатова Ф.Ф.</span>
+                <div class="d-md-none text-center text-truncate">Ин.яз в проф</div>
+                <div class="d-none d-md-block"><b>Ин.яз в проф</b>
+                  Иностранный язык в профессиональной деятельности</div>
+              </div>
+              <div class="d-flex flex-column subGroup2">
+                <span>2</span> п/гр.
+                <span>ауд.</span>
+                <span class="Staff"></span>
+                <div class="d-md-none text-center text-truncate">~..............</div>
+                <div class="d-none d-md-block">...................................</div>
+              </div>
+            </div>
+          </div>
+        </body></html>
+        """
+        schedule = bot.parse_schedule(html, date(2026, 9, 11))
+        pair_iv = [p for p in schedule.pairs if p.number == "IV"]
+        self.assertEqual(len(pair_iv), 1)
+        self.assertEqual(len(pair_iv[0].lessons), 2)
+        by_sub = {
+            bot.clean_text(x.subgroup): x for x in pair_iv[0].lessons
+        }
+        self.assertEqual(by_sub["1"].subject, "Ин.яз в проф")
+        self.assertTrue(bot.is_placeholder_subject(by_sub["2"].subject))
+
+        self.record(schedule)
+        rows = self.history_rows(pair="IV")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["subject"], "Ин.яз в проф")
+        self.assertEqual(bot.load_total_study_minutes(), 80)
+
+    def test_real_september_totals(self):
+        """Итог 1-11 сентября по реальным данным сайта — 44 ч 20 мин."""
+        for day, pairs in site_september_2026().items():
+            self.record(study_day_schedule(day, pairs))
+
+        self.assertEqual(bot.load_total_study_minutes(), 2660)
+        self.assertEqual(bot.format_duration(2660), "44 ч 20 мин")
+        # 9 дней с занятиями (суббота 5 сентября — без пар).
+        self.assertEqual(
+            bot.count_active_study_days(
+                bot.GROUP_NAME, date(2026, 9, 1), date(2026, 9, 11)
+            ),
+            9,
+        )
+        # 35 строк: 33 обычных пары + 2 подгруппы пары II 7 сентября
+        # (заглушка 11 сентября не пишется).
+        self.assertEqual(len(self.history_rows()), 35)
+        # Химия Н и Г: 7.09 (80) + 11.09 (80 + 80) = 240 минут.
+        totals = bot.load_subject_totals()
+        self.assertEqual(totals["химия н и г"], 240)
+
+
+class TestStudyForecast(StudyDBTestCase):
+    """Прогноз «сколько осталось учиться» с 1 сентября по 30 июня."""
+
+    def test_academic_year_bounds(self):
+        self.assertEqual(
+            bot.get_academic_year_start(date(2026, 9, 1)), date(2026, 9, 1)
+        )
+        self.assertEqual(
+            bot.get_academic_year_end(date(2026, 9, 11)), date(2027, 6, 30)
+        )
+        self.assertEqual(
+            bot.get_academic_year_end(date(2027, 2, 10)), date(2027, 6, 30)
+        )
+        self.assertEqual(
+            bot.get_academic_year_start(date(2027, 7, 1)), date(2026, 9, 1)
+        )
+
+    def test_count_study_days(self):
+        # 7-13 сентября 2026: 7 дней минус воскресенье 13-го.
+        self.assertEqual(
+            bot.count_study_days(date(2026, 9, 7), date(2026, 9, 13)), 6
+        )
+        self.assertEqual(
+            bot.count_study_days(date(2026, 9, 13), date(2026, 9, 13)), 0
+        )
+        self.assertEqual(
+            bot.count_study_days(date(2026, 9, 14), date(2026, 9, 13)), 0
+        )
+
+    def test_forecast_math_and_badge(self):
+        minutes_by_day = {
+            date(2026, 9, 1): 180, date(2026, 9, 2): 320,
+            date(2026, 9, 3): 400, date(2026, 9, 4): 320,
+            date(2026, 9, 7): 320, date(2026, 9, 8): 240,
+            date(2026, 9, 9): 240, date(2026, 9, 10): 320,
+            date(2026, 9, 11): 320,
+        }
+        for day, minutes in minutes_by_day.items():
+            bot.record_completed_lesson(
+                bot.GROUP_NAME, day, "I", "08:30", "09:50", "НГПО",
+                duration=minutes,
+            )
+
+        forecast = bot.get_study_forecast(today=date(2026, 9, 11))
+        self.assertEqual(forecast.studied_minutes, 2660)
+        self.assertEqual(forecast.elapsed_study_days, 10)   # без воскресенья
+        self.assertEqual(forecast.active_days, 9)           # суббота пустая
+
+        expected_remaining_days = sum(
+            1
+            for i in range((date(2027, 6, 30) - date(2026, 9, 12)).days + 1)
+            if (date(2026, 9, 12) + timedelta(days=i)).weekday() != 6
+        )
+        self.assertEqual(forecast.remaining_study_days, expected_remaining_days)
+
+        # R = X * Dr / De, Y = X + R.
+        expected_remaining = round(2660 * expected_remaining_days / 10)
+        self.assertEqual(forecast.remaining_minutes, expected_remaining)
+        self.assertEqual(forecast.total_minutes, 2660 + expected_remaining)
+        self.assertAlmostEqual(
+            forecast.pace_minutes_per_day, 266.0, places=6
+        )
+
+        # Бейдж «Изучено: X / Y акад. ч» (академический час = 40 мин):
+        # 2660 мин = 66,5 акад. ч; Y = (2660 + R) / 40.
+        self.assertEqual(
+            bot.study_badge_text(forecast),
+            f"Изучено: 66,5 / "
+            f"{bot._format_academic_units((2660 + expected_remaining) / 40)}"
+            " акад. ч",
+        )
+
+    def test_no_history_no_forecast(self):
+        forecast = bot.get_study_forecast(today=date(2026, 9, 11))
+        self.assertEqual(forecast.studied_minutes, 0)
+        self.assertIsNone(forecast.remaining_minutes)
+        self.assertEqual(forecast.total_minutes, 0)
+        self.assertEqual(bot.study_badge_text(forecast), "Изучено: 0 акад. ч")
+        # Без истории сноска не формируется.
+        self.assertEqual(bot.study_note_lines(forecast), [])
+
+    def test_year_finished_nothing_remains(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2027, 6, 1), "I", "08:30", "09:50",
+            "НГПО", duration=80,
+        )
+        forecast = bot.get_study_forecast(today=date(2027, 7, 5))
+        self.assertEqual(forecast.remaining_study_days, 0)
+        self.assertEqual(forecast.remaining_minutes, 0)
+        self.assertEqual(forecast.total_minutes, forecast.studied_minutes)
+        # Учебный год закончился — бейдж без прогнозной части.
+        self.assertEqual(bot.study_badge_text(forecast), "Изучено: 2 акад. ч")
+        # В сноске — только факт, без «/ Y».
+        self.assertEqual(
+            bot.study_note_lines(forecast),
+            [
+                "Время считается по академическому часу: 1 акад. ч = 40 мин.",
+                "По обыкновенному времени: 1 ч 20 мин",
+            ],
+        )
+
+
+class TestAcademicHours(StudyDBTestCase):
+    """Академический час (40 минут) в бейдже, сноске и подписях предметов."""
+
+    def test_synthetic_italic_slant(self):
+        """Курсивная сноска: верх штрихов сдвинут вправо (~12°)."""
+        font = bot.get_font(30)
+        img = Image.new("RGB", (600, 100), (255, 255, 255))
+        bot._draw_italic_text(
+            img, (100, 30), "HHHHH", font, (100, 116, 139)
+        )
+        px = img.load()
+        rows = {}
+        for y in range(100):
+            xs = [
+                x for x in range(600)
+                if px[x, y] == (100, 116, 139)
+            ]
+            if xs:
+                rows[y] = (min(xs), max(xs))
+        self.assertTrue(rows, "курсивный текст не нарисован")
+        ys = sorted(rows)
+        top_y, bottom_y = ys[0], ys[-1]
+        height = bottom_y - top_y
+        shift = rows[top_y][0] - rows[bottom_y][0]
+        # Наклон = shear * высота: 0.21 * ~21px ≈ 4-5px.
+        self.assertGreater(height, 10)
+        self.assertGreater(shift, 0.21 * height * 0.5)
+        self.assertLess(shift, 0.21 * height * 1.5)
+
+    def test_format_academic_hours(self):
+        cases = {
+            0: "0 акад. ч",
+            20: "0,5 акад. ч",
+            30: "0,75 акад. ч",
+            40: "1 акад. ч",
+            60: "1,5 акад. ч",
+            80: "2 акад. ч",
+            90: "2,25 акад. ч",
+            95: "2,38 акад. ч",
+            160: "4 акад. ч",
+            2660: "66,5 акад. ч",
+            69160: "1729 акад. ч",
+        }
+        for minutes, expected in cases.items():
+            self.assertEqual(
+                bot.format_academic_hours(minutes), expected,
+                f"неверный перевод {minutes} минут",
+            )
+
+    def test_academic_hour_constant(self):
+        self.assertEqual(bot.ACADEMIC_HOUR_MINUTES, 40)
+
+    def test_note_lines_with_regular_time(self):
+        minutes_by_day = {date(2026, 9, 1): 180, date(2026, 9, 2): 320}
+        for day, minutes in minutes_by_day.items():
+            bot.record_completed_lesson(
+                bot.GROUP_NAME, day, "I", "08:30", "09:50", "НГПО",
+                duration=minutes,
+            )
+        forecast = bot.get_study_forecast(today=date(2026, 9, 2))
+        self.assertEqual(forecast.studied_minutes, 500)
+
+        lines = bot.study_note_lines(forecast)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(
+            lines[0],
+            "Время считается по академическому часу: 1 акад. ч = 40 мин.",
+        )
+        # Обыкновенное время — в формате «X / Y» с прогнозом.
+        self.assertTrue(lines[1].startswith("По обыкновенному времени: 8 ч 20 мин / "))
+        self.assertEqual(
+            bot.format_academic_hours(forecast.studied_minutes), "12,5 акад. ч"
+        )
+
+    def test_subject_progress_in_academic_hours(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
+            "НГПО", duration=160,
+        )
+        self.assertEqual(
+            bot.get_subject_progress("НГПО"), "Изучено: 4 акад. ч"
+        )
+
+    def test_note_rendered_on_schedule_image(self):
+        """Серая курсивная сноска — под карточками, над подвалом."""
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
+            "НГПО", duration=320,
+        )
+        schedule = bot.Schedule(
+            date=date(2026, 9, 7), group=bot.GROUP_NAME,
+            lessons=[lesson("I", None, "НГПО", "ПК217", "Степанов С.В.")],
+        )
+        path = bot.render_schedule_image(schedule)
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            card_rows = [
+                y for y in range(im.height)
+                if any(px[x, y] == (255, 255, 255)
+                       for x in range(150, im.width - 150, 6))
+            ]
+            last_card = max(card_rows)
+            muted = [
+                y for y in range(last_card + 6, im.height)
+                if any(px[x, y] == (100, 116, 139)
+                       for x in range(60, im.width - 60, 2))
+            ]
+        self.assertTrue(muted, "сноска про академический час не найдена")
+        clusters = []
+        for y in muted:
+            if not clusters or y > clusters[-1][-1] + 4:
+                clusters.append([y])
+            else:
+                clusters[-1].append(y)
+        # Две строки: пояснение + обыкновенное время.
+        self.assertGreaterEqual(len(clusters), 2)
+
+    def test_note_expands_image_but_pairs_stay_list(self):
+        """Картинка с историей выше (сноска), карточки — по-прежнему список."""
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
+            "НГПО", duration=320,
+        )
+        lessons = [
+            lesson("I", None, "НГПО", "ПК217", "Степанов С.В."),
+            lesson("II", None, "Физ-ра", "бол зал 2", "Кинзябаев А.И.",
+                   "10:00", "11:20"),
+        ]
+        with_history = bot.render_schedule_image(bot.Schedule(
+            date=date(2026, 9, 7), group=bot.GROUP_NAME, lessons=lessons))
+        # Убираем историю — второй рендер без бейджа и сноски.
+        with bot.db_connect() as conn:
+            conn.execute("DELETE FROM lesson_history")
+        without_history = bot.render_schedule_image(bot.Schedule(
+            date=date(2026, 9, 8), group=bot.GROUP_NAME, lessons=lessons))
+        with Image.open(with_history) as a, \
+                Image.open(without_history) as b:
+            self.assertGreater(a.size[1], b.size[1])
+            # Обе карточки (пары) остались вертикальным списком.
+            for img in (a, b):
+                px = img.convert("RGB").load()
+                card_rows = [
+                    y for y in range(288, img.size[1])
+                    if any(px[x, y] == (255, 255, 255)
+                           for x in range(150, img.size[0] - 150, 6))
+                ]
+                clusters = []
+                for y in card_rows:
+                    if not clusters or y > clusters[-1][-1] + 12:
+                        clusters.append([y])
+                    else:
+                        clusters[-1].append(y)
+                # Две карточки пар — вертикальный список.
+                self.assertGreaterEqual(len(clusters), 2)
+
+    def test_note_absent_on_staff_image(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
+            "НГПО", duration=320,
+        )
+        staff = bot.Schedule(
+            date=date(2026, 9, 8), group="Степанов Сергей Владимирович",
+            schedule_type="staff", staff_id=321,
+            staff_name="Степанов Сергей Владимирович",
+            lessons=[lesson("I", None, "НГПО", "ПК217", "—")],
+        )
+        path = bot.render_schedule_image(staff)
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            card_rows = [
+                y for y in range(im.height)
+                if any(px[x, y] == (255, 255, 255)
+                       for x in range(150, im.width - 150, 6))
+            ]
+            last_card = max(card_rows)
+            muted = [
+                y for y in range(last_card + 6, im.height)
+                if any(px[x, y] == (100, 116, 139)
+                       for x in range(60, im.width - 60, 2))
+            ]
+        self.assertEqual(muted, [])
+
+
+class TestHistoryMigration(unittest.TestCase):
+    """Миграция lesson_history v1 -> v2 и разовый пересчёт истории."""
+
+    LESSON_HISTORY_V1 = """
+        CREATE TABLE lesson_history (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_name         TEXT NOT NULL,
+            date               TEXT NOT NULL,
+            pair_number        TEXT NOT NULL,
+            start_time         TEXT NOT NULL,
+            end_time           TEXT NOT NULL,
+            subject            TEXT NOT NULL,
+            normalized_subject TEXT NOT NULL,
+            duration_minutes   INTEGER NOT NULL,
+            subgroup_info      TEXT NOT NULL DEFAULT '',
+            teacher            TEXT NOT NULL DEFAULT '',
+            room               TEXT NOT NULL DEFAULT '',
+            completed_at       TEXT NOT NULL,
+            created_at         TEXT NOT NULL,
+            UNIQUE (group_name, date, pair_number)
+        )
+    """
+    LESSON_HISTORY_V2 = """
+        CREATE TABLE lesson_history (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_name         TEXT NOT NULL,
+            date               TEXT NOT NULL,
+            pair_number        TEXT NOT NULL,
+            subgroup_key       TEXT NOT NULL DEFAULT '',
+            start_time         TEXT NOT NULL,
+            end_time           TEXT NOT NULL,
+            subject            TEXT NOT NULL,
+            normalized_subject TEXT NOT NULL,
+            duration_minutes   INTEGER NOT NULL,
+            subgroup_info      TEXT NOT NULL DEFAULT '',
+            teacher            TEXT NOT NULL DEFAULT '',
+            room               TEXT NOT NULL DEFAULT '',
+            completed_at       TEXT NOT NULL,
+            created_at         TEXT NOT NULL,
+            UNIQUE (group_name, date, pair_number, subgroup_key)
+        )
+    """
+    BACKFILL_DAYS = """
+        CREATE TABLE lesson_backfill_days (
+            group_name   TEXT NOT NULL,
+            date         TEXT NOT NULL,
+            processed_at TEXT NOT NULL,
+            PRIMARY KEY (group_name, date)
+        )
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self._tmp.name) / "old.db"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def connect(self, lesson_schema):
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        conn.execute(lesson_schema)
+        conn.execute(self.BACKFILL_DAYS)
+        return conn
+
+    def insert_row(self, conn, day, pair="I", subject="НГПО", minutes=80):
+        conn.execute(
+            "INSERT INTO lesson_history"
+            " (group_name, date, pair_number, start_time, end_time, subject,"
+            "  normalized_subject, duration_minutes, subgroup_info, teacher,"
+            "  room, completed_at, created_at)"
+            " VALUES (?, ?, ?, '08:30', '09:50', ?, ?, ?, '1, 2', '', '',"
+            " '2026-09-01', '2026-09-01')",
+            (bot.GROUP_NAME, day.isoformat(), pair, subject,
+             bot.normalize_subject_name(subject), minutes),
+        )
+
+    def mark_processed(self, conn, day):
+        conn.execute(
+            "INSERT INTO lesson_backfill_days VALUES (?, ?, 'x')",
+            (bot.GROUP_NAME, day.isoformat()),
+        )
+
+    def test_v1_migrates_and_schedules_recalc(self):
+        start = bot.get_academic_year_start()
+        prev_year_day = start - timedelta(days=1)
+
+        conn = self.connect(self.LESSON_HISTORY_V1)
+        self.insert_row(conn, prev_year_day, pair="I")   # прошлый год — остаётся
+        self.insert_row(conn, start, pair="II")          # текущий — пересчёт
+        self.mark_processed(conn, prev_year_day)
+        self.mark_processed(conn, start)
+        conn.commit()
+
+        bot._migrate_lesson_history(conn)
+        conn.commit()
+
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(lesson_history)")
+        }
+        self.assertIn("subgroup_key", columns)
+
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT date, subgroup_key FROM lesson_history"
+            )
+        ]
+        self.assertEqual([r["date"] for r in rows], [prev_year_day.isoformat()])
+        self.assertEqual(rows[0]["subgroup_key"], "")
+
+        markers = [
+            row["date"]
+            for row in conn.execute("SELECT date FROM lesson_backfill_days")
+        ]
+        self.assertEqual(markers, [prev_year_day.isoformat()])
+
+        meta = {
+            row["key"]: row["value"]
+            for row in conn.execute("SELECT key, value FROM bot_meta")
+        }
+        self.assertEqual(meta.get("schema_version"), str(bot.SCHEMA_VERSION))
+        self.assertEqual(meta.get("study_recalc_from"), start.isoformat())
+        conn.close()
+
+        # Повторная миграция уже мигрированной базы — no-op: строки на месте,
+        # флаг пересчёта не трогается (его снимает recalculate_study_history).
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        bot._migrate_lesson_history(conn)
+        conn.commit()
+        count = conn.execute("SELECT COUNT(*) FROM lesson_history").fetchone()[0]
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            bot._meta_get(conn, "study_recalc_from", ""),
+            start.isoformat(),
+        )
+        conn.close()
+
+    def test_fresh_v2_schema_sets_version_without_recalc(self):
+        start = bot.get_academic_year_start()
+        conn = self.connect(self.LESSON_HISTORY_V2)
+        self.insert_row(conn, start, pair="I", subject="НГПО")
+        self.mark_processed(conn, start)
+        bot._ensure_meta_table(conn)
+        bot._meta_set(conn, "schema_version", str(bot.SCHEMA_VERSION))
+        conn.commit()
+
+        bot._migrate_lesson_history(conn)
+
+        count = conn.execute("SELECT COUNT(*) FROM lesson_history").fetchone()[0]
+        self.assertEqual(count, 1)
+        markers = conn.execute(
+            "SELECT COUNT(*) FROM lesson_backfill_days"
+        ).fetchone()[0]
+        self.assertEqual(markers, 1)
+        flag = bot._meta_get(conn, "study_recalc_from", "")
+        self.assertEqual(flag, "")
+        conn.close()
+
+
+class TestDeployMigrationEndToEnd(unittest.TestCase):
+    """Продакшен-сценарий обновления: v1-база -> init_db -> пересчёт.
+
+    Именно это произойдёт на сервере при деплое новой версии: старая база
+    с записями «представителем» пары мигрирует, дни текущего года
+    сбрасываются и пересчитываются по подгруппам.
+    """
+
+    def test_v1_db_recalculates_after_init(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bot.db"
+            start = bot.get_academic_year_start()
+
+            # --- «старая» база: v1-схема, строки за 4 дня, метки backfill ---
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            conn.execute(TestHistoryMigration.LESSON_HISTORY_V1)
+            conn.execute(TestHistoryMigration.BACKFILL_DAYS)
+            for offset, pairs in ((0, ("I", "II")), (1, ("I",)),
+                                  (2, ()), (3, ("I",))):
+                day = start + timedelta(days=offset)
+                for pair in pairs:
+                    conn.execute(
+                        "INSERT INTO lesson_history"
+                        " (group_name, date, pair_number, start_time,"
+                        "  end_time, subject, normalized_subject,"
+                        "  duration_minutes, subgroup_info, teacher, room,"
+                        "  completed_at, created_at)"
+                        " VALUES (?, ?, ?, '08:30', '09:50', 'Ин.яз.',"
+                        " 'ин.яз', 80, '1, 2', '', '', 'x', 'x')",
+                        (bot.GROUP_NAME, day.isoformat(), pair),
+                    )
+                if pairs:
+                    conn.execute(
+                        "INSERT INTO lesson_backfill_days VALUES (?, ?, 'x')",
+                        (bot.GROUP_NAME, day.isoformat()),
+                    )
+            conn.commit()
+            conn.close()
+
+            # --- деплой: init_db мигрирует схему и ставит флаг пересчёта ---
+            with mock.patch.object(bot, "DB_PATH", db_path):
+                bot.init_db()
+                self.assertEqual(
+                    bot.get_meta_value("study_recalc_from"),
+                    start.isoformat(),
+                )
+
+                # Новое расписание тех же дней: пара II 1-го дня теперь
+                # честно разделена по подгруппам с разными предметами.
+                def sub_pair(day, pair, s1, s2):
+                    return study_day_schedule(day, [(
+                        pair, "10:00", "11:20", [
+                            lesson(pair, "1", s1, "ПК103"),
+                            lesson(pair, "2", s2, "ПК303"),
+                        ],
+                    )])
+
+                schedules = {
+                    start: None, start + timedelta(days=1): None,
+                    start + timedelta(days=2): None,
+                    start + timedelta(days=3): None,
+                    start + timedelta(days=4): None,
+                }
+                schedules[start] = study_day_schedule(start, [
+                    ("I", "08:30", "09:50",
+                     [lesson("I", None, "Химия Н и Г", "УК307")]),
+                ])
+                # Вторая пара первого дня — подгруппы с разными предметами.
+                schedules[start] = bot.Schedule(
+                    date=start,
+                    group=bot.GROUP_NAME,
+                    lessons=(
+                        schedules[start].lessons
+                        + sub_pair(start, "II", "Ин.яз.", "Нем.яз.").lessons
+                    ),
+                )
+                schedules[start + timedelta(days=1)] = study_day_schedule(
+                    start + timedelta(days=1),
+                    [("I", "08:30", "09:50",
+                      [lesson("I", None, "НГПО", "ПК217")])],
+                )
+                # день 2 — без занятий; день 3 — пара; день 4 (сегодня) — пара.
+                schedules[start + timedelta(days=3)] = study_day_schedule(
+                    start + timedelta(days=3),
+                    [("I", "08:30", "09:50",
+                      [lesson("I", None, "НГПО", "ПК217")])],
+                )
+                schedules[start + timedelta(days=4)] = study_day_schedule(
+                    start + timedelta(days=4),
+                    [("I", "08:30", "09:50",
+                      [lesson("I", None, "НГПО", "ПК217")])],
+                )
+
+                async def fake_get_schedule(day):
+                    return schedules.get(day) or bot.Schedule(
+                        date=day, group=bot.GROUP_NAME, lessons=[]
+                    )
+
+                today = start + timedelta(days=4)
+                with mock.patch.object(bot, "get_schedule",
+                                       fake_get_schedule), \
+                     mock.patch.object(bot, "get_today",
+                                       return_value=today), \
+                     mock.patch.object(bot, "now_local",
+                                       return_value=datetime(
+                                           today.year, today.month,
+                                           today.day, 20, 0)), \
+                     mock.patch.object(bot, "get_academic_year_start",
+                                       return_value=start):
+                    inserted = run(bot.recalculate_study_history())
+
+                # 6 строк: пара I + 2 подгруппы пары II (день 0) и по паре
+                # в дни 1, 3, 4.
+                self.assertEqual(inserted, 6)
+                self.assertEqual(
+                    bot.get_meta_value("study_recalc_from"), ""
+                )
+
+                # Общая сумма: 5 слотов пар по 80 минут (подгруппы пары II
+                # не удваивают время группы).
+                self.assertEqual(bot.load_total_study_minutes(), 400)
+
+                # Но каждый предмет подгруппы получил своё время.
+                totals = bot.load_subject_totals()
+                self.assertEqual(totals["ин.яз"], 80)
+                self.assertEqual(totals["нем.яз"], 80)
+                self.assertEqual(totals["химия н и г"], 80)
+                self.assertEqual(totals["нгпо"], 240)
+
+                # Все 5 дней отмечены обработанными.
+                with bot.db_connect() as conn:
+                    days = conn.execute(
+                        "SELECT COUNT(*) AS n FROM lesson_backfill_days"
+                    ).fetchone()["n"]
+                self.assertEqual(days, 5)
+
+
+class TestStudyRecalc(StudyDBTestCase):
+    """Разовый пересчёт изученного времени 1-11 сентября."""
+
+    def test_recalculate_study_history_from_scratch(self):
+        # Имитируем состояние после миграции: флаг пересчёта с 1 сентября.
+        bot.set_meta_value("study_recalc_from", "2026-09-01")
+
+        schedules = {
+            day: study_day_schedule(day, pairs)
+            for day, pairs in site_september_2026().items()
+        }
+
+        async def fake_get_schedule(day):
+            return schedules.get(
+                day, bot.Schedule(date=day, group=bot.GROUP_NAME, lessons=[])
+            )
+
+        with mock.patch.object(bot, "get_schedule", fake_get_schedule), \
+             mock.patch.object(bot, "get_today",
+                               return_value=date(2026, 9, 11)), \
+             mock.patch.object(bot, "now_local",
+                               return_value=datetime(2026, 9, 11, 20, 0)), \
+             mock.patch.object(bot, "get_academic_year_start",
+                               return_value=date(2026, 9, 1)):
+            inserted = run(bot.recalculate_study_history())
+
+        # 35 записей (33 пары + 2 подгруппы; заглушка не пишется).
+        self.assertEqual(inserted, 35)
+        # Флаг снят.
+        self.assertEqual(bot.get_meta_value("study_recalc_from"), "")
+
+        # Итог по реальным данным сайта: 44 ч 20 мин.
+        self.assertEqual(bot.load_total_study_minutes(), 2660)
+
+        # Пара с подгруппами записана двумя строками.
+        with bot.db_connect() as conn:
+            keys = [
+                row["subgroup_key"]
+                for row in conn.execute(
+                    "SELECT subgroup_key FROM lesson_history"
+                    " WHERE date = '2026-09-07' AND pair_number = 'II'"
+                )
+            ]
+            days = conn.execute(
+                "SELECT COUNT(*) AS n FROM lesson_backfill_days"
+            ).fetchone()["n"]
+        self.assertEqual(sorted(keys), ["1", "2"])
+        # Все 11 дней отмечены обработанными.
+        self.assertEqual(days, 11)
+
+        # Повторный запуск без флага не делает ничего.
+        calls = {"backfill": 0}
+
+        async def fake_backfill(*args, **kwargs):
+            calls["backfill"] += 1
+            return 0
+
+        with mock.patch.object(bot, "backfill_lesson_history", fake_backfill):
+            self.assertEqual(run(bot.recalculate_study_history()), 0)
+        self.assertEqual(calls["backfill"], 0)
+
+    def test_recalc_survives_source_error(self):
+        """Ошибка источника не снимает день с пересчёта окончательно."""
+        bot.set_meta_value("study_recalc_from", "2026-09-01")
+
+        async def failing_get_schedule(day):
+            raise bot.ScheduleUnavailable("сайт недоступен")
+
+        with mock.patch.object(bot, "get_schedule", failing_get_schedule), \
+             mock.patch.object(bot, "get_today",
+                               return_value=date(2026, 9, 11)):
+            inserted = run(bot.recalculate_study_history())
+
+        self.assertEqual(inserted, 0)
+        self.assertEqual(bot.get_meta_value("study_recalc_from"), "")
+        with bot.db_connect() as conn:
+            days = conn.execute(
+                "SELECT COUNT(*) AS n FROM lesson_backfill_days"
+            ).fetchone()["n"]
+        self.assertEqual(days, 0)  # дни не отмечены — обычный backfill доберёт
+
+
+class TestStatusImage(DBTestCase):
+    """Картинка /status в дизайне расписания + текстовый fallback."""
+
+    ACCENT = (79, 70, 229)        # #4F46E5
+    GREEN_LIGHT = (229, 246, 237)  # #E5F6ED
+
+    def setUp(self):
+        super().setUp()
+        with bot.db_connect() as conn:
+            conn.execute("DELETE FROM lesson_history")
+            conn.execute("DELETE FROM subjects")
+
+    def tearDown(self):
+        with bot.db_connect() as conn:
+            conn.execute("DELETE FROM lesson_history")
+            conn.execute("DELETE FROM subjects")
+        super().tearDown()
+
+    class FakeStatusMessage:
+        def __init__(self, chat_id=987654, fail_photo=False):
+            self.chat = type("Chat", (), {"id": chat_id})()
+            self.photos = []
+            self.answers = []
+            self.fail_photo = fail_photo
+
+        async def answer_photo(self, photo, caption=None, **kwargs):
+            if self.fail_photo:
+                raise RuntimeError("фото не ушло")
+            self.photos.append((photo, caption))
+
+        async def answer(self, text, *args, **kwargs):
+            self.answers.append(text)
+
+    def test_format_uptime(self):
+        self.assertEqual(bot.format_uptime(45), "45 с")
+        self.assertEqual(bot.format_uptime(5 * 60), "5 мин")
+        self.assertEqual(bot.format_uptime(3 * 3600 + 5 * 60), "3 ч 05 мин")
+        self.assertEqual(bot.format_uptime(2 * 86400 + 4 * 3600), "2 д 4 ч")
+
+    def test_renders_png_in_schedule_style(self):
+        bot.record_completed_lesson(
+            bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
+            "НГПО", duration=320,
+        )
+        path = bot.render_status_image(chat_id=987654)
+        try:
+            self.assertTrue(path.exists())
+            with Image.open(path) as img:
+                im = img.convert("RGB")
+                self.assertEqual(im.width, bot.IMAGE_WIDTH)
+                self.assertGreater(im.height, 600)
+                self.assertLess(im.height, 3500)
+                px = im.load()
+                # Белая шапка и акцентная полоса — как у расписания.
+                self.assertEqual(px[600, 10], (255, 255, 255))
+                self.assertEqual(px[5, 100], self.ACCENT)
+                # Зелёный бейдж «РАБОТАЕТ» в правом верхнем углу.
+                chip_rows = [
+                    y for y in range(40, 120)
+                    if any(px[x, y] == self.GREEN_LIGHT
+                           for x in range(600, im.width - 40, 4))
+                ]
+                self.assertTrue(chip_rows, "бейдж РАБОТАЕТ не найден")
+                # Карточки (белые блоки) ниже шапки.
+                card_rows = [
+                    y for y in range(300, im.height)
+                    if any(px[x, y] == (255, 255, 255)
+                           for x in range(200, im.width - 200, 8))
+                ]
+                self.assertTrue(card_rows, "карточки статуса не найдены")
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_send_status_photo_and_fallbacks(self):
+        # Обычная отправка: фото с подписью.
+        message = self.FakeStatusMessage()
+        run(bot._send_status(message))
+        self.assertEqual(len(message.photos), 1)
+        _, caption = message.photos[0]
+        self.assertIn("Статус бота", caption)
+        self.assertIn(bot.GROUP_NAME, caption)
+
+        # Сбой генерации картинки -> текстовый fallback.
+        message = self.FakeStatusMessage()
+        with mock.patch.object(bot, "render_status_image",
+                               side_effect=RuntimeError("boom")):
+            run(bot._send_status(message))
+        self.assertEqual(message.photos, [])
+        self.assertEqual(len(message.answers), 1)
+        self.assertIn(bot.GROUP_NAME, message.answers[0])
+        self.assertIn("подписок", message.answers[0])
+
+        # Сбой отправки фото -> тоже текстовый fallback.
+        message = self.FakeStatusMessage(fail_photo=True)
+        run(bot._send_status(message))
+        self.assertEqual(len(message.answers), 1)
+        self.assertIn(bot.GROUP_NAME, message.answers[0])
+
+    def test_cmd_status_sends_photo(self):
+        message = self.FakeStatusMessage(chat_id=42)
+        run(bot.cmd_status(message))
+        self.assertEqual(len(message.photos), 1)
+
+    def test_status_text_includes_study_and_uptime(self):
+        text = run(bot._status_text(chat_id=42))
+        self.assertIn("подписок", text)
+        self.assertIn("Аптайм", text)
+        self.assertIn(bot.TIMEZONE, text)
 
 
 if __name__ == "__main__":
