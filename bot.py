@@ -2670,7 +2670,7 @@ init_db()
 # РЕНДЕР PNG
 # ============================================================
 
-# Палитра
+# Палитра (историческая — картинка /status).
 COL_BG = "#F3F5FA"
 COL_WHITE = "#FFFFFF"
 COL_INK = "#14202F"
@@ -2688,11 +2688,14 @@ COL_RED_LIGHT = "#FEE2E2"
 SUMMARY_MAX_LINES = 24
 SUMMARY_MAX_CHANGES = 20
 
-# Ширина PNG-картинок (расписание и статус). 1280 — максимум Telegram
-# по стороне: картинка не пережимается сильнее необходимого, а карточки
-# и текстовые строки становятся шире.
+# Ширина PNG картинки статуса (1280 — максимум Telegram по стороне).
+# Картинка расписания имеет собственный формат: см. SCHEDULE_WIDTH/HEIGHT.
 IMAGE_WIDTH = 1280
 
+
+# ============================================================
+# РАЗДЕЛЬНЫЕ ХЕЛПЕРЫ РЕНДЕРА (общие для нового и статусного)
+# ============================================================
 
 def _wrap_lines(text: str, font, max_width: float) -> list:
     """Переносит текст по словам; слишком длинное слово обрезается."""
@@ -2873,657 +2876,1537 @@ def _change_summary_lines(changes: list) -> list:
     return lines[:SUMMARY_MAX_LINES]
 
 
+
+# ============================================================
+# НОВЫЙ РЕНДЕРЕР КАРТОЧКИ РАСПИСАНИЯ (1080×920)
+# ============================================================
+#
+# Дизайн: modern minimal dashboard. Светлый фон, белые карточки,
+# лёгкие серо-фиолетовые границы, фиолетовый акцент, зелёный —
+# аудитории/добавленные, красный — отменённые. Без тяжёлых
+# градиентов и декораций; готика — только микро-акцент
+# (стрельчатая арка) в шапке и подвале, цвет почти как у фона.
+#
+# Архитектура:
+#   fit_text / draw_text_bounded — универсальная безопасная
+#       вёрстка текста: знает доступную область, измеряет textbbox,
+#       сначала уменьшает шрифт, затем ставит ellipsis; текст
+#       НИКОГДА не рисуется за пределами bounding box.
+#   calculate_card_height — точный расчёт высоты карточки.
+#   _build_plan — чистый расчёт layout (прямоугольники всех
+#       карточек/строк/бейджей) без рисования.
+#   draw_header / draw_session_card / draw_subgroup_session_card /
+#   draw_subgroup_row / draw_room_badge / draw_changes_panel /
+#   draw_change_card — отрисовка по плану.
+#   validate_layout — проверка layout перед сохранением: текст
+#       внутри карточек, без пересечений, бейджи помещаются,
+#       подгруппы целиком, правая колонка в границах, низ не
+#       наезжает.
+#
+# Формат: 1080×920 — основной. Если контент не помещается, layout
+# последовательно уплотняется (уровни 0..3: отступы, затем шрифты
+# в пределах иерархии из ТЗ); только в крайнем случае холст
+# становится выше 920 — но кроп не происходит никогда.
+
+# --- Палитра нового дизайна (ТЗ) ---
+S_BG       = "#F7F7FA"
+S_INK      = "#171C2B"
+S_MUTED    = "#788094"
+S_PURPLE   = "#5949D8"
+S_PURPLE_L = "#EFEDFF"
+S_GREEN    = "#239566"
+S_GREEN_L  = "#E9F7F0"
+S_RED      = "#D45D65"
+S_RED_L    = "#FBECEE"
+S_BORDER   = "#E5E7EE"
+S_WHITE    = "#FFFFFF"
+S_ROW      = "#FAFAFD"    # фон строки подгруппы
+S_ROW_LINE = "#EEF0F6"    # граница строки подгруппы
+S_TRACK    = "#ECECF3"    # дорожка прогресса
+S_GOTHIC   = "#DDD9EF"    # готический микро-акцент (почти как фон)
+S_RED_LINE = "#F6DDE0"    # граница отменённой строки
+
+# --- Формат картинки ---
+SCHEDULE_WIDTH = 1080
+SCHEDULE_HEIGHT = 920
+S_MARGIN = 36                 # внешние отступы
+S_HEADER_BOTTOM = 148         # низ шапки
+S_CONTENT_TOP = 164           # начало основной области
+S_RIGHT_COL_W = 328           # ширина колонки «Изменения»
+S_COL_GAP = 24                # зазор между колонками
+S_BOTTOM_PAD = 26             # нижний padding холста
+
+import math as _math
+
+# --- Шрифты: Inter, если доступен, иначе DejaVu ---
+_WEIGHT_FILES = {
+    "regular":  ("Inter-Regular.ttf", "DejaVuSans.ttf"),
+    "medium":   ("Inter-Medium.ttf", "DejaVuSans.ttf"),
+    "semibold": ("Inter-SemiBold.ttf", "DejaVuSans-Bold.ttf"),
+    "bold":     ("Inter-Bold.ttf", "DejaVuSans-Bold.ttf"),
+}
+
+
+def _font_for(size: int, weight: str = "regular") -> ImageFont.FreeTypeFont:
+    """Шрифт нужной насыщенности: Inter, если лежит в fonts/, иначе DejaVu."""
+    for name in _WEIGHT_FILES.get(weight, _WEIGHT_FILES["regular"]):
+        path = FONTS_DIR / name
+        if path.exists():
+            return ImageFont.truetype(str(path), int(size))
+    raise RuntimeError("Шрифт не найден. Проверь папку fonts.")
+
+
+def get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    """Загружает шрифт ТОЛЬКО из папки fonts рядом с bot.py.
+
+    Использует Inter, если он доступен (regular/bold), иначе DejaVu.
+    """
+    return _font_for(size, "bold" if bold else "regular")
+
+
+# ============================================================
+# ТЕКСТ: измерение, fit, безопасная отрисовка
+# ============================================================
+
+def _lh(size: int) -> int:
+    """Высота строки текста заданного размера (canvas px)."""
+    return int(round(size * 1.25))
+
+
+def _wrap_words(text: str, font, max_w: float) -> list:
+    """Перенос по словам; одинокое слишком длинное слово — с ellipsis."""
+    words = text.split(" ")
+    lines: list = []
+    current = ""
+    for word in words:
+        trial = (current + " " + word).strip()
+        if font.getlength(trial) <= max_w:
+            current = trial
+            continue
+        if current:
+            lines.append(current)
+            current = word
+        if font.getlength(current) > max_w:
+            current = _ellipsis(current, font, max_w)
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
+def _ellipsis(text: str, font, max_w: float) -> str:
+    """Короче до вписывания + «…». Текст гарантированно ≤ max_w."""
+    text = clean_text(text)
+    if not text:
+        return ""
+    if font.getlength(text) <= max_w:
+        return text
+    while len(text) > 1 and font.getlength(text + "…") > max_w:
+        text = text[:-1]
+    return text + "…"
+
+
+def fit_text(
+    text: str,
+    size: int,
+    weight: str,
+    max_w: float,
+    min_size: int = 9,
+    max_lines: int = 1,
+) -> dict:
+    """Универсальный fit текста в ширину (и число строк).
+
+    Порядок действий по ТЗ: сначала уменьшаем размер шрифта;
+    если и на min_size не помещается — ставим ellipsis.
+    Возвращает {"lines": [...], "size": s, "truncated": bool,
+    "line_h": h строки}.
+    """
+    text = clean_text(text)
+    if not text:
+        return {"lines": [""], "size": size, "truncated": False,
+                "line_h": _lh(size)}
+
+    for s in range(max(8, int(size)), min_size - 1, -1):
+        font = _font_for(s, weight)
+        if max_lines <= 1:
+            if font.getlength(text) <= max_w:
+                return {"lines": [text], "size": s, "truncated": False,
+                        "line_h": _lh(s)}
+            return {"lines": [_ellipsis(text, font, max_w)], "size": s,
+                    "truncated": True, "line_h": _lh(s)}
+
+        lines = _wrap_words(text, font, max_w)
+        if len(lines) <= max_lines:
+            return {"lines": lines, "size": s, "truncated": False,
+                    "line_h": _lh(s)}
+
+        # Переполнение строк: держим max_lines-1 целых строк и
+        # последнюю — до вписывающийся остаток с ellipsis.
+        kept = lines[: max_lines - 1]
+        rest = " ".join(lines[max_lines - 1:])
+        tail = _ellipsis(rest, font, max_w)
+        if not tail:
+            tail = "…"
+        return {"lines": kept + [tail], "size": s, "truncated": True,
+                "line_h": _lh(s)}
+
+    # Достигли min_size (практически недостижимо: цикл выше завершён).
+    font = _font_for(min_size, weight)
+    lines = _wrap_words(text, font, max_w)[:max_lines]
+    lines[-1] = _ellipsis(lines[-1], font, max_w)
+    return {"lines": lines, "size": min_size, "truncated": True,
+            "line_h": _lh(min_size)}
+
+
+def _ls_width(text: str, font, spacing: float) -> float:
+    return sum(font.getlength(ch) for ch in text) + spacing * max(0, len(text) - 1)
+
+
+def draw_text_bounded(
+    draw,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    text: str,
+    size: int,
+    weight: str,
+    fill: str,
+    *,
+    align: str = "left",
+    valign: str = "top",
+    min_size: int = 9,
+    max_lines: int = 1,
+    line_gap: int = 2,
+    letter_spacing: float = 0.0,
+    report: list = None,
+    element_id: str = "",
+    owner: str = "canvas",
+):
+    """Рисует текст СТРОГО внутри прямоугольника (x, y, w, h).
+
+    1. знает доступную область (x, y, w, h);
+    2. измеряет textbbox (font.getbbox);
+    3. уменьшает шрифт при необходимости (fit_text);
+    4. при необходимости ставит ellipsis «…»;
+    5. НИКОГДА не рисует текст за пределами bounding box —
+       итоговая позиция клампится в область.
+
+    Возвращает фактический bbox (x0, y0, x1, y1) нарисованного
+    текста. При передаче `report` элемент кладётся в отчёт для
+    validate_layout().
+    """
+    x, y, w, h = float(x), float(y), float(w), float(h)
+    res = fit_text(text, size, weight, max(w, 1), min_size, max_lines)
+    font = _font_for(res["size"], weight)
+    lines = [line for line in res["lines"]]
+
+    line_hs = [res["line_h"]] * len(lines)
+    block_h = sum(line_hs) + line_gap * max(0, len(lines) - 1)
+
+    if valign == "middle":
+        top = y + max(0.0, (h - block_h) / 2)
+    elif valign == "bottom":
+        top = y + max(0.0, h - block_h)
+    else:
+        top = y
+    if top + block_h > y + h:
+        top = y  # блок выше, чем область — рисуем сверху, строки влезу
+
+    bbox = None
+    cursor = top
+    for i, line in enumerate(lines):
+        if letter_spacing > 0:
+            tw = _ls_width(line, font, letter_spacing)
+        else:
+            tw = font.getlength(line)
+        if tw > w:
+            tw = w  # страховка: fit уже гарантировал, но не шире зоны
+        if align == "center":
+            bx = x + max(0.0, (w - tw) / 2)
+        elif align == "right":
+            bx = x + max(0.0, w - tw)
+        else:
+            bx = x
+
+        if letter_spacing > 0:
+            cx = bx
+            for ch in line:
+                draw.text((cx, cursor), ch, font=font, fill=fill)
+                cx += font.getlength(ch) + letter_spacing
+        else:
+            draw.text((bx, cursor), line, font=font, fill=fill)
+
+        if line:
+            b0, b1, b2, b3 = font.getbbox(line)
+            ex0, ey0 = bx + b0, cursor + b1
+            ex1, ey1 = bx + b2, cursor + b3
+            # Кламп в область: даже при аномальных метриках шрифта
+            # ни один пиксель текста не уйдёт за bounding box.
+            ex0 = max(ex0, x)
+            ey0 = max(ey0, y)
+            ex1 = min(ex1, x + w)
+            ey1 = min(ey1, y + h)
+            if bbox is None:
+                bbox = (ex0, ey0, ex1, ey1)
+            else:
+                bbox = (
+                    min(bbox[0], ex0), min(bbox[1], ey0),
+                    max(bbox[2], ex1), max(bbox[3], ey1),
+                )
+        cursor += line_hs[i] + line_gap
+
+    if bbox is None:
+        bbox = (x, y, x, y)
+
+    if report is not None:
+        report.append({
+            "id": element_id,
+            "owner": owner,
+            "kind": "text",
+            "bbox": bbox,
+            "zone": (x, y, x + w, y + h),
+            "truncated": res["truncated"],
+            "size": res["size"],
+            "text": " ".join(lines),
+        })
+    return bbox
+
+
+# ============================================================
+# ГОТИЧЕСКИЙ МИКРО-АКЦЕНТ (стрельчатая арка)
+# ============================================================
+
+def _gothic_arch_polygon(x: float, y: float, w: float, h: float, n: int = 26) -> list:
+    """Контур стрельчатой (lancet) арки в прямоугольнике (x, y, w, h)."""
+    shoulder = y + h * 0.45
+    theta = _math.atan2(0.45 * h, w / 2)
+    pts = [(x, y + h), (x, shoulder)]
+    # Левая дуга: центр в правом плече, от 180° до 180°+theta.
+    c1 = (x + w, shoulder)
+    r1 = _math.hypot(w / 2, 0.45 * h)
+    for i in range(n + 1):
+        a = _math.pi + theta * i / n
+        pts.append((c1[0] + r1 * _math.cos(a), c1[1] + r1 * _math.sin(a)))
+    # Правая дуга: центр в левом плече, от -theta до 0°.
+    c2 = (x, shoulder)
+    r2 = r1
+    for i in range(n + 1):
+        a = -theta + theta * i / n
+        pts.append((c2[0] + r2 * _math.cos(a), c2[1] + r2 * _math.sin(a)))
+    pts.extend([(x + w, shoulder), (x + w, y + h)])
+    return pts
+
+
+def draw_gothic_arch(
+    draw,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    color: str = S_GOTHIC,
+    hole_color: str = S_BG,
+    ring: float = 2.0,
+) -> None:
+    """Маленький силуэт стрельчатой арки: почти незаметный декор."""
+    draw.polygon(_gothic_arch_polygon(x, y, w, h), fill=color)
+    if w > ring * 2 + 4 and h > ring * 2 + 4:
+        draw.polygon(
+            _gothic_arch_polygon(x + ring, y + ring, w - 2 * ring, h - 2 * ring),
+            fill=hole_color,
+        )
+
+
+def draw_gothic_divider(
+    draw,
+    cx: float,
+    y: float,
+    half_len: int = 150,
+    color: str = S_GOTHIC,
+) -> None:
+    """Тонкий разделитель с крошечной аркой в центре (footer)."""
+    ay = y
+    arch_w, arch_h = 12, 18
+    draw.line((cx - half_len, y + arch_h / 2, cx - arch_w / 2 - 10, y + arch_h / 2),
+              fill=color, width=1)
+    draw.line((cx + arch_w / 2 + 10, y + arch_h / 2, cx + half_len, y + arch_h / 2),
+              fill=color, width=1)
+    draw_gothic_arch(draw, cx - arch_w / 2, ay, arch_w, arch_h, color)
+
+
+# ============================================================
+# РАЗМЕТКА: стили уплотнения, высоты карточек, план
+# ============================================================
+
+def _style_for_level(level: int) -> dict:
+    """Метрики layout по уровням уплотнения (0 — самый «воздушный»)."""
+    style = {
+        "card_gap": 12, "row_gap": 8,
+        "pad_x": 20, "pad_t": 12, "pad_b": 12,
+        "g1": 7, "g2": 7, "g3": 5,
+        "time_size": 16, "subject_size": 17, "teacher_size": 11,
+        "room_size": 10, "row_h": 44,
+        "chg_pad": 12, "chg_gap": 10, "chg_subject_size": 14,
+    }
+    if level >= 1:
+        style.update(card_gap=10, row_gap=6, pad_t=10, pad_b=10, g1=6,
+                     g2=6, row_h=42)
+    if level >= 2:
+        style.update(time_size=15, subject_size=16, row_h=40,
+                     chg_subject_size=13, g2=5)
+    if level >= 3:
+        style.update(card_gap=6, row_gap=5, pad_t=8, pad_b=8, g1=5,
+                     g2=5, g3=4, subject_size=15, row_h=40,
+                     chg_pad=10, chg_subject_size=12)
+    return style
+
+
+def _progress_text_for(lesson, ctx) -> str:
+    """Текст прогресса «Изучено: N акад. ч» / «Первое занятие…»."""
+    if not ctx.get("is_group"):
+        return ""
+    if is_placeholder_subject(lesson.subject):
+        return ""
+    normalized = normalize_subject_name(lesson.subject)
+    if not normalized:
+        return ""
+    minutes = ctx.get("subject_totals", {}).get(normalized, 0)
+    if minutes > 0:
+        return f"Изучено: {format_academic_hours(minutes)}"
+    return "Первое занятие по предмету"
+
+
+def _split_progress(progress: str) -> tuple:
+    """«Изучено: 8 акад. ч» -> («Изучено:», «8 акад. ч»)."""
+    if progress.startswith("Изучено:"):
+        return progress, progress.split(":", 1)[1].strip()
+    return "", progress
+
+
+def calculate_card_height(pair: Pair, style: dict, ctx: dict) -> int:
+    """Точная высота карточки пары (обычной или с подгруппами)."""
+    items = _render_items_for_pair(pair, ctx["change_by_key"], ctx["removed_by_pair"])
+    has_subgroups = any(clean_text(i["lesson"].subgroup) for i in items)
+
+    if has_subgroups:
+        n = max(1, len(items))
+        h = style["pad_t"] + 28 + 8 + n * style["row_h"] + max(0, n - 1) * style["row_gap"]
+        if _subgroup_shared_teacher(items):
+            h += 8 + 15
+        return h + style["pad_b"]
+
+    lesson = items[0]["lesson"]
+    h = (style["pad_t"] + 28 + style["g1"] + _lh(style["subject_size"])
+         + style["g2"] + 22)
+    if not is_placeholder_subject(lesson.subject):
+        h += style["g3"] + 15
+        if clean_text(getattr(lesson, "groups", "")):
+            h += 2 + 13
+    return h + style["pad_b"]
+
+
+def _subgroup_shared_teacher(items: list) -> list:
+    """Уникальные преподаватели парных подгрупп (не отменённых).
+
+    [«Арнаутова А.В.»] -> общая строка под блоком строк.
+    [] / несколько -> строк под блоком нет (или преподаватель
+    пишется в своей строке подгруппы).
+    """
+    teachers = set()
+    for item in items:
+        lesson = item["lesson"]
+        if item["kind"] == "removed":
+            continue
+        if is_placeholder_subject(lesson.subject):
+            continue
+        t = clean_text(lesson.teacher)
+        if t and t != "—":
+            teachers.add(t)
+    return sorted(teachers)
+
+
+def _measure_change_card(change: ScheduleChange, style: dict) -> int:
+    pad = style["chg_pad"]
+    h = pad + 18 + 4 + _lh(style["chg_subject_size"]) + 5 + 18 + pad
+    if change.kind == "changed":
+        details = [d for d in change.details]
+        if len(details) > 1 or (details and len(clean_text(
+                f"{details[0].get('label')}: "
+                f"{details[0].get('old') or '—'} → {details[0].get('new') or '—'}"
+            )) > 46):
+            h += 14
+    return h
+
+
+def _change_card_lines(change: ScheduleChange, style: dict) -> dict:
+    """Тексты карточки изменения (правая колонка)."""
+    pair = clean_text(change.pair).upper() or "—"
+    subgroup = clean_text(change.subgroup) or None
+    if change.kind == "added":
+        item = change.new or {}
+    else:
+        item = change.new or change.old or {}
+    subject = display_subject_text(item.get("subject", ""))
+    room = clean_text(item.get("room", ""))
+    cancelled = is_placeholder_subject(item.get("subject", ""))
+
+    status = ""
+    badge = None
+    if change.kind == "removed":
+        badge = "ОТМЕНА" if cancelled else "УДАЛЕНО"
+    elif change.kind == "added":
+        if cancelled:
+            badge = "ОТМЕНА"
+        else:
+            status = f"{room} · добавлено" if room and room != "—" else "добавлено"
+    else:  # changed
+        if cancelled:
+            badge = "ОТМЕНА"
+        else:
+            details = change.details or []
+            detail = details[0] if details else None
+            if detail:
+                label = clean_text(detail.get("label") or detail.get("field", ""))
+                old_val = clean_text(detail.get("old", ""))
+                new_val = clean_text(detail.get("new", ""))
+                if detail.get("field") in ("subject",) or label == "Предмет":
+                    old_val = display_subject_text(old_val) if old_val else old_val
+                    new_val = display_subject_text(new_val) if new_val else new_val
+                status = f"{label}: {old_val or '—'} → {new_val or '—'}"
+            else:
+                status = "изменено"
+            if len(details) > 1:
+                status_extra = f"и ещё {len(details) - 1} изм."
+            else:
+                status_extra = ""
+    extra = locals().get("status_extra", "")
+    return {
+        "pair": pair, "subgroup": subgroup, "subject": subject,
+        "room": room, "status": status, "badge": badge,
+        "cancelled": cancelled, "extra": extra,
+        "kind": change.kind,
+    }
+
+
+def _footer_geometry(note_lines: list, H: int) -> dict:
+    """Позиции подвала: разделитель-арка + сноска про акад. час."""
+    note_h = len(note_lines) * _lh(11) + max(0, len(note_lines) - 1) * 4
+    note_bottom = H - S_BOTTOM_PAD
+    note_y = note_bottom - note_h
+    divider_h = 18
+    divider_y = note_y - 12 - divider_h if note_lines else H - S_BOTTOM_PAD - divider_h
+    content_bottom = divider_y - 16
+    return {
+        "note_lines": note_lines, "note_y": note_y, "note_h": note_h,
+        "divider_y": divider_y, "content_bottom": content_bottom,
+    }
+
+
+def _build_plan(schedule: Schedule, changes: list, title, style: dict,
+                ctx: dict, fixed: bool = True) -> dict:
+    """Чистый расчёт layout (без отрисовки)."""
+    W = SCHEDULE_WIDTH
+    has_changes = bool(changes)
+    content_w = W - 2 * S_MARGIN
+    if has_changes:
+        left_x = S_MARGIN
+        left_w = content_w - S_RIGHT_COL_W - S_COL_GAP
+        right_x = left_x + left_w + S_COL_GAP
+        right_w = S_RIGHT_COL_W
+    else:
+        left_x, left_w = S_MARGIN, content_w
+        right_x, right_w = None, 0
+
+    note_lines = ctx.get("note_lines", [])
+    H = SCHEDULE_HEIGHT
+    footer = _footer_geometry(note_lines, H)
+    budget = footer["content_bottom"] - S_CONTENT_TOP
+
+    # --- карточки пар (левая колонка) ---
+    cards = []
+    y = S_CONTENT_TOP
+    for pair in schedule.pairs:
+        h = calculate_card_height(pair, style, ctx)
+        cards.append({
+            "pair": pair,
+            "items": _render_items_for_pair(pair, ctx["change_by_key"],
+                                            ctx["removed_by_pair"]),
+            "x": left_x, "y": y, "w": left_w, "h": h,
+        })
+        y += h + style["card_gap"]
+    content_bottom = (y - style["card_gap"]) if cards else S_CONTENT_TOP
+
+    fits = content_bottom <= footer["content_bottom"]
+
+    # --- авто-высота (крайний случай, кроп невозможен) ---
+    if not fixed and content_bottom > footer["content_bottom"]:
+        H = max(SCHEDULE_HEIGHT,
+                content_bottom + 16 + (12 + footer["note_h"]) + 18
+                + S_BOTTOM_PAD)
+        footer = _footer_geometry(note_lines, H)
+        # y карточек пересчитываем не нужно: контент от S_CONTENT_TOP.
+        fits = True
+
+    # --- правая колонка «Изменения» ---
+    change_cards = []
+    change_overflow = 0
+    if has_changes:
+        cy = S_CONTENT_TOP + 34
+        limit = footer["content_bottom"]
+        for change in changes:
+            h = _measure_change_card(change, style)
+            if cy + h > limit and change_cards:
+                change_overflow += 1
+                continue
+            change_cards.append({
+                "change": change, "info": _change_card_lines(change, style),
+                "x": right_x, "y": cy, "w": right_w, "h": h,
+            })
+            cy += h + style["chg_gap"]
+        # пересчёт overflow: сколько не влезло
+        shown = len(change_cards)
+        change_overflow = max(0, len(changes) - shown)
+
+    plan = {
+        "W": W, "H": H, "style": style, "ctx": ctx,
+        "left": (left_x, left_w), "right": (right_x, right_w),
+        "has_changes": has_changes,
+        "cards": cards, "content_bottom": content_bottom,
+        "change_cards": change_cards, "change_overflow": change_overflow,
+        "footer": footer,
+        "empty_rect": None,
+        "title": title,
+        "owners": {},
+        "elements": [],
+        "fits": fits,
+    }
+
+    # --- владельцы зон (для validate_layout) ---
+    plan["owners"]["header"] = (0, 0, W, S_HEADER_BOTTOM)
+    plan["owners"]["footer"] = (0, footer["content_bottom"], W, H)
+    for idx, card in enumerate(cards):
+        plan["owners"][f"card:{idx}"] = (
+            card["x"], card["y"], card["x"] + card["w"], card["y"] + card["h"],
+        )
+    if not cards:
+        ew, eh = min(560, left_w), 150
+        ex = left_x + (left_w - ew) / 2
+        ey = S_CONTENT_TOP + max(0, (budget - eh) / 2)
+        plan["empty_rect"] = (ex, ey, ew, eh)
+        plan["owners"]["empty"] = (ex, ey, ex + ew, ey + eh)
+    for idx, cc in enumerate(change_cards):
+        plan["owners"][f"change:{idx}"] = (
+            cc["x"], cc["y"], cc["x"] + cc["w"], cc["y"] + cc["h"],
+        )
+    return plan
+
+
+# ============================================================
+# ОТРИСОВКА
+# ============================================================
+
+def draw_header(
+    image, draw, plan: dict, schedule: Schedule, ctx: dict
+) -> None:
+    """Шапка: label + группа/ФИО + дата | pill занятий + прогресс."""
+    rep = plan["elements"]
+    W = plan["W"]
+    title = plan.get("title") or "РАСПИСАНИЕ"
+    is_staff = schedule.schedule_type == "staff"
+
+    # Готический микро-акцент слева от label.
+    draw_gothic_arch(draw, S_MARGIN, 44, 14, 22)
+    plan["owners"]["header"] = plan["owners"]["header"]  # no-op
+
+    # Pill «N занятий» (справа) — сначала он, т.к. заголовок ограничен
+    # его левой границей.
+    lesson_count = count_lessons(schedule.lessons)
+    count_word = _plural(lesson_count, "занятие", "занятия", "занятий")
+    f_num = _font_for(20, "bold")
+    f_word = _font_for(13, "regular")
+    num_txt = str(lesson_count)
+    pill_w = int(16 + f_num.getlength(num_txt) + 6
+                 + f_word.getlength(count_word) + 16)
+    pill_x = W - S_MARGIN - pill_w
+    pill_y, pill_h = 58, 36
+    draw.rounded_rectangle((pill_x, pill_y, pill_x + pill_w, pill_y + pill_h),
+                           radius=pill_h / 2, fill=S_WHITE,
+                           outline=S_BORDER, width=1)
+    rep.append({"id": "header:pill", "owner": "header", "kind": "shape",
+                "bbox": (pill_x, pill_y, pill_x + pill_w, pill_y + pill_h),
+                "zone": (pill_x, pill_y, pill_x + pill_w, pill_y + pill_h),
+                "truncated": False, "size": 20, "text": num_txt + " " + count_word})
+
+    title_max_w = (pill_x - 28) - S_MARGIN
+    draw_text_bounded(
+        draw, S_MARGIN, 44, min(430, title_max_w), 20,
+        clean_text(title).upper(), 13, "bold", S_PURPLE,
+        letter_spacing=3, min_size=10,
+        report=rep, element_id="header:label", owner="header",
+    )
+    big_title = (
+        clean_text(schedule.staff_name or schedule.group)
+        if is_staff else clean_text(schedule.group or GROUP_NAME)
+    )
+    draw_text_bounded(
+        draw, S_MARGIN, 70, title_max_w, 46,
+        big_title, 36, "bold", S_INK,
+        min_size=20, valign="top",
+        report=rep, element_id="header:title", owner="header",
+    )
+    draw_text_bounded(
+        draw, S_MARGIN + 2, 120, title_max_w, 20,
+        format_date_header(schedule.date), 16, "regular", S_MUTED,
+        min_size=12,
+        report=rep, element_id="header:date", owner="header",
+    )
+    # Числа pill.
+    draw_text_bounded(
+        draw, pill_x + 16, pill_y, f_num.getlength(num_txt) + 2, pill_h,
+        num_txt, 20, "bold", S_PURPLE, valign="middle",
+        report=rep, element_id="header:count", owner="header",
+    )
+    draw_text_bounded(
+        draw, pill_x + 16 + f_num.getlength(num_txt) + 6, pill_y,
+        f_word.getlength(count_word) + 4, pill_h,
+        count_word, 13, "regular", S_MUTED, valign="middle",
+        report=rep, element_id="header:count_word", owner="header",
+    )
+
+    # Прогресс обучения (только основная группа, если есть история).
+    forecast = ctx.get("forecast")
+    if ctx.get("is_group") and forecast is not None and forecast.studied_minutes > 0:
+        draw_text_bounded(
+            draw, W - S_MARGIN - 300, 104, 300, 15,
+            study_badge_text(forecast), 12, "regular", S_MUTED,
+            align="right", min_size=10,
+            report=rep, element_id="header:progress_text", owner="header",
+        )
+        bar_w, bar_h, bar_y = 300, 4, 124
+        bar_x = W - S_MARGIN - bar_w
+        draw.rounded_rectangle((bar_x, bar_y, bar_x + bar_w, bar_y + bar_h),
+                               radius=bar_h / 2, fill="#E7E8EF")
+        share = 0.0
+        if forecast.total_minutes > 0:
+            share = min(1.0, forecast.studied_minutes / forecast.total_minutes)
+        fill_w = max(4, int(bar_w * share)) if share else 0
+        if fill_w:
+            draw.rounded_rectangle(
+                (bar_x, bar_y, bar_x + fill_w, bar_y + bar_h),
+                radius=bar_h / 2, fill=S_PURPLE,
+            )
+        rep.append({"id": "header:progress_bar", "owner": "header",
+                    "kind": "shape",
+                    "bbox": (bar_x, bar_y, bar_x + bar_w, bar_y + bar_h),
+                    "zone": (bar_x, bar_y, bar_x + bar_w, bar_y + bar_h),
+                    "truncated": False, "size": 4, "text": ""})
+
+
+def draw_room_badge(
+    draw, plan: dict, owner: str, element_id: str,
+    x: float, y: float, max_w: float, h: int, room: str,
+    *, align: str = "left",
+) -> int:
+    """Зелёный бейдж аудитории. Возвращает фактическую ширину."""
+    rep = plan["elements"]
+    text = f"АУД. {room}"
+    res = fit_text(text, 10, "bold", max_w - 20, min_size=9, max_lines=1)
+    font = _font_for(res["size"], "bold")
+    text_w = font.getlength(res["lines"][0])
+    w = int(min(max_w, text_w + 20))
+    bx = x + (max_w - w) if align == "right" else x
+    by = y
+    draw.rounded_rectangle((bx, by, bx + w, by + h), radius=h / 2,
+                           fill=S_GREEN_L)
+    rep.append({"id": element_id, "owner": owner, "kind": "badge",
+                "bbox": (bx, by, bx + w, by + h),
+                "zone": (bx, by, bx + w, by + h),
+                "truncated": res["truncated"], "size": res["size"],
+                "text": res["lines"][0]})
+    draw_text_bounded(
+        draw, bx + 10, by, w - 20, h,
+        res["lines"][0], res["size"], "bold", S_GREEN,
+        align="left", valign="middle", min_size=9,
+        report=rep, element_id=element_id + ":text", owner=owner,
+    )
+    return w
+
+
+def _status_badge(
+    draw, plan: dict, owner: str, element_id: str,
+    x: float, y: float, max_w: float, h: int, label: str,
+) -> int:
+    """Красный бейдж ОТМЕНА/УДАЛЕНО. Возвращает ширину."""
+    rep = plan["elements"]
+    res = fit_text(label, 10, "bold", max_w - 20, min_size=9, max_lines=1)
+    font = _font_for(res["size"], "bold")
+    text_w = font.getlength(res["lines"][0])
+    w = int(min(max_w, text_w + 20))
+    bx = x + (max_w - w)
+    draw.rounded_rectangle((x + (max_w - w), y, bx + w, y + h),
+                           radius=h / 2, fill=S_RED)
+    rep.append({"id": element_id, "owner": owner, "kind": "badge",
+                "bbox": (bx, y, bx + w, y + h),
+                "zone": (bx, y, bx + w, y + h),
+                "truncated": res["truncated"], "size": res["size"],
+                "text": res["lines"][0]})
+    draw_text_bounded(
+        draw, bx + 10, y, w - 20, h,
+        res["lines"][0], res["size"], "bold", S_WHITE,
+        valign="middle", min_size=9,
+        report=rep, element_id=element_id + ":text", owner=owner,
+    )
+    return w
+
+
+_KIND_TAG = {"changed": ("ИЗМЕНЕНО", S_PURPLE),
+             "added": ("ДОБАВЛЕНО", S_GREEN),
+             "removed": ("УДАЛЕНО", S_RED)}
+
+
+def draw_session_card(
+    image, draw, plan: dict, card: dict, ctx: dict
+) -> None:
+    """Компактная карточка обычного занятия (без подгрупп).
+
+    Приоритет информации: время → предмет → аудитория →
+    преподаватель → доп. информация (прогресс).
+    """
+    rep = plan["elements"]
+    style = plan["style"]
+    owner_id = _card_owner_id(plan, card)
+    cx, cy, cw, ch = card["x"], card["y"], card["w"], card["h"]
+    draw.rounded_rectangle((cx, cy, cx + cw, cy + ch), radius=16,
+                           fill=S_WHITE, outline=S_BORDER, width=1)
+
+    item = card["items"][0]
+    lesson = item["lesson"]
+    kind = item["kind"]
+    cancelled = is_placeholder_subject(lesson.subject)
+    pad_x, pad_t = style["pad_x"], style["pad_t"]
+    x0 = cx + pad_x
+    w_full = cw - 2 * pad_x
+    y = cy + pad_t
+
+    # --- ряд 1: номер пары + время (+ перемена / тег изменения) ---
+    badge_s = 28
+    draw.rounded_rectangle((x0, y, x0 + badge_s, y + badge_s), radius=10,
+                           fill=S_PURPLE_L)
+    roman = clean_text(card["pair"].number).upper() or "—"
+    draw_text_bounded(
+        draw, x0, y, badge_s, badge_s, roman, 13, "bold", S_PURPLE,
+        align="center", valign="middle", min_size=9, max_lines=1,
+        report=rep, element_id=owner_id + ":roman", owner=owner_id,
+    )
+    # Правый край ряда 1: тег изменения либо «перемена N мин».
+    right_txt = ""
+    right_color = S_MUTED
+    if kind in _KIND_TAG:
+        right_txt, right_color = _KIND_TAG[kind]
+    elif clean_text(getattr(card["pair"], "break_duration", "")):
+        right_txt = f"перемена {clean_text(card['pair'].break_duration)}"
+    right_w = 0
+    if right_txt:
+        rres = fit_text(right_txt, 11, "regular" if kind not in _KIND_TAG else "bold",
+                        220, min_size=9)
+        rfont = _font_for(rres["size"], rres["lines"] and ("bold" if kind in _KIND_TAG else "regular"))
+        right_w = int(rfont.getlength(rres["lines"][0])) + 4
+    time_x = x0 + badge_s + 12
+    time_txt = (f"{clean_text(card['pair'].start)} — {clean_text(card['pair'].end)}"
+                if card["pair"].start and card["pair"].end
+                else clean_text(lesson.time))
+    draw_text_bounded(
+        draw, time_x, y, max(40, w_full - badge_s - 12 - right_w), 28,
+        time_txt, style["time_size"], "bold", S_INK,
+        valign="middle", min_size=12,
+        report=rep, element_id=owner_id + ":time", owner=owner_id,
+    )
+    if right_txt:
+        draw_text_bounded(
+            draw, x0 + w_full - right_w, y, right_w, 28,
+            right_txt, 11, "bold" if kind in _KIND_TAG else "regular",
+            right_color, align="right", valign="middle", min_size=9,
+            report=rep, element_id=owner_id + ":right1", owner=owner_id,
+        )
+    y += 28 + style["g1"]
+
+    # --- ряд 2: предмет ---
+    subject = display_subject_text(lesson.subject)
+    subj_fill = S_RED if cancelled else S_INK
+    draw_text_bounded(
+        draw, x0, y, w_full, _lh(style["subject_size"]),
+        subject, style["subject_size"], "semibold", subj_fill,
+        valign="top", min_size=12,
+        report=rep, element_id=owner_id + ":subject", owner=owner_id,
+    )
+    y += _lh(style["subject_size"]) + style["g2"]
+
+    if cancelled:
+        # Отмена: бейдж ОТМЕНА справа, без аудитории/преподавателя.
+        _status_badge(draw, plan, owner_id, owner_id + ":cancel",
+                      x0, y, w_full, 22, "ОТМЕНА")
+        return
+
+    # --- ряд 3: аудитория (бейдж) + прогресс справа ---
+    room = clean_text(lesson.room)
+    room_txt = room if room and room != "—" else "—"
+    progress = _progress_text_for(lesson, ctx)
+    prog_zone_w = 0
+    if progress:
+        prog_zone_w = 150 if progress.startswith("Изучено:") \
+            else min(190, w_full - 120)
+    room_max_w = w_full - prog_zone_w - 16
+    draw_room_badge(
+        draw, plan, owner_id, owner_id + ":room",
+        x0, y, max(60, room_max_w), 22, room_txt,
+    )
+    if progress:
+        # Зона прогресса покрывает ряды 3–4 справа. Две строки
+        # («Изучено:» / «N акад. ч») рисуются над рядом преподавателя,
+        # одна строка («Первое занятие…») — по центру объединённой зоны.
+        combined_h = 22 + style["g3"] + 15
+        if progress.startswith("Изучено:"):
+            value = progress.split(":", 1)[1].strip()
+            draw_text_bounded(
+                draw, x0 + w_full - prog_zone_w, y, prog_zone_w, 14,
+                "Изучено:", 10, "regular", S_MUTED, align="right",
+                min_size=9,
+                report=rep, element_id=owner_id + ":progress1", owner=owner_id,
+            )
+            draw_text_bounded(
+                draw, x0 + w_full - prog_zone_w, y + 16, prog_zone_w, 16,
+                value, 12, "bold", S_GREEN, align="right", min_size=9,
+                report=rep, element_id=owner_id + ":progress2", owner=owner_id,
+            )
+        else:
+            draw_text_bounded(
+                draw, x0 + w_full - prog_zone_w, y, prog_zone_w, combined_h,
+                progress, 10, "regular", S_MUTED,
+                align="right", valign="middle", min_size=9,
+                report=rep, element_id=owner_id + ":progress1", owner=owner_id,
+            )
+    y += 22 + style["g3"]
+
+    # --- ряд 4: преподаватель (+ группы для staff) ---
+    # Тег изменения (если есть) нарисован в ряду 1.
+    teacher = clean_text(lesson.teacher)
+    teacher_txt = teacher if teacher and teacher != "—" else "Преподаватель не указан"
+    draw_text_bounded(
+        draw, x0, y, w_full, 15,
+        teacher_txt, style["teacher_size"], "regular", S_MUTED,
+        min_size=9,
+        report=rep, element_id=owner_id + ":teacher", owner=owner_id,
+    )
+    groups = clean_text(getattr(lesson, "groups", ""))
+    if groups:
+        y += 2 + 13
+        draw_text_bounded(
+            draw, x0, y, w_full, 13,
+            f"Группы: {groups}", 10, "regular", S_MUTED,
+            min_size=9,
+            report=rep, element_id=owner_id + ":groups", owner=owner_id,
+        )
+
+
+def draw_subgroup_row(
+    image, draw, plan: dict, owner_id: str, card: dict,
+    row: dict, row_x: float, row_y: float, row_w: int, row_h: int
+) -> None:
+    """Одна строка подгруппы с фиксированными зонами.
+
+    Зоны (слева направо): 1) label подгруппы; 2) предмет;
+    3) аудитория/статус. Текст каждой зоны рисуется
+    draw_text_bounded строго в своей области — пересечения
+    невозможны по построению.
+    """
+    rep = plan["elements"]
+    style = plan["style"]
+    item = row
+    lesson = item["lesson"]
+    kind = item["kind"]
+    cancelled = is_placeholder_subject(lesson.subject)
+    # Отменённая строка всегда рисуется в красной стилистике —
+    # «добавлено/изменено» не подсвечивают отмену зелёным.
+    highlighted = kind in _KIND_TAG and not cancelled
+    fill = S_RED_L if (cancelled or kind == "removed") else S_ROW
+    line = S_RED_LINE if (cancelled or kind == "removed") else S_ROW_LINE
+    outline = _KIND_TAG[kind][1] if highlighted else None
+
+    draw.rounded_rectangle((row_x, row_y, row_x + row_w, row_y + row_h),
+                           radius=12, fill=fill,
+                           outline=outline if outline else line,
+                           width=2 if highlighted else 1)
+    rep.append({"id": owner_id + f":rowbg:{row.get('sub', '')}",
+                "owner": owner_id, "kind": "rowbg",
+                "bbox": (row_x, row_y, row_x + row_w, row_y + row_h),
+                "zone": (row_x, row_y, row_x + row_w, row_y + row_h),
+                "truncated": False, "size": 0, "text": ""})
+
+    pad = 12
+    label_w = 58
+    right_w = 150
+    sub_txt = _subgroup_label(lesson.subgroup) or "п/гр."
+    label_fill = S_RED if (cancelled or kind == "removed") else S_PURPLE
+    draw_text_bounded(
+        draw, row_x + pad, row_y, label_w, row_h,
+        sub_txt, 11, "bold", label_fill,
+        valign="middle", min_size=9,
+        report=rep, element_id=f"{owner_id}:sub:{row.get('sub', '')}:label",
+        owner=owner_id,
+    )
+
+    subject_x = row_x + pad + label_w + 10
+    subject_w = row_w - label_w - 10 - right_w - 8
+    # Вертикальные слоты строки (row_h = 40..44):
+    #   линия 1 (предмет/бейдж): y+5..y+23
+    #   линия 2 (преподаватель/прогресс): y+row_h-15..y+row_h-3
+    line2_y = row_y + row_h - 15
+    subject = "Занятие отменено" if (cancelled or kind == "removed") \
+        else display_subject_text(lesson.subject)
+    subj_fill = S_RED if (cancelled or kind == "removed") else S_INK
+    draw_text_bounded(
+        draw, subject_x, row_y + 5, subject_w, 18,
+        subject, 16, "semibold", subj_fill,
+        min_size=11,
+        report=rep, element_id=f"{owner_id}:sub:{row.get('sub', '')}:subject",
+        owner=owner_id,
+    )
+
+    # Вторая линия слева: преподаватель (если в паре разные).
+    teacher = clean_text(lesson.teacher)
+    if row.get("show_teacher") and teacher and teacher != "—":
+        draw_text_bounded(
+            draw, subject_x, line2_y, subject_w, 12,
+            teacher, 10, "regular", S_MUTED,
+            min_size=8,
+            report=rep, element_id=f"{owner_id}:sub:{row.get('sub', '')}:teacher",
+            owner=owner_id,
+        )
+
+    # Зона 3: аудитория/статус.
+    zx = row_x + row_w - right_w - pad
+    if cancelled or kind == "removed":
+        label = "ОТМЕНА" if cancelled else ("ОТМЕНА" if kind == "removed"
+                                            and is_placeholder_subject(lesson.subject) else "УДАЛЕНО")
+        _status_badge(draw, plan, owner_id,
+                      f"{owner_id}:sub:{row.get('sub', '')}:status",
+                      zx, row_y + 8, right_w, 18, label)
+    else:
+        room = clean_text(lesson.room)
+        room_txt = room if room and room != "—" else "—"
+        draw_room_badge(draw, plan, owner_id,
+                        f"{owner_id}:sub:{row.get('sub', '')}:room",
+                        zx, row_y + 8, right_w, 18, room_txt)
+    # Прогресс под бейджем (справа).
+    progress = _progress_text_for(lesson, ctx=plan["ctx"]) if not (
+        cancelled or kind == "removed") else ""
+    if progress:
+        p_fill = S_GREEN if progress.startswith("Изучено:") else S_MUTED
+        p_weight = "bold" if progress.startswith("Изучено:") else "regular"
+        draw_text_bounded(
+            draw, zx, line2_y, right_w, 12,
+            progress, 10, p_weight, p_fill,
+            align="right", min_size=8,
+            report=rep, element_id=f"{owner_id}:sub:{row.get('sub', '')}:progress",
+            owner=owner_id,
+        )
+
+
+def _card_owner_id(plan: dict, card: dict) -> str:
+    for idx, c in enumerate(plan["cards"]):
+        if c is card:
+            return f"card:{idx}"
+    raise ValueError("card не найден в плане")
+
+
+def draw_subgroup_session_card(
+    image, draw, plan: dict, card: dict, ctx: dict
+) -> None:
+    """Карточка пары с подгруппами: каждая подгруппа — свой ряд.
+
+    Приоритет: номер пары → время → подгруппа → предмет →
+    аудитория → преподаватель.
+    """
+    rep = plan["elements"]
+    style = plan["style"]
+    owner_id = _card_owner_id(plan, card)
+    cx, cy, cw, ch = card["x"], card["y"], card["w"], card["h"]
+    draw.rounded_rectangle((cx, cy, cx + cw, cy + ch), radius=16,
+                           fill=S_WHITE, outline=S_BORDER, width=1)
+
+    pair = card["pair"]
+    pad_x, pad_t = style["pad_x"], style["pad_t"]
+    x0 = cx + pad_x
+    w_full = cw - 2 * pad_x
+    y = cy + pad_t
+
+    # Шапка пары: номер + время + «N подгрупп».
+    badge_s = 28
+    draw.rounded_rectangle((x0, y, x0 + badge_s, y + badge_s), radius=10,
+                           fill=S_PURPLE_L)
+    roman = clean_text(pair.number).upper() or "—"
+    draw_text_bounded(
+        draw, x0, y, badge_s, badge_s, roman, 13, "bold", S_PURPLE,
+        align="center", valign="middle", min_size=9,
+        report=rep, element_id=owner_id + ":roman", owner=owner_id,
+    )
+    n_sub = max(1, len(card["items"]))
+    n_label = f"{n_sub} " + _plural(n_sub, "подгруппа", "подгруппы", "подгрупп") \
+        if n_sub > 1 else ""
+    n_w = 0
+    if n_label:
+        nres = fit_text(n_label, 11, "regular", 140, min_size=9)
+        n_w = int(_font_for(nres["size"], "regular").getlength(nres["lines"][0])) + 4
+    time_x = x0 + badge_s + 12
+    time_txt = (f"{pair.start} — {pair.end}" if pair.start and pair.end
+                else clean_text(card["items"][0]["lesson"].time))
+    draw_text_bounded(
+        draw, time_x, y, max(40, w_full - badge_s - 12 - n_w), 28,
+        time_txt, style["time_size"], "bold", S_INK,
+        valign="middle", min_size=12,
+        report=rep, element_id=owner_id + ":time", owner=owner_id,
+    )
+    if n_label:
+        draw_text_bounded(
+            draw, x0 + w_full - n_w, y, n_w, 28,
+            n_label, 11, "regular", S_MUTED, align="right", valign="middle",
+            min_size=9,
+            report=rep, element_id=owner_id + ":nsub", owner=owner_id,
+        )
+    y += 28 + 8
+
+    # Строки подгрупп.
+    shared_teachers = _subgroup_shared_teacher(card["items"])
+    distinct = len(shared_teachers) > 1
+    row_h = style["row_h"]
+    row_x = cx + 14
+    row_w = cw - 28
+    for i, item in enumerate(card["items"]):
+        row_y = y + i * (row_h + style["row_gap"])
+        draw_subgroup_row(
+            image, draw, plan, owner_id, card,
+            {**item, "sub": clean_text(item["lesson"].subgroup) or str(i + 1),
+             "show_teacher": distinct or item["kind"] == "removed"},
+            row_x, row_y, row_w, row_h,
+        )
+    y += len(card["items"]) * row_h + max(0, len(card["items"]) - 1) * style["row_gap"]
+
+    # Общий преподаватель (если у всех подгрупп один).
+    if len(shared_teachers) == 1:
+        y += 8
+        draw_text_bounded(
+            draw, x0, y, w_full, 15,
+            shared_teachers[0], style["teacher_size"], "regular", S_MUTED,
+            min_size=9,
+            report=rep, element_id=owner_id + ":teacher", owner=owner_id,
+        )
+
+
+def draw_change_card(
+    image, draw, plan: dict, cc: dict
+) -> None:
+    """Компактная карточка изменения в правой колонке.
+
+    Подгруппа ОБЯЗАТЕЛЬНА: «IV · 2 п/гр.», а не «Химия добавлена».
+    """
+    rep = plan["elements"]
+    style = plan["style"]
+    idx = plan["change_cards"].index(cc)
+    owner_id = f"change:{idx}"
+    x, y, w, h = cc["x"], cc["y"], cc["w"], cc["h"]
+    info = cc["info"]
+    pad = style["chg_pad"]
+
+    draw.rounded_rectangle((x, y, x + w, y + h), radius=14,
+                           fill=S_WHITE, outline=S_BORDER, width=1)
+    inner_w = w - 2 * pad
+    iy = y + pad
+
+    # Ряд 1: пара + подгруппа (обязательная).
+    pair_txt = info["pair"]
+    sub_txt = f" · {info['subgroup']} п/гр." if info["subgroup"] else ""
+    total = pair_txt + sub_txt
+    res = fit_text(total, 13, "bold", inner_w, min_size=10, max_lines=1)
+    font = _font_for(res["size"], "bold")
+    pair_w = font.getlength(pair_txt)
+    draw_text_bounded(
+        draw, x + pad, iy, min(pair_w + 2, inner_w), 18,
+        pair_txt[:len(res["lines"][0])] if res["truncated"] else pair_txt,
+        res["size"], "bold", S_PURPLE, valign="top", min_size=10,
+        report=rep, element_id=owner_id + ":pair", owner=owner_id,
+    )
+    if sub_txt:
+        sub_part = res["lines"][0][len(pair_txt):] if res["truncated"] else sub_txt
+        draw_text_bounded(
+            draw, x + pad + pair_w, iy, inner_w - pair_w, 18,
+            sub_part, res["size"], "regular", S_MUTED, valign="top", min_size=10,
+            report=rep, element_id=owner_id + ":sub", owner=owner_id,
+        )
+    iy += 18 + 4
+
+    # Ряд 2: предмет.
+    subj_fill = S_RED if info["cancelled"] else S_INK
+    draw_text_bounded(
+        draw, x + pad, iy, inner_w, _lh(style["chg_subject_size"]),
+        info["subject"], style["chg_subject_size"], "semibold", subj_fill,
+        min_size=11,
+        report=rep, element_id=owner_id + ":subject", owner=owner_id,
+    )
+    iy += _lh(style["chg_subject_size"]) + 5
+
+    # Ряд 3: статус.
+    if info["badge"]:
+        _status_badge(draw, plan, owner_id, owner_id + ":badge",
+                      x + pad, iy + 1, inner_w, 18, info["badge"])
+    elif info["status"]:
+        status_fill = S_GREEN if info["kind"] == "added" else S_MUTED
+        draw_text_bounded(
+            draw, x + pad, iy, inner_w, 18,
+            info["status"], 11, "bold" if info["kind"] == "added" else "regular",
+            status_fill, min_size=9,
+            report=rep, element_id=owner_id + ":status", owner=owner_id,
+        )
+    if info.get("extra"):
+        iy += 18 + 2
+        draw_text_bounded(
+            draw, x + pad, iy, inner_w, 14,
+            info["extra"], 10, "regular", S_MUTED, min_size=9,
+            report=rep, element_id=owner_id + ":extra", owner=owner_id,
+        )
+
+
+def draw_changes_panel(
+    image, draw, plan: dict
+) -> None:
+    """Правая колонка «Изменения»."""
+    rep = plan["elements"]
+    style = plan["style"]
+    right_x, right_w = plan["right"]
+    if right_x is None:
+        return
+    title_txt = "ИЗМЕНЕНИЯ"
+    count_txt = f" · {len(plan['change_cards'])}" \
+        if plan["change_cards"] else ""
+    tres = fit_text(title_txt, 20, "semibold", right_w - 80, min_size=14)
+    cfont = _font_for(tres["size"], "semibold")
+    title_w = cfont.getlength(tres["lines"][0])
+    draw_text_bounded(
+        draw, right_x, S_CONTENT_TOP, title_w + 2, 24,
+        title_txt, tres["size"], "semibold", S_INK,
+        min_size=14,
+        report=rep, element_id="panel:title", owner="footer" if False else "header",
+    )
+    # Владелец заголовка панели — header? Нет: своя зона. Используем
+    # owner «panel» (регистрируем ниже).
+    rep[-1]["owner"] = "panel"
+    plan["owners"]["panel"] = (right_x, S_CONTENT_TOP, right_x + right_w,
+                               S_CONTENT_TOP + 30)
+    if count_txt:
+        cres = fit_text(count_txt, 12, "regular", 60, min_size=10)
+        cfont2 = _font_for(cres["size"], "regular")
+        draw_text_bounded(
+            draw, right_x + title_w + 2, S_CONTENT_TOP + 6,
+            cfont2.getlength(cres["lines"][0]) + 2, 18,
+            count_txt, cres["size"], "regular", S_MUTED, min_size=10,
+            report=rep, element_id="panel:count", owner="panel",
+        )
+    for cc in plan["change_cards"]:
+        draw_change_card(image, draw, plan, cc)
+    if plan["change_overflow"] > 0:
+        note_y = S_CONTENT_TOP + 34
+        # находим нижний край последней карточки
+        if plan["change_cards"]:
+            last = plan["change_cards"][-1]
+            note_y = last["y"] + last["h"] + style["chg_gap"]
+        draw_text_bounded(
+            draw, right_x, note_y, right_w, 14,
+            f"и ещё {plan['change_overflow']} изменений",
+            11, "regular", S_MUTED, min_size=9,
+            report=rep, element_id="panel:more", owner="panel",
+        )
+        plan["owners"]["panel"] = (
+            right_x, S_CONTENT_TOP, right_x + right_w, note_y + 14,
+        )
+
+
+def draw_empty_card(
+    image, draw, plan: dict
+) -> None:
+    rep = plan["elements"]
+    ex, ey, ew, eh = plan["empty_rect"]
+    draw.rounded_rectangle((ex, ey, ex + ew, ey + eh), radius=16,
+                           fill=S_WHITE, outline=S_BORDER, width=1)
+    draw_text_bounded(
+        draw, ex, ey + eh / 2 - 34, ew, 26,
+        "Занятий нет", 20, "semibold", S_INK,
+        align="center", min_size=14,
+        report=rep, element_id="empty:title", owner="empty",
+    )
+    draw_text_bounded(
+        draw, ex + 24, ey + eh / 2 + 4, ew - 48, 18,
+        "Расписание на этот день не опубликовано.",
+        13, "regular", S_MUTED,
+        align="center", min_size=10, max_lines=2,
+        report=rep, element_id="empty:sub", owner="empty",
+    )
+
+
+def draw_footer(
+    image, draw, plan: dict
+) -> None:
+    rep = plan["elements"]
+    footer = plan["footer"]
+    W = plan["W"]
+    H = plan["H"]
+    cx = W / 2
+    draw_gothic_divider(draw, cx, footer["divider_y"], half_len=150)
+    rep.append({"id": "footer:divider", "owner": "footer", "kind": "shape",
+                "bbox": (cx - 150, footer["divider_y"], cx + 150,
+                         footer["divider_y"] + 18),
+                "zone": (cx - 150, footer["divider_y"], cx + 150,
+                         footer["divider_y"] + 18),
+                "truncated": False, "size": 0, "text": ""})
+    ny = footer["note_y"]
+    for line in footer["note_lines"]:
+        draw_text_bounded(
+            draw, 0, ny, W, _lh(11),
+            line, 11, "regular", S_MUTED,
+            align="center", min_size=9,
+            report=rep, element_id="footer:note", owner="footer",
+        )
+        ny += _lh(11) + 4
+
+
+def _draw_plan(
+    image, draw, plan: dict, schedule: Schedule, ctx: dict
+) -> None:
+    """Отрисовка всего плана на холсте."""
+    draw.rectangle((0, 0, plan["W"], plan["H"]), fill=S_BG)
+    draw_header(image, draw, plan, schedule, ctx)
+    for card in plan["cards"]:
+        if any(clean_text(i["lesson"].subgroup) for i in card["items"]):
+            draw_subgroup_session_card(image, draw, plan, card, ctx)
+        else:
+            draw_session_card(image, draw, plan, card, ctx)
+    if plan["empty_rect"] is not None:
+        draw_empty_card(image, draw, plan)
+    if plan["has_changes"]:
+        draw_changes_panel(image, draw, plan)
+    draw_footer(image, draw, plan)
+
+
+# ============================================================
+# ВАЛИДАЦИЯ LAYOUT
+# ============================================================
+
+def _intersect_area(a: tuple, b: tuple) -> float:
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
+
+
+def validate_layout(plan: dict) -> list:
+    """Проверка layout ДО сохранения изображения.
+
+    Проверяет:
+    - ни один текст не выходит за свою зону и за карточку (owner);
+    - ничего не выходит за границы холста;
+    - элементы не пересекаются (текст × текст/бейдж/фигура);
+    - все бейджи помещаются в свою карточку;
+    - подгруппы помещаются полностью (их строки внутри карточки);
+    - правая колонка не выходит за пределы колонки;
+    - нижние элементы (сноска, разделитель) не пересекаются
+      с контентом и не прижаты к краю.
+
+    Возвращает список проблем (пустой — layout корректен).
+    """
+    problems: list = []
+    eps = 1.6
+    W, H = plan["W"], plan["H"]
+    owners = plan["owners"]
+    elements = plan["elements"]
+
+    for el in elements:
+        x0, y0, x1, y1 = el["bbox"]
+        zx0, zy0, zx1, zy1 = el["zone"]
+        # 1) bbox внутри своей зоны.
+        if (x0 < zx0 - eps or y0 < zy0 - eps
+                or x1 > zx1 + eps or y1 > zy1 + eps):
+            problems.append(
+                f"«{el['id']}»: текст вышел за зону "
+                f"({x0:.0f},{y0:.0f},{x1:.0f},{y1:.0f}) vs "
+                f"({zx0:.0f},{zy0:.0f},{zx1:.0f},{zy1:.0f})"
+            )
+        # 2) зона внутри owner-прямоугольника.
+        owner = owners.get(el["owner"])
+        if owner is None:
+            problems.append(f"«{el['id']}»: неизвестный owner «{el['owner']}»")
+        elif (zx0 < owner[0] - eps or zy0 < owner[1] - eps
+              or zx1 > owner[2] + eps or zy1 > owner[3] + eps):
+            problems.append(
+                f"«{el['id']}»: зона вышла за карточку {el['owner']}"
+            )
+        # 3) bbox внутри холста.
+        if x0 < -eps or y0 < -eps or x1 > W + eps or y1 > H + eps:
+            problems.append(f"«{el['id']}»: элемент вышел за холст")
+
+    # 4) пересечения элементов (кроме фонов: card/rowbg/bg).
+    checkable = [
+        el for el in elements if el["kind"] not in ("card", "rowbg", "bg")
+    ]
+
+    def _contains(outer: tuple, inner: tuple) -> bool:
+        return (outer[0] - eps <= inner[0] and outer[1] - eps <= inner[1]
+                and outer[2] + eps >= inner[2]
+                and outer[3] + eps >= inner[3])
+    for i in range(len(checkable)):
+        for j in range(i + 1, len(checkable)):
+            a, b = checkable[i], checkable[j]
+            if a["id"] == b["id"]:
+                continue
+            area = _intersect_area(a["bbox"], b["bbox"])
+            if area <= 3:
+                continue
+            # Текст ВНУТРИ бейджа/фигуры — намеренное вложение,
+            # не пересечение.
+            if (a["kind"] in ("badge", "shape") and b["kind"] == "text"
+                    and _contains(a["bbox"], b["bbox"])):
+                continue
+            if (b["kind"] in ("badge", "shape") and a["kind"] == "text"
+                    and _contains(b["bbox"], a["bbox"])):
+                continue
+            problems.append(f"пересечение: «{a['id']}» × «{b['id']}»")
+
+    # 5) колонки: левая и правая не пересекаются и в пределах холста.
+    left_x, left_w = plan["left"]
+    for el in elements:
+        if el["owner"] in ("header", "footer"):
+            continue
+        ox0, oy0, ox1, oy1 = owners.get(el["owner"], (0, 0, W, H))
+        if plan["has_changes"] and ox1 > left_x + left_w + eps + 1:
+            # правая колонка — только в её границах
+            right_x, right_w = plan["right"]
+            if ox0 < right_x - eps:
+                problems.append(
+                    f"«{el['id']}»: левая колонка вторглась в правую"
+                )
+
+    # 6) низ: сноска/разделитель не прижаты к краю, не наезжают
+    #    на последнюю карточку.
+    footer_owner = owners.get("footer")
+    content_bottom = plan.get("content_bottom", 0)
+    if footer_owner and content_bottom > 0:
+        if footer_owner[1] < content_bottom - eps:
+            problems.append("подвал наехал на контент")
+    for el in elements:
+        if el["owner"] == "footer" and el["kind"] == "text":
+            if H - el["bbox"][3] < 20:
+                problems.append(f"«{el['id']}»: прижат к нижнему краю")
+
+    return problems
+
+
+# ============================================================
+# ТОЧКА ВХОДА: render_schedule_image
+# ============================================================
+
+# Последний layout-отчёт — для диагностики и тестов.
+_LAST_RENDER: dict = {}
+
+
 def render_schedule_image(
     schedule: Schedule,
     changes=None,
     title: Optional[str] = None,
 ) -> Path:
-    """
-    Создаёт PNG-картинку расписания (вертикальная лента карточек пар).
+    """Создаёт PNG-карточку расписания в формате 1080×920.
 
-    Пары рисуются одна под другой, а ширина изображения фиксирована
-    (W = IMAGE_WIDTH = 1280) и не зависит от числа пар.
+    Современный minimal-dashboard: светлый фон, белые карточки,
+    фиолетовый акцент, колонка «Изменения» (при наличии changes),
+    подгруппы — отдельными строками с фиксированными зонами,
+    аудитория — зелёным бейджем, отмены — красным.
 
-    - `changes=None`  -> обычная картинка без выделения изменений.
-    - `changes=[...]` -> изменённые блоки выделяются цветом/рамкой,
-      добавляется заголовок «РАСПИСАНИЕ ИЗМЕНИЛОСЬ» и блок
-      «Что изменилось».
-    - `title`         -> произвольный заголовок в шапке (например
-      «РАСПИСАНИЕ ОПУБЛИКОВАНО»).
-    - для `schedule_type == "staff"` в шапке выводится ФИО
-      преподавателя, а в карточках — группы пар (`lesson.groups`).
-    - для расписания основной группы в правом нижнем углу шапки
-      показывается бейдж «Изучено: X / Y акад. ч» с фактическим временем
-      и прогнозом на учебный год из истории завершённых пар, а внизу —
-      серая курсивная сноска про академический час с расчётом по
-      обыкновенному времени.
+    - `changes=None`  -> обычная картинка (одна колонка пар).
+    - `changes=[...]` -> правая колонка «Изменения», затронутые
+      занятия подсвечиваются (изменено/добавлено/удалено).
+    - `title`         -> произвольный label в шапке.
+    - staff-расписание: в шапке ФИО, в карточках — группы пар.
+    - для основной группы: pill «N занятий», прогресс обучения
+      (бейдж «Изучено: X / Y акад. ч» + шкала) и сноска про
+      академический час в подвале.
+
+    Перед сохранением layout проходит validate_layout(); текст
+    рисуется только через draw_text_bounded и никогда не выходит
+    за границы карточек. Если контент не влезает в 920 px, layout
+    уплотняется; в крайнем случае холст становится выше — кроп
+    невозможен.
     """
     try:
         lessons = list(schedule.lessons)
         changes = list(changes or [])
-        pairs = schedule.pairs
         is_group = schedule.schedule_type == "group"
-        is_staff = schedule.schedule_type == "staff"
 
-        # История нужна только для расписания основной группы. Загружаем её
-        # одним запросом на картинку: эти же totals используются и строками
-        # прогресса в блоках, и бейджем в шапке.
+        # История нужна только основной группе (бизнес-логика та же).
         subject_totals = {}
         if is_group:
             register_subjects_from_schedule(schedule)
             subject_totals = load_subject_totals()
 
-        # Шрифты
-        font_label = get_font(24, bold=True)
-        font_group = get_font(72, bold=True)
-        font_date = get_font(30)
-        font_count = get_font(24, bold=True)
-        font_total = get_font(22, bold=True)
-        font_pair = get_font(28, bold=True)
-        font_time = get_font(32, bold=True)
-        font_break = get_font(22)
-        font_subject = get_font(34, bold=True)
-        font_info = get_font(26)
-        font_subg = get_font(24, bold=True)
-        font_status = get_font(22, bold=True)
-        font_detail = get_font(23, bold=True)
-        font_empty_title = get_font(44, bold=True)
-        font_empty_sub = get_font(30)
-        font_summary = get_font(25, bold=True)
-        font_summary_body = get_font(24)
+        forecast = get_study_forecast() if is_group else None
+        note_lines = study_note_lines(forecast) if forecast is not None else []
 
-        # Геометрия
-        W = IMAGE_WIDTH
-        MARGIN = 58
-        HEADER_H = 250
-        card_gap = 28
-        x1 = MARGIN
-        x2 = W - MARGIN
-        inner = 48
-        text_w = (x2 - x1) - 2 * inner
-        circle_s = 68
-        top_pad = 26
-        pad_bottom = 24
-        item_gap = 16
-        # Вертикальные уровни шапки карточки:
-        #   1) время пары; 2) «перемена XX мин»; затем блоки занятий
-        #   (3) предмет, 4) аудитория/преподаватель — рисуются ниже).
-        time_line_h = _text_h(font_time)
-        break_line_h = _text_h(font_break)
-        break_gap = 6      # между строкой времени и строкой перемены
-        header_gap = 24    # между шапкой пары и первым блоком занятия
-        time_x_offset = 34  # отступ текстовой колонки от кружка пары
-        line_h = int(font_subject.size * 1.35)
-        chip_h = 44
-        subg_h = 30
-        status_h = 30
-        detail_h = 30
-        progress_gap = 8
-        progress_h = _text_h(font_break)
-
-        def progress_for_lesson(lesson):
-            """Возвращает подпись и цвет прогресса для блока занятия."""
-            if not is_group:
-                return "", COL_MUTED
-            if is_placeholder_subject(lesson.subject):
-                return "", COL_MUTED
-            normalized = normalize_subject_name(lesson.subject)
-            if not normalized:
-                return "", COL_MUTED
-            minutes = subject_totals.get(normalized, 0)
-            if minutes > 0:
-                return (
-                    f"Изучено: {format_academic_hours(minutes)}",
-                    COL_GREEN,
-                )
-            return "Первое занятие по предмету", COL_MUTED
-
-        change_by_key = {
-            (clean_text(c.pair).upper(), clean_text(c.subgroup) or None): c
-            for c in changes
+        ctx = {
+            "is_group": is_group,
+            "subject_totals": subject_totals,
+            "forecast": forecast,
+            "note_lines": note_lines,
+            "change_by_key": {
+                (clean_text(c.pair).upper(), clean_text(c.subgroup) or None): c
+                for c in changes
+            },
+            "removed_by_pair": {},
         }
-        removed_by_pair = {}
         for c in changes:
             if c.kind == "removed":
-                removed_by_pair.setdefault(
+                ctx["removed_by_pair"].setdefault(
                     clean_text(c.pair).upper(), []
                 ).append(c)
 
-        def subject_lines_for(subject):
-            return _wrap_lines(
-                display_subject_text(subject), font_subject, text_w
-            )
+        plan = None
+        image = None
+        draw = None
+        problems: list = []
+        level_used = 0
+        for level in range(4):
+            style = _style_for_level(level)
+            plan = _build_plan(schedule, changes, title, style, ctx, fixed=True)
+            image = Image.new("RGB", (plan["W"], plan["H"]), S_BG)
+            draw = ImageDraw.Draw(image)
+            plan["elements"] = []
+            _draw_plan(image, draw, plan, schedule, ctx)
+            problems = validate_layout(plan)
+            level_used = level
+            if plan["fits"] and not problems:
+                break
 
-        def item_block_height(item) -> int:
-            lesson = item["lesson"]
-            cancelled = is_placeholder_subject(lesson.subject)
-            h = 8 + 10  # верхний/нижний отступ
-            if _subgroup_label(lesson.subgroup):
-                h += subg_h
-            if item["kind"] != "normal":
-                h += status_h
-            h += line_h * len(subject_lines_for(lesson.subject))
-            # У отменённого занятия нет ни аудитории, ни преподавателя,
-            # ни прогресса — только строка «Занятие отменено».
-            if not cancelled:
-                h += 14 + chip_h
-                if clean_text(getattr(lesson, "groups", "")):
-                    h += 8 + _text_h(font_info)
-                progress_text, _ = progress_for_lesson(lesson)
-                if progress_text:
-                    h += progress_gap + progress_h
-            if item["kind"] == "changed":
-                h += 8 + detail_h * len(item["details"])
-            return h
+        if plan is None or not (plan["fits"] and not problems):
+            # Крайний случай: холст растёт по высоте (кропа не будет).
+            style = _style_for_level(3)
+            plan = _build_plan(schedule, changes, title, style, ctx,
+                               fixed=False)
+            image = Image.new("RGB", (plan["W"], plan["H"]), S_BG)
+            draw = ImageDraw.Draw(image)
+            plan["elements"] = []
+            _draw_plan(image, draw, plan, schedule, ctx)
+            problems = validate_layout(plan)
+            level_used = 3
 
-        def pair_break_text(pair) -> str:
-            """«перемена XX мин» или пустая строка, если данных нет."""
-            duration = clean_text(getattr(pair, "break_duration", ""))
-            return f"перемена {duration}" if duration else ""
+        if problems:
+            logger.error("Layout-валидация: %s", problems)
 
-        def pair_header_metrics(pair) -> tuple:
-            """Метрики шапки пары: (высота шапки, высота текст. блока,
-            высота содержимого шапки).
-
-            Строка «перемена» — часть текстового блока времени, поэтому
-            она не сдвигает предмет по горизонтали и не наезжает на него
-            по вертикали. Если перемены нет, строка не резервируется.
-            """
-            block_h = time_line_h
-            if pair_break_text(pair):
-                block_h += break_gap + break_line_h
-            content_h = max(circle_s, block_h)
-            return top_pad + content_h + header_gap, block_h, content_h
-
-        def pair_card_height(pair) -> int:
-            items = _render_items_for_pair(
-                pair, change_by_key, removed_by_pair
-            )
-            header_h = pair_header_metrics(pair)[0]
-            blocks_h = sum(item_block_height(i) for i in items)
-            blocks_gap = max(0, len(items) - 1) * item_gap
-            return header_h + blocks_h + blocks_gap + pad_bottom
-
-        # Пустое расписание.
-        if not lessons:
-            empty_h = 250
-            pairs = []
-            cards_h = empty_h
-        else:
-            cards_h = (
-                sum(pair_card_height(p) for p in pairs)
-                + max(0, len(pairs) - 1) * card_gap
-            )
-
-        summary_lines = _change_summary_lines(changes) if changes else []
-        if changes and not summary_lines:
-            summary_lines = ["Что изменилось:"]
-        summary_h = 0
-        if summary_lines:
-            summary_h = 50 + len(summary_lines) * 34 + 20
-
-        # ---------- layout по вертикали ----------
-        # Заголовок шапки — название группы либо ФИО преподавателя.
-        # Сначала подбираем шрифт и число строк заголовка: длинное ФИО
-        # не должно уезжать под бейдж занятий или за правый край.
-        big_title = clean_text(
-            (schedule.staff_name or schedule.group)
-            if is_staff else (schedule.group or GROUP_NAME)
-        )
-        lesson_count = count_lessons(lessons)
-        if lesson_count:
-            count_text = f"{lesson_count} "
-            count_text += "занятие" if lesson_count == 1 \
-                else "занятия" if lesson_count < 5 else "занятий"
-        else:
-            count_text = "занятий нет"
-        cw = font_count.getlength(count_text)
-        chip_pad_x = 26
-        chip_w = cw + chip_pad_x * 2
-        count_chip_h = 54
-        chip_x = W - MARGIN - chip_w
-        chip_y = 48
-        title_max_w = (chip_x - 24) - (MARGIN + 20)
-
-        big_font = font_group
-        if big_font.getlength(big_title) <= title_max_w:
-            title_lines = [big_title]
-        else:
-            for size in (64, 56, 48, 44, 40, 36, 32, 28, 24):
-                candidate = get_font(size, bold=True)
-                if candidate.getlength(big_title) <= title_max_w:
-                    big_font = candidate
-                    break
-            else:
-                big_font = get_font(24, bold=True)
-            title_lines = _wrap_lines(big_title, big_font, title_max_w)[:2]
-
-        title_step = int(big_font.size * 1.2)
-        header_extra = max(0, len(title_lines) - 1) * title_step
-        header_bottom = HEADER_H + header_extra
-
-        # Бейдж «Изучено: X ч / Y ч» для расписания группы. Ставится в
-        # правый нижний угол шапки — ниже бейджа занятий и ниже заголовка,
-        # поэтому не пересекается ни с ним, ни с датой. Y — динамический
-        # прогноз на учебный год при текущем темпе (см. get_study_forecast).
-        # Показывается только когда в истории уже накоплены минуты.
-        # Прогноз нужен и бейджу в шапке, и сноске внизу картинки.
-        forecast = get_study_forecast() if is_group else None
-        total_pill = None
-        if is_group and forecast is not None:
-            if forecast.studied_minutes > 0:
-                total_text = study_badge_text(forecast)
-                total_pad_x = 26
-                total_w = font_total.getlength(total_text) + total_pad_x * 2
-                total_h = 50
-                total_x = W - MARGIN - total_w
-                total_y = 84 + len(title_lines) * title_step + 20
-                total_pill = (total_x, total_y, total_w, total_h,
-                              total_text, total_pad_x)
-
-        # Низ картинки: подписи «ИНК · расписание» больше нет, поэтому
-        # после последнего элемента контента остаётся только нижний
-        # padding — ничего не прижато к краю и не обрезается.
-        footer_pad_bottom = 40   # нижний padding изображения
-        card_shadow = 8          # тень карточек рисуется на 8px ниже
-
-        content_top = header_bottom + 36
-        if lessons:
-            content_bottom = content_top + cards_h + card_shadow
-        else:
-            content_bottom = content_top + cards_h
-
-        summary_y = None
-        if summary_lines:
-            summary_y = content_top + cards_h + (36 if lessons else 0)
-            content_bottom = summary_y + summary_h
-
-        # Сноска про академический час — часть layout: сначала строки,
-        # потом высота картинки. Пары остаются вертикальным списком,
-        # картинка просто становится выше.
-        note_lines = (
-            study_note_lines(forecast) if forecast is not None else []
-        )
-        font_note = get_font(21)
-        note_gap = 34          # между контентом и сноской
-        note_line_gap = 8      # между строками сноски
-        note_line_h = _text_h(font_note)
-        note_h = (
-            len(note_lines) * note_line_h
-            + max(0, len(note_lines) - 1) * note_line_gap
-            if note_lines else 0
-        )
-        note_y = content_bottom + note_gap if note_lines else None
-
-        # Последний нарисованный элемент — сноска про академический час,
-        # а если её нет — последняя карточка или блок «Что изменилось».
-        last_drawn_y = note_y + note_h if note_lines else content_bottom
-        H = int(last_drawn_y + footer_pad_bottom)
-
-        image = Image.new("RGB", (W, H), COL_BG)
-        draw = ImageDraw.Draw(image)
-
-        # ---------- шапка ----------
-        draw.rectangle((0, 0, W, header_bottom), fill=COL_WHITE)
-        draw.rectangle((0, 0, 14, header_bottom), fill=COL_ACCENT)
-
-        header_label = title or (
-            "РАСПИСАНИЕ ИЗМЕНИЛОСЬ" if changes else "РАСПИСАНИЕ"
-        )
-        draw.text((MARGIN + 20, 40), header_label,
-                  font=font_label, fill=COL_ACCENT)
-
-        # Большой заголовок: группа или ФИО преподавателя.
-        for idx, line in enumerate(title_lines):
-            draw.text((MARGIN + 20, 84 + idx * title_step), line,
-                      font=big_font, fill=COL_INK)
-        draw.text((MARGIN + 22, 186 + header_extra),
-                  format_date_header(schedule.date),
-                  font=font_date, fill=COL_MUTED)
-
-        # бейдж с количеством занятий (пары, а не подгруппы)
-        # ВАЖНО: у бейджа своя высота (`count_chip_h`); переиспользовать
-        # `chip_h` нельзя — он участвует в расчёте высоты карточек.
-        draw.rounded_rectangle(
-            (chip_x, chip_y, chip_x + chip_w, chip_y + count_chip_h),
-            radius=count_chip_h / 2,
-            fill=COL_ACCENT_LIGHT,
-        )
-        draw.text(
-            (chip_x + chip_pad_x,
-             chip_y + (count_chip_h - _text_h(font_count)) // 2),
-            count_text,
-            font=font_count,
-            fill=COL_ACCENT,
-        )
-
-        # Бейдж суммарного отученного времени — в той же стилистике, что и
-        # бейдж занятий, чтобы правая колонка шапки смотрелась цельно.
-        if total_pill is not None:
-            tx, ty, tw, th, ttext, tpad = total_pill
-            draw.rounded_rectangle(
-                (tx, ty, tx + tw, ty + th),
-                radius=th / 2,
-                fill=COL_ACCENT_LIGHT,
-            )
-            draw.text(
-                (tx + tpad, ty + (th - _text_h(font_total)) // 2),
-                ttext,
-                font=font_total,
-                fill=COL_ACCENT,
-            )
-
-        # ---------- пустое расписание ----------
-        if not lessons:
-            by = content_top
-            draw.rounded_rectangle(
-                (x1, by, x2, by + empty_h),
-                radius=30,
-                fill=COL_WHITE,
-                outline=COL_BORDER,
-                width=2,
-            )
-            title_txt = "Занятий нет"
-            tw = draw.textlength(title_txt, font=font_empty_title)
-            draw.text(((W - tw) / 2, by + 62), title_txt,
-                      font=font_empty_title, fill=COL_INK)
-            sub = "Расписание на этот день не опубликовано."
-            sw = draw.textlength(sub, font=font_empty_sub)
-            draw.text(((W - sw) / 2, by + 140), sub,
-                      font=font_empty_sub, fill=COL_MUTED)
-
-        # ---------- карточки пар ----------
-        else:
-            y = content_top
-            for pair in pairs:
-                left = x1 + inner
-                top = y
-                ch = pair_card_height(pair)
-                items = _render_items_for_pair(
-                    pair, change_by_key, removed_by_pair
-                )
-                pair_has_change = any(
-                    it["kind"] != "normal" for it in items
-                )
-
-                # тень
-                draw.rounded_rectangle(
-                    (x1 + 6, top + 8, x2 + 6, top + ch + 8),
-                    radius=30,
-                    fill="#E6EAF3",
-                )
-                # карточка
-                draw.rounded_rectangle(
-                    (x1, top, x2, top + ch),
-                    radius=30,
-                    fill=COL_WHITE,
-                    outline=COL_ACCENT if pair_has_change else COL_BORDER,
-                    width=3 if pair_has_change else 2,
-                )
-
-                # --- шапка пары: кружок + время + перемена ---
-                header_h, block_h, content_h = pair_header_metrics(pair)
-                header_top = top + top_pad
-
-                # --- кружок пары ---
-                cy_top = header_top + (content_h - circle_s) / 2
-                cx = left
-                draw.ellipse(
-                    (cx, cy_top, cx + circle_s, cy_top + circle_s),
-                    fill=COL_ACCENT,
-                )
-                roman = clean_text(pair.number).upper()
-                rw = draw.textlength(roman, font=font_pair)
-                rh = _text_h(font_pair)
-                draw.text(
-                    (cx + (circle_s - rw) / 2,
-                     cy_top + (circle_s - rh) / 2),
-                    roman,
-                    font=font_pair,
-                    fill=COL_WHITE,
-                )
-
-                # --- время (уровень 1) и перемена (уровень 2) ---
-                # Обе строки лежат в одной текстовой колонке, поэтому
-                # положение времени стабильно при любой длине текста.
-                text_x = left + circle_s + time_x_offset
-                text_max_w = (x2 - inner) - text_x
-                time_y = header_top + (content_h - block_h) / 2
-                draw.text((text_x, time_y),
-                          f"{pair.start} — {pair.end}",
-                          font=font_time, fill=COL_ACCENT)
-
-                break_text = pair_break_text(pair)
-                if break_text:
-                    draw.text(
-                        (text_x, time_y + time_line_h + break_gap),
-                        _truncate(break_text, font_break, text_max_w),
-                        font=font_break,
-                        fill=COL_MUTED,
-                    )
-
-                # --- блоки занятий/подгрупп (уровни 3 и 4) ---
-                by = top + header_h
-                for item in items:
-                    lesson = item["lesson"]
-                    kind = item["kind"]
-                    h = item_block_height(item)
-
-                    # Подсветка изменений.
-                    if kind == "changed":
-                        fill = COL_WARN_LIGHT
-                        outline = COL_WARN
-                    elif kind == "added":
-                        fill = COL_GREEN_LIGHT
-                        outline = COL_GREEN
-                    elif kind == "removed":
-                        fill = COL_RED_LIGHT
-                        outline = COL_RED
-                    else:
-                        fill = None
-                        outline = None
-
-                    if fill is not None:
-                        draw.rounded_rectangle(
-                            (left - 6, by, x2 - inner + 6, by + h),
-                            radius=14,
-                            fill=fill,
-                            outline=outline,
-                            width=2,
-                        )
-
-                    inner_y = by + 8
-
-                    # Подгруппа.
-                    subgroup_txt = _subgroup_label(lesson.subgroup)
-                    if subgroup_txt:
-                        draw.rounded_rectangle(
-                            (left, inner_y, left + draw.textlength(
-                                subgroup_txt, font=font_subg
-                            ) + 24, inner_y + subg_h),
-                            radius=subg_h / 2,
-                            fill=COL_ACCENT_LIGHT,
-                        )
-                        draw.text(
-                            (left + 12,
-                             inner_y + (subg_h - _text_h(font_subg)) / 2),
-                            subgroup_txt,
-                            font=font_subg,
-                            fill=COL_ACCENT,
-                        )
-                        inner_y += subg_h + 6
-
-                    # Статус изменения (без эмодзи: шрифт DejaVu их не рисует).
-                    if kind == "changed":
-                        status = "ИЗМЕНЕНО"
-                        color = COL_WARN
-                    elif kind == "added":
-                        status = "ДОБАВЛЕНО"
-                        color = COL_GREEN
-                    elif kind == "removed":
-                        status = "УДАЛЕНО"
-                        color = COL_RED
-                    else:
-                        status = ""
-
-                    if status:
-                        sw2 = draw.textlength(status, font=font_status)
-                        draw.text(
-                            (x2 - inner - sw2, inner_y),
-                            status,
-                            font=font_status,
-                            fill=color,
-                        )
-                        inner_y += status_h
-
-                    # Предмет. Отменённое занятие — серым, без мета-строки.
-                    cancelled = is_placeholder_subject(lesson.subject)
-                    subj_lines = subject_lines_for(lesson.subject)
-                    subj_color = COL_MUTED if cancelled else COL_INK
-                    for idx, line in enumerate(subj_lines):
-                        draw.text(
-                            (left, inner_y + idx * line_h),
-                            line,
-                            font=font_subject,
-                            fill=subj_color,
-                        )
-                    inner_y += line_h * len(subj_lines)
-
-                    if not cancelled:
-                        # Аудитория + преподаватель.
-                        inner_y += 14
-                        meta_y = inner_y
-                        room_text = (
-                            f"ауд. {lesson.room}"
-                            if clean_text(lesson.room) not in ("", "—")
-                            else "ауд. —"
-                        )
-                        room_color = COL_RED if kind == "removed" else COL_GREEN
-                        room_fill = (
-                            COL_RED_LIGHT if kind == "removed" else COL_GREEN_LIGHT
-                        )
-                        room_w = draw.textlength(room_text, font=font_info)
-                        room_chip_pad = 18
-                        room_chip_w = room_w + room_chip_pad * 2
-                        draw.rounded_rectangle(
-                            (left, meta_y,
-                             left + room_chip_w, meta_y + chip_h),
-                            radius=chip_h / 2,
-                            fill=room_fill,
-                        )
-                        draw.text(
-                            (left + room_chip_pad,
-                             meta_y + (chip_h - _text_h(font_info)) / 2),
-                            room_text,
-                            font=font_info,
-                            fill=room_color,
-                        )
-
-                        teacher = (
-                            clean_text(lesson.teacher)
-                            if clean_text(lesson.teacher) not in ("", "—")
-                            else "Преподаватель не указан"
-                        )
-                        teacher_x = left + room_chip_w + 24
-                        teacher_max_w = (x2 - inner) - teacher_x
-                        teacher = _truncate(teacher, font_info, teacher_max_w)
-                        draw.text(
-                            (teacher_x,
-                             meta_y + (chip_h - _text_h(font_info)) / 2),
-                            teacher,
-                            font=font_info,
-                            fill=COL_MUTED,
-                        )
-                        inner_y += chip_h
-
-                        # Для расписания преподавателя показываем группы пары.
-                        groups = clean_text(getattr(lesson, "groups", ""))
-                        if groups:
-                            draw.text(
-                                (left, inner_y + 8),
-                                _truncate(f"Группы: {groups}", font_info, text_w),
-                                font=font_info,
-                                fill=COL_MUTED,
-                            )
-                            inner_y += 8 + _text_h(font_info)
-
-                        # Накопленный прогресс — только в карточках основной
-                        # группы. Он идёт после аудитории/преподавателя и
-                        # списка групп, но до деталей изменения.
-                        progress_text, progress_color = progress_for_lesson(lesson)
-                        if progress_text:
-                            draw.text(
-                                (left, inner_y + progress_gap),
-                                progress_text,
-                                font=font_break,
-                                fill=progress_color,
-                            )
-                            inner_y += progress_gap + progress_h
-
-                    # Было -> стало для изменённых полей.
-                    if kind == "changed":
-                        inner_y += 8
-                        for detail in item["details"]:
-                            label_name = detail.get("label") or detail.get(
-                                "field", ""
-                            )
-                            old_val = clean_text(detail.get("old", ""))
-                            new_val = clean_text(detail.get("new", ""))
-                            line = (
-                                f"{label_name}: "
-                                f"{old_val or '—'} -> {new_val or '—'}"
-                            )
-                            draw.text(
-                                (left, inner_y),
-                                _truncate(line, font_detail, text_w),
-                                font=font_detail,
-                                fill=COL_WARN,
-                            )
-                            inner_y += detail_h
-
-                    # --- подвал блока ---
-                    by += h + item_gap
-
-                y += ch + card_gap
-
-        # ---------- блок «Что изменилось» ----------
-        if summary_lines:
-            sy = summary_y
-            draw.rounded_rectangle(
-                (x1, sy, x2, sy + summary_h),
-                radius=30,
-                fill=COL_WHITE,
-                outline=COL_WARN,
-                width=2,
-            )
-            tys = sy + 24
-            heading = "Что изменилось:"
-            draw.text((x1 + inner, tys), heading,
-                      font=font_summary, fill=COL_WARN)
-            tys += 44
-            for line in summary_lines:
-                draw.text(
-                    (x1 + inner + 8, tys),
-                    _truncate(line, font_summary_body, text_w - 16),
-                    font=font_summary_body,
-                    fill=COL_INK,
-                )
-                tys += 34
-
-        # ---------- сноска про академический час ----------
-        # Маленький серый курсив по центру: пояснение + расчёт по
-        # обыкновенному времени. Показывается вместе с бейджем «Изучено».
-        if note_lines:
-            ny = note_y
-            for note_line in note_lines:
-                line_w = _italic_text_width(note_line, font_note)
-                _draw_italic_text(
-                    image, ((W - line_w) / 2, ny), note_line,
-                    font_note, COL_MUTED,
-                )
-                ny += note_line_h + note_line_gap
-
-        # ---------- сохранение ----------
         kind = "staff" if schedule.schedule_type == "staff" else "group"
         staff_part = f"_{schedule.staff_id}" if schedule.staff_id else ""
         suffix = "_changed" if changes else ""
@@ -3533,7 +4416,24 @@ def render_schedule_image(
         )
         path = IMAGE_DIR / filename
         image.save(path, "PNG", optimize=True)
-        logger.info("Изображение сохранено: %s (%sx%s)", path, W, H)
+
+        truncated = [
+            el["id"] for el in plan["elements"] if el.get("truncated")
+        ]
+        _LAST_RENDER.update({
+            "path": str(path),
+            "size": (plan["W"], plan["H"]),
+            "level": level_used,
+            "problems": problems,
+            "truncated": truncated,
+            "elements": len(plan["elements"]),
+        })
+        logger.info(
+            "Изображение сохранено: %s (%sx%s, уровень уплотнения %s, "
+            "эллипсис: %s)",
+            path, plan["W"], plan["H"], level_used,
+            ", ".join(truncated) if truncated else "нет",
+        )
         return path
 
     except Exception:
