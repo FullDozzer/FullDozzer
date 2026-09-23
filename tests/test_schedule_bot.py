@@ -1175,7 +1175,7 @@ class TestScheduleComparison(unittest.TestCase):
 
 
 class TestPillowRendering(unittest.TestCase):
-    def test_render_subgroups_and_changes_dynamic_height(self):
+    def test_render_subgroups_and_changes_fixed_format(self):
         schedule = bot.Schedule(
             date=date(2026, 9, 7),
             group=bot.GROUP_NAME,
@@ -1213,10 +1213,13 @@ class TestPillowRendering(unittest.TestCase):
         normal = bot.render_schedule_image(schedule)
         changed = bot.render_schedule_image(schedule, changes=changes)
         with Image.open(normal) as img_n, Image.open(changed) as img_c:
-            self.assertGreater(img_n.size[0], 500)
-            self.assertGreater(img_n.size[1], 300)
-            # У изменённой картинки есть блок «Что изменилось» => выше.
-            self.assertGreater(img_c.size[1], img_n.size[1])
+            # Основной формат: 1080×920 и у обычной, и у изменённой
+            # (изменения идут в отдельную колонку, а не растят картинку).
+            self.assertEqual(img_n.size, (1080, 920))
+            self.assertEqual(img_c.size, (1080, 920))
+        # Layout-валидация: текст в границах, подгруппы и бейджи
+        # помещаются, пересечений нет.
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
 
     def test_render_added_and_removed_subgroups(self):
         old = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
@@ -1345,9 +1348,10 @@ class TestLessonCount(unittest.TestCase):
 class TestCancelledLessonRendering(unittest.TestCase):
     """Отмена занятия («~..............») на картинке расписания."""
 
-    GREEN = (14, 159, 95)
-    GREEN_LIGHT = (229, 246, 237)
-    MUTED = (100, 116, 139)
+    GREEN = (35, 149, 102)        # S_GREEN
+    GREEN_LIGHT = (233, 247, 240)  # S_GREEN_L
+    MUTED = (120, 128, 148)        # S_MUTED
+    RED = (212, 93, 101)           # S_RED
 
     def cancelled_schedule(self):
         return bot.Schedule(
@@ -1359,36 +1363,59 @@ class TestCancelledLessonRendering(unittest.TestCase):
             ],
         )
 
-    def color_rows(self, path, color):
+    def color_rows(self, path, color, y0=150):
+        # Точность ±6: залитые бейджи совпадают точно, глифы текста —
+        # с частичным покрытием (±единицы в каналах).
         with Image.open(path) as img:
             im = img.convert("RGB")
             px = im.load()
             return [
-                y for y in range(300, im.height)
-                if any(px[x, y] == color for x in range(100, im.width - 40, 2))
+                y for y in range(y0, im.height)
+                if any(abs(px[x, y][0] - color[0]) <= 6
+                       and abs(px[x, y][1] - color[1]) <= 6
+                       and abs(px[x, y][2] - color[2]) <= 6
+                       for x in range(100, im.width - 40, 2))
             ]
 
-    def test_cancelled_block_has_no_room_chip_and_shows_muted_text(self):
+    @staticmethod
+    def white_card_rows(img):
+        """Строки белой карточки (x 100..900, ниже шапки)."""
+        px = img.convert("RGB").load()
+        return [
+            y for y in range(150, img.height - 30)
+            if any(px[x, y] == (255, 255, 255) for x in range(100, 900, 4))
+        ]
+
+    def test_cancelled_block_has_no_room_chip_and_shows_red_text(self):
         path = bot.render_schedule_image(self.cancelled_schedule())
         # У отменённого занятия нет чипа аудитории (зелёного) вообще…
         self.assertEqual(self.color_rows(path, self.GREEN), [])
         self.assertEqual(self.color_rows(path, self.GREEN_LIGHT), [])
-        # …но есть серая надпись «Занятие отменено».
-        muted = self.color_rows(path, self.MUTED)
-        self.assertTrue(muted, "надпись «Занятие отменено» не найдена")
+        # …но есть красная надпись «Занятие отменено» и бейдж ОТМЕНА.
+        red = self.color_rows(path, self.RED)
+        self.assertTrue(red, "красная надпись «Занятие отменено» не найдена")
 
     def test_cancelled_block_is_compact(self):
-        """Блок без аудитории/преподавателя короче обычного блока."""
-        cancelled = bot.render_schedule_image(self.cancelled_schedule())
-        # Другая дата -> другой файл: рендер не перезапишет первую картинку.
+        """Блок без аудитории/преподавателя короче обычного блока.
+
+        Формат картинки фиксированный (1080×920), поэтому сравниваем
+        площадь белой карточки, а не высоту холста.
+        """
+        cancelled = bot.render_schedule_image(bot.Schedule(
+            date=date(2026, 9, 11),
+            group=bot.GROUP_NAME,
+            lessons=[lesson("IV", None, "~..............", "—", "—",
+                            "13:25", "14:45")],
+        ))
         normal = bot.render_schedule_image(bot.Schedule(
             date=date(2026, 9, 10),
             group=bot.GROUP_NAME,
-            lessons=[lesson("IV", "2", "Ин.яз в проф", "ПК103",
+            lessons=[lesson("IV", None, "Ин.яз в проф", "ПК103",
                             "Мурзабулатова Ф.Ф.", "13:25", "14:45")],
         ))
         with Image.open(cancelled) as a, Image.open(normal) as b:
-            self.assertLess(a.size[1], b.size[1])
+            self.assertEqual(a.size, b.size)  # оба 1080×920
+            self.assertLess(self.white_card_rows(a), self.white_card_rows(b))
 
     def test_cancellation_in_change_notification_text(self):
         """Уведомление об отмене — словами, без «~..............»."""
@@ -1409,37 +1436,64 @@ class TestCancelledLessonRendering(unittest.TestCase):
 class TestImageLayoutFixes(unittest.TestCase):
     """Разметка картинки: блок «перемена» и низ картинки без подвала."""
 
-    def test_schedule_image_width(self):
-        """Картинки широкие (1280 — максимум Telegram по стороне)."""
-        self.assertEqual(bot.IMAGE_WIDTH, 1280)
+    def test_schedule_image_format_is_1080x920(self):
+        """Основной формат карточки расписания — 1080×920."""
+        self.assertEqual((bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT),
+                         (1080, 920))
         path = bot.render_schedule_image(empty_schedule(date(2026, 9, 8)))
         with Image.open(path) as img:
-            self.assertEqual(img.size[0], bot.IMAGE_WIDTH)
+            self.assertEqual(img.size, (1080, 920))
 
-    BG = (243, 245, 250)
-    MUTED = (100, 116, 139)   # COL_MUTED — цвет курсивной сноски
+    BG = (247, 247, 250)          # S_BG
+    MUTED = (120, 128, 148)       # S_MUTED — сноска в подвале
+    GOTHIC = (221, 217, 239)      # S_GOTHIC — микро-акцент подвала
 
-    def drawn_rows(self, path):
+    def drawn_rows(self, path, bg=None):
         """Строки, где есть хоть один пиксель не цвета фона."""
+        bg = bg or self.BG
         with Image.open(path) as img:
             im = img.convert("RGB")
             px = im.load()
             return [
                 y for y in range(im.height)
-                if any(px[x, y] != self.BG
+                if any(px[x, y] != bg
                        for x in range(20, im.width - 20, 4))
             ]
 
-    def note_rows(self, path):
-        """Строки курсивной сноски про академический час (COL_MUTED)."""
+    def note_rows(self, path, color=None):
+        """Строки сноска в подвале (по умолчанию S_MUTED), точность ±6."""
+        color = color or self.MUTED
         with Image.open(path) as img:
             im = img.convert("RGB")
             px = im.load()
             return [
                 y for y in range(im.height)
-                if any(px[x, y] == self.MUTED
+                if any(abs(px[x, y][0] - color[0]) <= 6
+                       and abs(px[x, y][1] - color[1]) <= 6
+                       and abs(px[x, y][2] - color[2]) <= 6
                        for x in range(60, im.width - 60, 2))
             ]
+
+    def gothic_rows(self, path):
+        """Строки готического разделителя-арки (S_GOTHIC)."""
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            return [
+                y for y in range(im.height)
+                if any(px[x, y] == self.GOTHIC
+                       for x in range(60, im.width - 60, 2))
+            ]
+
+    @staticmethod
+    def card_content_rows(img):
+        """Строки контента карточки в левой части (белая/строки подгрупп)."""
+        px = img.convert("RGB").load()
+        return [
+            y for y in range(150, 900)
+            if any(px[x, y] in ((255, 255, 255), (250, 250, 253))
+                   for x in range(60, 640, 4))
+        ]
 
     def scan(self, path):
         """Возвращает (ширина, высота, низ последней карточки, строки ниже)."""
@@ -1458,24 +1512,24 @@ class TestImageLayoutFixes(unittest.TestCase):
         return width, height, last_card, below_cards
 
     def subject_left_x(self, path):
-        """Левая граница текста предмета (единственный тёмный текст)."""
+        """Левая граница тёмного текста (предмет) в карточке."""
         with Image.open(path) as img:
             im = img.convert("RGB")
             width, height = im.size
             px = im.load()
             for x in range(width):
-                for y in range(300, height):
+                for y in range(150, height):
                     r, g, b = px[x, y]
                     if r < 80 and g < 80 and b < 80:
                         return x
         return -1
 
-    def make(self, break_duration=""):
+    def make(self, break_duration="", day=None):
         item = lesson("I", None, "Химия Н и Г", "УК307", "Арнаутова А.В.",
                       "08:30", "09:50")
         item.break_duration = break_duration
-        return bot.Schedule(date=date(2026, 9, 9), group=bot.GROUP_NAME,
-                            lessons=[item])
+        return bot.Schedule(date=day or date(2026, 9, 9),
+                            group=bot.GROUP_NAME, lessons=[item])
 
     def test_nothing_below_last_card_except_study_note(self):
         """Под последней карточкой — только курсивная сноска (её тут нет)."""
@@ -1485,7 +1539,8 @@ class TestImageLayoutFixes(unittest.TestCase):
         # Подписи «ИНК · расписание» больше нет: ниже последней карточки
         # не рисуется ничего, кроме сноски про академический час.
         self.assertEqual(
-            set(below_cards) - set(self.note_rows(path)), set(),
+            set(below_cards) - set(self.note_rows(path))
+            - set(self.gothic_rows(path)), set(),
             "под последней карточкой нарисовано что-то кроме сноски",
         )
         # Последний нарисованный элемент не прижат к нижнему краю.
@@ -1502,38 +1557,65 @@ class TestImageLayoutFixes(unittest.TestCase):
         path = bot.render_schedule_image(new, changes=changes)
         width, height, last_card, below_cards = self.scan(path)
         drawn = self.drawn_rows(path)
-        # Ниже карточек — только блок «Что изменилось» (без сноски:
-        # история пуста), никакой подписи.
+        # Ниже карточек — только подвал (разделитель-арка; сноска
+        # не нужна: история пуста), никакой подписи.
         self.assertEqual(
-            set(below_cards) - set(self.note_rows(path)), set()
+            set(below_cards) - set(self.note_rows(path))
+            - set(self.gothic_rows(path)), set()
         )
         # Блок входит в высоту картинки и не обрезан снизу.
         self.assertGreaterEqual(height - 1 - max(drawn), 20)
 
     def test_empty_schedule_bottom_padding(self):
-        """Пустое расписание: под карточкой ничего, нижний padding на месте."""
+        """Пустое расписание: под карточкой только подвал, padding на месте."""
         path = bot.render_schedule_image(empty_schedule(date(2026, 9, 8)))
         width, height, last_card, below_cards = self.scan(path)
         self.assertEqual(
-            set(below_cards) - set(self.note_rows(path)), set(),
+            set(below_cards) - set(self.note_rows(path))
+            - set(self.gothic_rows(path)), set(),
             "под карточкой пустого расписания что-то нарисовано",
         )
         self.assertGreaterEqual(height - 1 - max(self.drawn_rows(path)), 20)
         self.assertGreaterEqual(height - 1 - last_card, 20)
 
     def test_break_line_does_not_move_subject(self):
-        with_break = bot.render_schedule_image(self.make("30 мин"))
+        # Разные даты: иначе второй рендер перезапишет файл первого.
+        with_break = bot.render_schedule_image(
+            self.make("30 мин", day=date(2026, 9, 9)))
         x_with = self.subject_left_x(with_break)
-        without_break = bot.render_schedule_image(self.make(""))
+        without_break = bot.render_schedule_image(
+            self.make("", day=date(2026, 9, 10)))
         x_without = self.subject_left_x(without_break)
         self.assertGreater(x_with, 0)
         self.assertEqual(x_with, x_without)
 
-    def test_break_line_reserves_vertical_space(self):
-        with Image.open(bot.render_schedule_image(self.make("30 мин"))) as a, \
-                Image.open(bot.render_schedule_image(self.make(""))) as b:
-            # Строка перемены добавляет высоту, а не наезжает на предмет.
-            self.assertGreater(a.size[1], b.size[1])
+    def test_break_text_is_drawn_in_card_header(self):
+        """«Перемена N мин» — в шапке карточки, не наезжает на предмет.
+
+        Разные даты: иначе второй рендер перезапишет файл первого.
+        """
+        with_break = bot.render_schedule_image(
+            self.make("30 мин", day=date(2026, 9, 9)))
+        without_break = bot.render_schedule_image(
+            self.make("", day=date(2026, 9, 10)))
+
+        def header_muted_rows(path):
+            # Точность ±6: глифы FreeType имеют пиксели частичного
+            # покрытия (±единицы в каналах относительно S_MUTED).
+            with Image.open(path) as img:
+                px = img.convert("RGB").load()
+                return [
+                    y for y in range(165, 215)
+                    if any(abs(px[x, y][0] - self.MUTED[0]) <= 6
+                           and abs(px[x, y][1] - self.MUTED[1]) <= 6
+                           and abs(px[x, y][2] - self.MUTED[2]) <= 6
+                           for x in range(700, 1040, 2))
+                ]
+
+        self.assertTrue(
+            header_muted_rows(with_break), "текст перемены не найден"
+        )
+        self.assertEqual(header_muted_rows(without_break), [])
 
     def test_subgroups_are_still_rendered(self):
         schedule = bot.parse_schedule(PROVIDED_HTML, date(2026, 9, 7))
@@ -1543,20 +1625,153 @@ class TestImageLayoutFixes(unittest.TestCase):
         two = bot.Schedule(date=date(2026, 9, 7), group=bot.GROUP_NAME,
                            lessons=[x for x in schedule.lessons
                                     if x.pair == "II"])
-        one = bot.Schedule(date=date(2026, 9, 7), group=bot.GROUP_NAME,
+        # Другая дата: иначе рендер «one» перезапишет файл «two».
+        one = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
                            lessons=[x for x in schedule.lessons
                                     if x.pair == "IV"])
-        with Image.open(bot.render_schedule_image(two)) as img_two, \
-                Image.open(bot.render_schedule_image(one)) as img_one:
-            self.assertGreater(img_two.size[1], img_one.size[1])
+        path_two = bot.render_schedule_image(two)
+        path_one = bot.render_schedule_image(one)
+        with Image.open(path_two) as img_two, \
+                Image.open(path_one) as img_one:
+            # Формат фиксированный; карточка с подгруппами выше:
+            # больше строк контента внутри холста.
+            self.assertEqual(img_two.size, (1080, 920))
+            self.assertEqual(img_one.size, (1080, 920))
+            self.assertGreater(self.card_content_rows(img_two),
+                               self.card_content_rows(img_one))
+
+
+class TestScheduleCardDesign(unittest.TestCase):
+    """Новый дизайн карточки: формат 1080×920, зоны, валидация layout."""
+
+    BG = (247, 247, 250)
+    MUTED = (120, 128, 148)
+    PURPLE = (89, 73, 216)
+    GREEN = (35, 149, 102)
+    RED = (212, 93, 101)
+    GOTHIC = (221, 217, 239)
+
+    def schedule_with_subgroups(self, day=None):
+        return bot.Schedule(
+            date=day or date(2026, 9, 24), group=bot.GROUP_NAME,
+            lessons=[
+                lesson("I", None, "Пром безопас", "СК201",
+                       "Гайзуллин И.Т.", "08:30", "09:50"),
+                lesson("II", "1", "Ин.яз в проф", "ПК103",
+                       "Мурзабулатова Ф.Ф.", "10:00", "11:20"),
+                lesson("II", "2", "~..............", "—", "—",
+                       "10:00", "11:20"),
+                lesson("III", None, "Химия Н и Г", "УК307",
+                       "Арнаутова А.В.", "11:35", "12:55"),
+            ],
+        )
+
+    def test_main_format_is_1080x920(self):
+        self.assertEqual((bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT),
+                         (1080, 920))
+        path = bot.render_schedule_image(self.schedule_with_subgroups())
+        with Image.open(path) as img:
+            self.assertEqual(img.size, (1080, 920))
+
+    def test_layout_validation_clean(self):
+        """validate_layout: нет выходов за bounds и пересечений."""
+        path = bot.render_schedule_image(self.schedule_with_subgroups())
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        self.assertGreater(bot._LAST_RENDER["elements"], 10)
+
+    def test_long_subject_truncated_not_overflowed(self):
+        schedule = bot.Schedule(
+            date=date(2026, 9, 24), group=bot.GROUP_NAME,
+            lessons=[
+                lesson("I", None,
+                       "Очень длинное название предмета, которое точно "
+                       "не помещается в одну строку карточки целиком "
+                       "даже после уменьшения размера шрифта",
+                       "УК103", "Степанов Сергей Владимирович",
+                       "08:30", "09:50"),
+            ],
+        )
+        bot.render_schedule_image(schedule)
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        self.assertIn(
+            "card:0:subject", bot._LAST_RENDER["truncated"],
+            "длинное название должно сокращаться ellipsis",
+        )
+
+    def test_right_column_stays_within_bounds(self):
+        old = bot.Schedule(date=date(2026, 9, 24), group=bot.GROUP_NAME,
+                           lessons=[lesson("II", "1")])
+        new = self.schedule_with_subgroups()
+        changes = bot.compare_schedules(old, new)
+        path = bot.render_schedule_image(new, changes=changes)
+        with Image.open(path) as img:
+            px = img.convert("RGB").load()
+            # Правее правой колонки (x > 1044) — только фон.
+            dirty = [
+                (x, y) for y in range(150, 900, 2)
+                for x in range(1046, 1078, 2)
+                if px[x, y] != self.BG
+            ]
+        self.assertEqual(dirty, [])
+
+    def test_cancelled_subgroup_red_added_green(self):
+        old = bot.Schedule(date=date(2026, 9, 24), group=bot.GROUP_NAME,
+                           lessons=[
+                               lesson("I", None, "Пром безопас", "СК201",
+                                      "Гайзуллин И.Т.", "08:30", "09:50"),
+                           ])
+        new = self.schedule_with_subgroups()
+        changes = bot.compare_schedules(old, new)
+        path = bot.render_schedule_image(new, changes=changes)
+        with Image.open(path) as img:
+            px = img.convert("RGB").load()
+        def close(c, target, tol=6):
+            return (abs(c[0] - target[0]) <= tol
+                    and abs(c[1] - target[1]) <= tol
+                    and abs(c[2] - target[2]) <= tol)
+
+        red_rows = [
+            y for y in range(150, 900)
+            if any(close(px[x, y], self.RED) for x in range(100, 640, 2))
+        ]
+        green_rows = [
+            y for y in range(150, 900)
+            if any(close(px[x, y], self.GREEN) for x in range(100, 640, 2))
+        ]
+        self.assertTrue(red_rows, "отменённая подгруппа не красная")
+        self.assertTrue(green_rows, "добавленная подгруппа не подсвечена")
+
+    def test_gothic_accent_present_but_subtle(self):
+        path = bot.render_schedule_image(self.schedule_with_subgroups())
+        with Image.open(path) as img:
+            px = img.convert("RGB").load()
+            header_gothic = [
+                (x, y) for y in range(0, 148)
+                for x in range(0, 1080)
+                if px[x, y] == self.GOTHIC
+            ]
+            footer_gothic = [
+                (x, y) for y in range(780, 920)
+                for x in range(0, 1080)
+                if px[x, y] == self.GOTHIC
+            ]
+        self.assertTrue(
+            header_gothic, "гоготический акцент в шапке не найден"
+        )
+        self.assertTrue(
+            footer_gothic, "гоготический акцент в подвале не найден"
+        )
+        # Акцент почти незаметный: совсем немного пикселей.
+        self.assertLess(len(header_gothic), 400)
+        self.assertLess(len(footer_gothic), 1600)
 
 
 class TestTotalStudyBadge(DBTestCase):
     """Бейдж «Изучено: X ч / Y ч» в шапке картинки и подсчёт минут истории."""
 
-    ACCENT_LIGHT = (236, 236, 251)  # hex COL_ACCENT_LIGHT ("#ECECFB")
-    GREEN = (14, 159, 95)            # hex COL_GREEN
-    MUTED = (100, 116, 139)          # hex COL_MUTED
+    PURPLE = (89, 73, 216)          # S_PURPLE — шкала прогресса в шапке
+    GREEN = (35, 149, 102)           # S_GREEN
+    MUTED = (120, 128, 148)          # S_MUTED
 
     def setUp(self):
         super().setUp()
@@ -1569,25 +1784,40 @@ class TestTotalStudyBadge(DBTestCase):
             conn.execute("DELETE FROM lesson_history")
             conn.execute("DELETE FROM subjects")
 
-    def badge_rows(self, path, y0=150, y1=250, x0=450):
-        """Строки с заливкой бейджа (accent-light) в нижней части шапки."""
+    def badge_rows(self, path, y0=100, y1=140, x0=744):
+        """Строки фиолетовой шкалы прогресса в шапке."""
         with Image.open(path) as img:
             im = img.convert("RGB")
             px = im.load()
             return [
                 y for y in range(y0, y1)
-                if any(px[x, y] == self.ACCENT_LIGHT
+                if any(px[x, y] == self.PURPLE
                        for x in range(x0, im.width - 40, 2))
             ]
 
-    def color_rows(self, path, color, y0=520):
-        """Точные цветовые строки внутри блока занятия, ниже метаданных."""
+    def color_rows(self, path, color, y0=150):
+        """Цветовые строки в зоне карточек (ниже шапки), точность ±6."""
         with Image.open(path) as img:
             im = img.convert("RGB")
             px = im.load()
             return [
                 y for y in range(y0, im.height)
-                if any(px[x, y] == color for x in range(100, im.width - 40))
+                if any(abs(px[x, y][0] - color[0]) <= 6
+                       and abs(px[x, y][1] - color[1]) <= 6
+                       and abs(px[x, y][2] - color[2]) <= 6
+                       for x in range(100, im.width - 40))
+            ]
+
+    def green_right_rows(self, path):
+        """Зелёные строки в правой части карточек (прогресс, не бейдж)."""
+        with Image.open(path) as img:
+            px = img.convert("RGB").load()
+            return [
+                y for y in range(150, 600)
+                if any(abs(px[x, y][0] - self.GREEN[0]) <= 6
+                       and abs(px[x, y][1] - self.GREEN[1]) <= 6
+                       and abs(px[x, y][2] - self.GREEN[2]) <= 6
+                       for x in range(800, 1044, 2))
             ]
 
     def color_clusters(self, rows):
@@ -1609,9 +1839,11 @@ class TestTotalStudyBadge(DBTestCase):
             lessons=[lesson("I", None, "Математика")],
         )
         path = bot.render_schedule_image(schedule)
-        # После чипа аудитории у строки «Изучено: 2 ч 40 мин» есть зелёные
-        # пиксели; зелёная надпись аудитории находится выше этого диапазона.
-        self.assertTrue(self.color_rows(path, self.GREEN))
+        # «Изучено: 4 акад. ч» — зелёным, справа в карточке (зелёный
+        # бейдж аудитории слева не попадает в зону проверки).
+        self.assertTrue(
+            self.green_right_rows(path), "зелёный прогресс справа не найден"
+        )
 
     def test_subject_progress_without_history_is_muted_first_lesson(self):
         schedule = bot.Schedule(
@@ -1637,7 +1869,7 @@ class TestTotalStudyBadge(DBTestCase):
             lessons=[lesson("I", None, "Математика")],
         )
         path = bot.render_schedule_image(staff)
-        self.assertEqual(self.color_rows(path, self.GREEN), [])
+        self.assertEqual(self.green_right_rows(path), [])
 
     def test_progress_does_not_reduce_card_height(self):
         without_history = bot.Schedule(
@@ -2193,7 +2425,7 @@ class TestAcademicHours(StudyDBTestCase):
             last_card = max(card_rows)
             muted = [
                 y for y in range(last_card + 6, im.height)
-                if any(px[x, y] == (100, 116, 139)
+                if any(px[x, y] == (120, 128, 148)
                        for x in range(60, im.width - 60, 2))
             ]
         self.assertTrue(muted, "сноска про академический час не найдена")
@@ -2206,8 +2438,12 @@ class TestAcademicHours(StudyDBTestCase):
         # Две строки: пояснение + обыкновенное время.
         self.assertGreaterEqual(len(clusters), 2)
 
-    def test_note_expands_image_but_pairs_stay_list(self):
-        """Картинка с историей выше (сноска), карточки — по-прежнему список."""
+    def test_note_appears_in_footer_with_history(self):
+        """Сноска появляется в подвале только при наличии истории.
+
+        Формат картинки фиксированный (1080×920): история не меняет
+        высоту холста, а добавляет сноску в подвал.
+        """
         bot.record_completed_lesson(
             bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
             "НГПО", duration=320,
@@ -2224,14 +2460,37 @@ class TestAcademicHours(StudyDBTestCase):
             conn.execute("DELETE FROM lesson_history")
         without_history = bot.render_schedule_image(bot.Schedule(
             date=date(2026, 9, 8), group=bot.GROUP_NAME, lessons=lessons))
+
+        def footer_note_rows(img):
+            px = img.convert("RGB").load()
+            card_rows = [
+                y for y in range(img.size[1])
+                if any(px[x, y] == (255, 255, 255)
+                       for x in range(150, img.size[0] - 150, 6))
+            ]
+            last_card = max(card_rows)
+            return [
+                y for y in range(last_card + 6, img.size[1])
+                if any(abs(px[x, y][0] - 120) <= 6
+                       and abs(px[x, y][1] - 128) <= 6
+                       and abs(px[x, y][2] - 148) <= 6
+                       for x in range(60, img.size[0] - 60, 2))
+            ]
+
         with Image.open(with_history) as a, \
                 Image.open(without_history) as b:
-            self.assertGreater(a.size[1], b.size[1])
+            self.assertEqual(a.size, (1080, 920))
+            self.assertEqual(b.size, (1080, 920))
+            self.assertTrue(footer_note_rows(a), "сноска с историей не найдена")
+            self.assertEqual(
+                footer_note_rows(b), [],
+                "сноска без истории не должна отображаться",
+            )
             # Обе карточки (пары) остались вертикальным списком.
             for img in (a, b):
                 px = img.convert("RGB").load()
                 card_rows = [
-                    y for y in range(288, img.size[1])
+                    y for y in range(150, img.size[1])
                     if any(px[x, y] == (255, 255, 255)
                            for x in range(150, img.size[0] - 150, 6))
                 ]
@@ -2267,7 +2526,7 @@ class TestAcademicHours(StudyDBTestCase):
             last_card = max(card_rows)
             muted = [
                 y for y in range(last_card + 6, im.height)
-                if any(px[x, y] == (100, 116, 139)
+                if any(px[x, y] == (120, 128, 148)
                        for x in range(60, im.width - 60, 2))
             ]
         self.assertEqual(muted, [])
@@ -2281,8 +2540,9 @@ class TestFooterSignatureRemoved(StudyDBTestCase):
     """
 
     FOOTER_GRAY = (152, 161, 176)   # бывший COL_FOOTER («#98A1B0»)
-    MUTED = (100, 116, 139)         # COL_MUTED — курсивная сноска
-    BG = (243, 245, 250)
+    MUTED = (120, 128, 148)         # S_MUTED — сноска в подвале
+    BG = (247, 247, 250)            # S_BG (картинка расписания)
+    STATUS_BG = (243, 245, 250)     # COL_BG (картинка /status)
 
     def setUp(self):
         super().setUp()
@@ -2304,25 +2564,30 @@ class TestFooterSignatureRemoved(StudyDBTestCase):
                 if px[x, y] == self.FOOTER_GRAY
             ]
 
-    def note_rows(self, path):
-        """Строки курсивной сноски про академический час."""
+    def note_rows(self, path, color=None):
+        """Строки сноски (по умолчанию S_MUTED), точность ±6: глифы
+        FreeType имеют пиксели частичного покрытия."""
+        color = color or self.MUTED
         with Image.open(path) as img:
             im = img.convert("RGB")
             px = im.load()
             return [
                 y for y in range(im.height)
-                if any(px[x, y] == self.MUTED
+                if any(abs(px[x, y][0] - color[0]) <= 6
+                       and abs(px[x, y][1] - color[1]) <= 6
+                       and abs(px[x, y][2] - color[2]) <= 6
                        for x in range(60, im.width - 60, 2))
             ]
 
-    def drawn_rows(self, path):
+    def drawn_rows(self, path, bg=None):
         """Строки, где есть хоть один пиксель не цвета фона."""
+        bg = bg or self.BG
         with Image.open(path) as img:
             im = img.convert("RGB")
             px = im.load()
             return [
                 y for y in range(im.height)
-                if any(px[x, y] != self.BG
+                if any(px[x, y] != bg
                        for x in range(20, im.width - 20, 4))
             ]
 
@@ -2357,9 +2622,13 @@ class TestFooterSignatureRemoved(StudyDBTestCase):
                 self.footer_pixels(path), [],
                 "на картинке /status осталась подпись «ИНК · расписание»",
             )
-            note = self.note_rows(path)
+            note = self.note_rows(path, color=(100, 116, 139))
             self.assertTrue(note, "сноска про академический час исчезла")
-            self.assertEqual(max(self.drawn_rows(path)), max(note))
+            # Сночка — последний элемент: хвосты скошенных глифов могут
+            # выступать не более чем на пару пикселей.
+            self.assertLessEqual(
+                max(self.drawn_rows(path, bg=self.STATUS_BG)) - max(note), 2
+            )
             with Image.open(path) as img:
                 height = img.height
             self.assertGreaterEqual(height - 1 - max(note), 20)
