@@ -30,6 +30,7 @@ import os
 import re
 import sqlite3
 import threading
+from functools import lru_cache
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -2947,6 +2948,7 @@ _WEIGHT_FILES = {
 }
 
 
+@lru_cache(maxsize=256)
 def _font_for(size: int, weight: str = "regular") -> ImageFont.FreeTypeFont:
     """Шрифт нужной насыщенности: Inter, если лежит в fonts/, иначе DejaVu."""
     for name in _WEIGHT_FILES.get(weight, _WEIGHT_FILES["regular"]):
@@ -3407,14 +3409,11 @@ def _build_plan(schedule: Schedule, changes: list, title, style: dict,
     W = SCHEDULE_WIDTH
     has_changes = bool(changes)
     content_w = W - 2 * S_MARGIN
-    if has_changes:
-        left_x = S_MARGIN
-        left_w = content_w - S_RIGHT_COL_W - S_COL_GAP
-        right_x = left_x + left_w + S_COL_GAP
-        right_w = S_RIGHT_COL_W
-    else:
-        left_x, left_w = S_MARGIN, content_w
-        right_x, right_w = None, 0
+    # Вторая колонка «Изменения» всегда присутствует.
+    left_x = S_MARGIN
+    left_w = content_w - S_RIGHT_COL_W - S_COL_GAP
+    right_x = left_x + left_w + S_COL_GAP
+    right_w = S_RIGHT_COL_W
 
     note_lines = ctx.get("note_lines", [])
     H = SCHEDULE_HEIGHT
@@ -3449,23 +3448,21 @@ def _build_plan(schedule: Schedule, changes: list, title, style: dict,
     # --- правая колонка «Изменения» ---
     change_cards = []
     change_overflow = 0
-    if has_changes:
-        cy = S_CONTENT_TOP + 34
-        limit = footer["content_bottom"]
-        for change in changes:
-            h = _measure_change_card(change, style)
-            if cy + h > limit and change_cards:
-                change_overflow += 1
-                continue
-            change_cards.append({
-                "change": change, "info": _change_card_lines(change, style),
-                "x": right_x, "y": cy, "w": right_w, "h": h,
-            })
-            cy += h + style["chg_gap"]
-        # пересчёт overflow: сколько не влезло
-        shown = len(change_cards)
-        change_overflow = max(0, len(changes) - shown)
-
+    cy = S_CONTENT_TOP + 34
+    limit = footer["content_bottom"]
+    for change in changes:
+        h = _measure_change_card(change, style)
+        if cy + h > limit and change_cards:
+            change_overflow += 1
+            continue
+        change_cards.append({
+            "change": change, "info": _change_card_lines(change, style),
+            "x": right_x, "y": cy, "w": right_w, "h": h,
+        })
+        cy += h + style["chg_gap"]
+    # пересчёт overflow: сколько не влезло
+    shown = len(change_cards)
+    change_overflow = max(0, len(changes) - shown)
     plan = {
         "W": W, "H": H, "style": style, "ctx": ctx,
         "left": (left_x, left_w), "right": (right_x, right_w),
@@ -4109,8 +4106,25 @@ def draw_changes_panel(
             count_txt, cres["size"], "regular", S_MUTED, min_size=10,
             report=rep, element_id="panel:count", owner="panel",
         )
-    for cc in plan["change_cards"]:
-        draw_change_card(image, draw, plan, cc)
+    if plan["change_cards"]:
+        for cc in plan["change_cards"]:
+            draw_change_card(image, draw, plan, cc)
+    else:
+        ph_x, ph_y, ph_w, ph_h = right_x, S_CONTENT_TOP + 34, right_w, 86
+        draw.rounded_rectangle((ph_x, ph_y, ph_x + ph_w, ph_y + ph_h),
+                               radius=14, fill=S_WHITE, outline=S_BORDER, width=1)
+        rep.append({"id": "panel:empty_bg", "kind": "shape",
+                    "bbox": (ph_x, ph_y, ph_x + ph_w, ph_y + ph_h),
+                    "owner": "panel"})
+        draw_text_bounded(draw, ph_x + 12, ph_y + 16, ph_w - 24, 20,
+                          "Изменений нет", 14, "semibold", S_INK,
+                          report=rep, element_id="panel:empty_title", owner="panel")
+        draw_text_bounded(draw, ph_x + 12, ph_y + 43, ph_w - 24, 30,
+                          "Расписание без изменений", 11, "regular", S_MUTED,
+                          min_size=9, max_lines=2, report=rep,
+                          element_id="panel:empty_subtitle", owner="panel")
+        plan["owners"]["panel"] = (right_x, S_CONTENT_TOP,
+                                     right_x + right_w, ph_y + ph_h)
     if plan["change_overflow"] > 0:
         note_y = S_CONTENT_TOP + 34
         # находим нижний край последней карточки
@@ -4189,8 +4203,7 @@ def _draw_plan(
             draw_session_card(image, draw, plan, card, ctx)
     if plan["empty_rect"] is not None:
         draw_empty_card(image, draw, plan)
-    if plan["has_changes"]:
-        draw_changes_panel(image, draw, plan)
+    draw_changes_panel(image, draw, plan)
     draw_footer(image, draw, plan)
 
 
@@ -4286,7 +4299,7 @@ def validate_layout(plan: dict) -> list:
         if el["owner"] in ("header", "footer"):
             continue
         ox0, oy0, ox1, oy1 = owners.get(el["owner"], (0, 0, W, H))
-        if plan["has_changes"] and ox1 > left_x + left_w + eps + 1:
+        if ox1 > left_x + left_w + eps + 1:
             # правая колонка — только в её границах
             right_x, right_w = plan["right"]
             if ox0 < right_x - eps:
@@ -4383,6 +4396,8 @@ def render_schedule_image(
         for level in range(4):
             style = _style_for_level(level)
             plan = _build_plan(schedule, changes, title, style, ctx, fixed=True)
+            if not plan["fits"]:
+                continue
             image = Image.new("RGB", (plan["W"], plan["H"]), S_BG)
             draw = ImageDraw.Draw(image)
             plan["elements"] = []
