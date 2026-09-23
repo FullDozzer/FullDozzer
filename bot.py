@@ -4115,7 +4115,9 @@ def draw_changes_panel(
                                radius=14, fill=S_WHITE, outline=S_BORDER, width=1)
         rep.append({"id": "panel:empty_bg", "kind": "shape",
                     "bbox": (ph_x, ph_y, ph_x + ph_w, ph_y + ph_h),
-                    "owner": "panel"})
+                    "zone": (ph_x, ph_y, ph_x + ph_w, ph_y + ph_h),
+                    "owner": "panel", "truncated": False, "size": 0,
+                    "text": ""})
         draw_text_bounded(draw, ph_x + 12, ph_y + 16, ph_w - 24, 20,
                           "Изменений нет", 14, "semibold", S_INK,
                           report=rep, element_id="panel:empty_title", owner="panel")
@@ -4243,32 +4245,46 @@ def validate_layout(plan: dict) -> list:
     elements = plan["elements"]
 
     for el in elements:
-        x0, y0, x1, y1 = el["bbox"]
-        zx0, zy0, zx1, zy1 = el["zone"]
+        el_id = el.get("id", "?")
+        bbox = el.get("bbox")
+        if bbox is None:
+            problems.append(f"«{el_id}»: элемент без bbox")
+            continue
+        x0, y0, x1, y1 = bbox
+        # Зона обязательна для проверки, но её отсутствие — проблема
+        # layout, а не повод ронять весь валидатор (и вместе с ним
+        # отрисовку расписания). Недостающую зону считаем равной bbox.
+        zone = el.get("zone")
+        if zone is None:
+            zone = bbox
+            problems.append(f"«{el_id}»: элемент без зоны (zone)")
+        zx0, zy0, zx1, zy1 = zone
         # 1) bbox внутри своей зоны.
         if (x0 < zx0 - eps or y0 < zy0 - eps
                 or x1 > zx1 + eps or y1 > zy1 + eps):
             problems.append(
-                f"«{el['id']}»: текст вышел за зону "
+                f"«{el_id}»: текст вышел за зону "
                 f"({x0:.0f},{y0:.0f},{x1:.0f},{y1:.0f}) vs "
                 f"({zx0:.0f},{zy0:.0f},{zx1:.0f},{zy1:.0f})"
             )
         # 2) зона внутри owner-прямоугольника.
-        owner = owners.get(el["owner"])
+        el_owner = el.get("owner")
+        owner = owners.get(el_owner)
         if owner is None:
-            problems.append(f"«{el['id']}»: неизвестный owner «{el['owner']}»")
+            problems.append(f"«{el_id}»: неизвестный owner «{el_owner}»")
         elif (zx0 < owner[0] - eps or zy0 < owner[1] - eps
               or zx1 > owner[2] + eps or zy1 > owner[3] + eps):
             problems.append(
-                f"«{el['id']}»: зона вышла за карточку {el['owner']}"
+                f"«{el_id}»: зона вышла за карточку {el_owner}"
             )
         # 3) bbox внутри холста.
         if x0 < -eps or y0 < -eps or x1 > W + eps or y1 > H + eps:
-            problems.append(f"«{el['id']}»: элемент вышел за холст")
+            problems.append(f"«{el_id}»: элемент вышел за холст")
 
     # 4) пересечения элементов (кроме фонов: card/rowbg/bg).
     checkable = [
-        el for el in elements if el["kind"] not in ("card", "rowbg", "bg")
+        el for el in elements
+        if el.get("kind") not in ("card", "rowbg", "bg")
     ]
 
     def _contains(outer: tuple, inner: tuple) -> bool:
@@ -4278,33 +4294,39 @@ def validate_layout(plan: dict) -> list:
     for i in range(len(checkable)):
         for j in range(i + 1, len(checkable)):
             a, b = checkable[i], checkable[j]
-            if a["id"] == b["id"]:
+            a_id, b_id = a.get("id", "?"), b.get("id", "?")
+            if a_id == b_id:
                 continue
-            area = _intersect_area(a["bbox"], b["bbox"])
+            a_box, b_box = a.get("bbox"), b.get("bbox")
+            if a_box is None or b_box is None:
+                continue  # уже зафиксировано выше как «без bbox»
+            area = _intersect_area(a_box, b_box)
             if area <= 3:
                 continue
             # Текст ВНУТРИ бейджа/фигуры — намеренное вложение,
             # не пересечение.
-            if (a["kind"] in ("badge", "shape") and b["kind"] == "text"
-                    and _contains(a["bbox"], b["bbox"])):
+            a_kind, b_kind = a.get("kind"), b.get("kind")
+            if (a_kind in ("badge", "shape") and b_kind == "text"
+                    and _contains(a_box, b_box)):
                 continue
-            if (b["kind"] in ("badge", "shape") and a["kind"] == "text"
-                    and _contains(b["bbox"], a["bbox"])):
+            if (b_kind in ("badge", "shape") and a_kind == "text"
+                    and _contains(b_box, a_box)):
                 continue
-            problems.append(f"пересечение: «{a['id']}» × «{b['id']}»")
+            problems.append(f"пересечение: «{a_id}» × «{b_id}»")
 
     # 5) колонки: левая и правая не пересекаются и в пределах холста.
     left_x, left_w = plan["left"]
     for el in elements:
-        if el["owner"] in ("header", "footer"):
+        el_owner = el.get("owner")
+        if el_owner in ("header", "footer"):
             continue
-        ox0, oy0, ox1, oy1 = owners.get(el["owner"], (0, 0, W, H))
+        ox0, oy0, ox1, oy1 = owners.get(el_owner, (0, 0, W, H))
         if ox1 > left_x + left_w + eps + 1:
             # правая колонка — только в её границах
             right_x, right_w = plan["right"]
             if ox0 < right_x - eps:
                 problems.append(
-                    f"«{el['id']}»: левая колонка вторглась в правую"
+                    f"«{el.get('id', '?')}»: левая колонка вторглась в правую"
                 )
 
     # 6) низ: сноска/разделитель не прижаты к краю, не наезжают
@@ -4315,9 +4337,10 @@ def validate_layout(plan: dict) -> list:
         if footer_owner[1] < content_bottom - eps:
             problems.append("подвал наехал на контент")
     for el in elements:
-        if el["owner"] == "footer" and el["kind"] == "text":
-            if H - el["bbox"][3] < 20:
-                problems.append(f"«{el['id']}»: прижат к нижнему краю")
+        if el.get("owner") == "footer" and el.get("kind") == "text":
+            bbox = el.get("bbox")
+            if bbox is not None and H - bbox[3] < 20:
+                problems.append(f"«{el.get('id', '?')}»: прижат к нижнему краю")
 
     return problems
 
