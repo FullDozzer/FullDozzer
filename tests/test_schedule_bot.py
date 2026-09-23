@@ -50,6 +50,19 @@ def empty_schedule(day: date) -> bot.Schedule:
     return bot.Schedule(date=day, group=bot.GROUP_NAME, lessons=[])
 
 
+def lesson_card_span() -> tuple:
+    """(x0, x1) карточки пары в левой колонке — из констант layout.
+
+    Колонка «Изменения» присутствует всегда, поэтому карточки пар
+    заканчиваются задолго до правого края холста. Пиксельные проверки
+    «справа в карточке» должны опираться на эту геометрию, а не на
+    жёстко заданные координаты.
+    """
+    content_w = bot.SCHEDULE_WIDTH - 2 * bot.S_MARGIN
+    left_w = content_w - bot.S_RIGHT_COL_W - bot.S_COL_GAP
+    return bot.S_MARGIN, bot.S_MARGIN + left_w
+
+
 class FakeBot:
     """Минимальный Bot для тестов: записывает отправки."""
 
@@ -1599,6 +1612,11 @@ class TestImageLayoutFixes(unittest.TestCase):
         without_break = bot.render_schedule_image(
             self.make("", day=date(2026, 9, 10)))
 
+        # Текст перемены прижат к правому краю карточки пары; правее
+        # карточки — колонка «Изменения», её не сканируем.
+        card_x0, card_x1 = lesson_card_span()
+        scan_x0 = (card_x0 + card_x1) // 2
+
         def header_muted_rows(path):
             # Точность ±6: глифы FreeType имеют пиксели частичного
             # покрытия (±единицы в каналах относительно S_MUTED).
@@ -1609,7 +1627,7 @@ class TestImageLayoutFixes(unittest.TestCase):
                     if any(abs(px[x, y][0] - self.MUTED[0]) <= 6
                            and abs(px[x, y][1] - self.MUTED[1]) <= 6
                            and abs(px[x, y][2] - self.MUTED[2]) <= 6
-                           for x in range(700, 1040, 2))
+                           for x in range(scan_x0, card_x1, 2))
                 ]
 
         self.assertTrue(
@@ -1678,6 +1696,53 @@ class TestScheduleCardDesign(unittest.TestCase):
         path = bot.render_schedule_image(self.schedule_with_subgroups())
         self.assertEqual(bot._LAST_RENDER["problems"], [])
         self.assertGreater(bot._LAST_RENDER["elements"], 10)
+
+    def test_render_without_changes_registers_empty_panel_with_zone(self):
+        """Регрессия: /today без изменений падал с KeyError: 'zone'.
+
+        Плашка «Изменений нет» в правой колонке регистрировалась в
+        отчёте layout без ключа zone, и validate_layout ронял весь
+        рендер. Обычный рендер (changes=None) — самый частый сценарий —
+        должен проходить валидацию без единой проблемы.
+        """
+        schedule = bot.Schedule(
+            date=date(2026, 9, 23), group=bot.GROUP_NAME,
+            lessons=[
+                lesson("II", None, "~..............", "—", "—",
+                       "10:00", "11:20"),
+                lesson("III", None, "Основы экономики", "УК303",
+                       "Кильдиярова Г.Р.", "11:35", "12:55"),
+                lesson("IV", None, "Основы экономики", "УК303",
+                       "Кильдиярова Г.Р.", "13:25", "14:45"),
+            ],
+        )
+        path = bot.render_schedule_image(schedule)  # changes=None
+        self.assertTrue(Path(path).exists())
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        self.assertEqual(bot._LAST_RENDER["size"], (1080, 920))
+
+    def test_validate_layout_reports_missing_zone_instead_of_raising(self):
+        """Неполный элемент отчёта — проблема layout, а не исключение."""
+        W, H = bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT
+        plan = {
+            "W": W, "H": H,
+            "left": (bot.S_MARGIN, 656), "right": (716, bot.S_RIGHT_COL_W),
+            "content_bottom": 300,
+            "owners": {"header": (0, 0, W, bot.S_HEADER_BOTTOM),
+                       "footer": (0, 800, W, H),
+                       "panel": (716, 164, 1044, 284)},
+            "elements": [
+                # как регистрировалась плашка «Изменений нет» до фикса
+                {"id": "panel:empty_bg", "kind": "shape",
+                 "bbox": (716, 198, 1044, 284), "owner": "panel"},
+                {"id": "ghost", "kind": "text", "owner": "panel"},
+            ],
+        }
+        problems = bot.validate_layout(plan)
+        self.assertTrue(any("panel:empty_bg" in p and "zone" in p
+                            for p in problems), problems)
+        self.assertTrue(any("ghost" in p and "bbox" in p
+                            for p in problems), problems)
 
     def test_long_subject_truncated_not_overflowed(self):
         schedule = bot.Schedule(
@@ -1809,7 +1874,13 @@ class TestTotalStudyBadge(DBTestCase):
             ]
 
     def green_right_rows(self, path):
-        """Зелёные строки в правой части карточек (прогресс, не бейдж)."""
+        """Зелёные строки в правой части карточек (прогресс, не бейдж).
+
+        Сканируется правая половина карточки пары: бейдж аудитории
+        стоит слева, а правее карточки — колонка «Изменения».
+        """
+        card_x0, card_x1 = lesson_card_span()
+        scan_x0 = (card_x0 + card_x1) // 2
         with Image.open(path) as img:
             px = img.convert("RGB").load()
             return [
@@ -1817,7 +1888,7 @@ class TestTotalStudyBadge(DBTestCase):
                 if any(abs(px[x, y][0] - self.GREEN[0]) <= 6
                        and abs(px[x, y][1] - self.GREEN[1]) <= 6
                        and abs(px[x, y][2] - self.GREEN[2]) <= 6
-                       for x in range(800, 1044, 2))
+                       for x in range(scan_x0, card_x1, 2))
             ]
 
     def color_clusters(self, rows):
