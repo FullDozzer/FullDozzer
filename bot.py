@@ -6,9 +6,10 @@ Telegram-бот расписания группы ЭС7-24 (Институт н�
 - Разбирает HTML через BeautifulSoup (только карточки div.card.myCard с .card-header).
 - Игнорирует недельную таблицу.
 - Генерирует современную PNG-картинку через Pillow: одна дата = одна
-  вертикальная карточка (1080×1350, 4:5; при плотном дне холст растёт по
-  лестнице форматов), главный акцент каждой пары — крупный зелёный чип
-  аудитории; изменения и отмены показываются внутри карточки пары.
+  вертикальная карточка (1080×1620, 2:3; при плотном дне холст растёт по
+  лестнице форматов). Карточка пары: номер, время, предмет, преподаватель
+  и аккуратная зелёная плашка аудитории; изменения и отмены показываются
+  внутри карточки пары.
 - Поддержка подписок (SQLite), фоновый мониторинг изменений.
 - Работает в Docker, кодировка UTF-8.
 - Все даты считаются в часовом поясе Asia/Yekaterinburg (UTC+5),
@@ -45,7 +46,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -2012,6 +2013,20 @@ normalize_subject = normalize_subject_name
 # Такое «предметом» не считается: ни в историю, ни в подсчёт времени.
 _PLACEHOLDER_SUBJECT_RE = re.compile(r"^[\s.\-–—~_=*#]+$")
 
+# Символы, которых нет в Inter/DejaVu: Pillow подставил бы «квадрат».
+_UNPRINTABLE_RE = re.compile(r"[^\w\s.,;:!?()\[\]{}«»„“”'\"\\/|+\-—–=*&%$#№@^~…°]",
+                            flags=re.UNICODE)
+
+
+def sanitize_text(value) -> str:
+    """Убрать символы, которые шрифт нарисует «квадратами»."""
+    text = clean_text(value)
+    if not text:
+        return ""
+    cleaned = _UNPRINTABLE_RE.sub("", text)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
 
 def is_placeholder_subject(value) -> bool:
     """True для отменённых занятий («~..............», «---», пусто)."""
@@ -2885,26 +2900,21 @@ def _change_summary_lines(changes: list) -> list:
 # РЕНДЕР КАРТОЧКИ РАСПИСАНИЯ (Telegram-first: один день — одна картинка)
 # ============================================================
 #
-# Главная цель дизайна: картинку открыли в чате Telegram и БЕЗ ЗУМА
-# прочитали «во сколько → какой предмет → В КАКОЙ АУДИТОРИИ».
-#
-# Формат:
-#   - вертикальное 4:5 (1080×1350) — целиком попадает в превью чата
-#     и на Android, и на iOS (длинная сторона не «уезжает» за 1280);
-#   - ОДНА КАРТИНКА = ОДИН ДЕНЬ: даты никогда не объединяются;
-#   - отдельной колонки «Изменения» больше нет — изменение, добавление
-#     и отмена живут ВНУТРИ карточки той пары, к которой относятся;
-#   - всё важное — в safe area (SAFE_AREA px от каждого края холста).
-#
-# Иерархия карточки:
-#   номер пары → ВРЕМЯ (крупно) → ПРЕДМЕТ (крупно) → АУДИТОРИЯ
-#   (самый заметный элемент после времени и предмета: зелёный чип
-#   «АУД. УК303», крупный жирный, никогда не мельче ROOM_FONT_MIN) →
-#   преподаватель (меньше) → второстепенное (ещё меньше).
-#   Перерыв — компактной строкой между карточками.
-#   Отменённое занятие — мягкая красно-розовая карточка и крупная
-#   плашка «ЗАНЯТИЕ ОТМЕНЕНО»; аудитория при этом остаётся, если она
-#   есть в исходных данных.
+# Дизайн (референс — «легкая лавандовая карточка дня»):
+#   - фон — светлая лаванда с едва заметными диагональными подложками;
+#   - шапка: иконка календаря, «РАСПИСАНИЕ», группа крупно, дата;
+#     справа — счётчик занятий, шкала прогресса и «Изучено: … акад. ч»;
+#   - карточка пары: круг с номером + время (начало тёмное, конец
+#     приглушённое) + тихая пометка справа (перемена / подгруппы),
+#     затем предмет, преподаватель и зелёная плашка аудитории;
+#   - плашка аудитории: «Ауд. ПК108» и изученное время — зелёный
+#     акцент, но сдержанного кегля: аудитория заметна цветом и
+#     подложкой, а не «режимом для слабовидящих»;
+#   - отмена: розовая плашка внутри карточки с пилюлей «Занятие
+#     отменено» и красным бейджем «ОТМЕНА»;
+#   - подвал: светлая плашка со сноской про академический час и
+#     обыкновенным временем в две колонки;
+#   - ОДНА КАРТИНКА = ОДИН ДЕНЬ, всё важное — в safe area.
 #
 # Архитектура (layout → render; позиции нигде не хардкодятся):
 #   Pen             — шрифт-измеритель: метрики снимаются с того же
@@ -2914,132 +2924,164 @@ def _change_summary_lines(changes: list) -> list:
 #                     использует и layout (чтобы записать честный
 #                     bounding box), и рендер (чтобы нарисовать там же);
 #   layout_*        — ТОЛЬКО измеряют и возвращают ops (прямоугольники,
-#                     текст, чипы) + высоту блока; ничего не рисуют;
+#                     текст, иконки) + высоту блока; ничего не рисуют;
 #   build_plan      — подбирает масштаб и высоту холста по количеству
 #                     занятий и раскладывает шапку, карточки, подвал;
 #   draw_ops        — единственное место, которое рисует (холст 2x +
 #                     даунскейл LANCZOS — чёткий текст);
 #   validate_layout — проверка ПЕРЕД сохранением: ни один bounding box
 #                     не вышел за свою зону, за карточку, за safe area и
-#                     за canvas; аудитория не мельче пола; пересечений
-#                     нет. Контент не режется никогда: сначала
-#                     уплотняется layout, в крайнем случае растёт холст.
+#                     за canvas; пересечений текста нет. Контент не
+#                     режется никогда: сначала уплотняется layout, в
+#                     крайнем случае растёт холст.
 
 import math as _math
 
-# --- Палитра: светлый фон, лаванда, зелёные аудитории, красная отмена ---
-S_BG        = "#F4F4FA"     # фон холста
-S_CARD      = "#FFFFFF"     # карточка
-S_INK       = "#1A2030"     # основной текст
-S_MUTED     = "#7C8598"     # второстепенный текст
-S_FAINT     = "#9AA3B4"     # самый тихий текст
-S_PURPLE    = "#5B4BD6"     # акцент (шапка, номер пары, изменения)
-S_PURPLE_D  = "#4535BC"
-S_PURPLE_L  = "#EFEDFF"     # лавандовые плашки
-S_PURPLE_B  = "#E0DBFA"
-S_GREEN     = "#1B9C62"
-S_GREEN_D   = "#0F7A49"     # текст чипа аудитории
-S_GREEN_L   = "#E3F7ED"     # фон чипа аудитории
-S_GREEN_B   = "#BFE9D4"     # рамка чипа аудитории
-S_RED       = "#D6455C"     # плашка отмены
-S_RED_D     = "#AE2A42"
-S_RED_L     = "#FDEDF0"     # фон отменённой карточки
-S_RED_B     = "#F7D3DA"
-S_BORDER    = "#E8E7F1"     # границы карточек
-S_ROW_BG    = "#FAFAFE"     # фон строки подгруппы
-S_ROW_BD    = "#EDECF5"
-S_BAND      = "#F4F2FE"     # плашка «что изменилось» внутри карточки
-S_BAND_BD   = "#E6E1FC"
-S_TRACK     = "#E7E6F0"     # дорожка прогресса в шапке
-S_SHADOW    = "#DAD8E8"     # тень карточек (растягивается к цвету фона)
-S_GOTHIC    = "#DBD6EF"     # микро-акцент: стрельчатая арка (едва заметен)
+# ------------------------------------------------------------
+# ПАЛИТРА: лавандовый холст, белые карточки, зелёные аудитории
+# ------------------------------------------------------------
 
-# --- Холст ---
+S_BG         = "#F2F1FA"   # фон холста
+S_BG_LIGHT   = "#F7F6FC"   # диагональная подложка (светлее фона)
+S_BG_DEEP    = "#ECEAF7"   # диагональная подложка (темнее фона)
+S_CARD       = "#FFFFFF"   # карточка пары
+S_INK        = "#191826"   # основной текст
+S_MUTED      = "#8A88A0"   # второстепенный текст
+S_FAINT      = "#A9A7BD"   # самый тихий текст
+S_PURPLE     = "#6C5CE7"   # акцент: метка, номер пары, шкала прогресса
+S_PURPLE_D   = "#5B49D6"   # текст изменений
+S_PURPLE_L   = "#EFEDFD"   # светлая лаванда: круг номера, статусные пилюли
+S_PURPLE_B   = "#E2DDFA"   # граница лавандовых плашек
+S_GREEN      = "#17A15E"   # иконка аудитории
+S_GREEN_D    = "#128A4E"   # «6 акад. ч»
+S_GREEN_M    = "#5F9179"   # «Ауд. ПК108» — спокойный зелёно-серый
+S_GREEN_L    = "#E9F7EF"   # плашка аудитории
+S_GREEN_B    = "#D6EFE1"   # граница плашки аудитории
+S_RED        = "#E8556D"   # бейдж «ОТМЕНА»
+S_RED_D      = "#D9455F"   # текст «Занятие отменено»
+S_RED_L      = "#FDECEF"   # розовая плашка отмены
+S_RED_PILL   = "#FBE0E6"   # фон пилюли «Занятие отменено»
+S_RED_B      = "#F8D6DD"   # граница розовой плашки
+S_BORDER     = "#EEECF7"   # граница карточки
+S_SHADOW     = "#B7AFDC"   # мягкая тень карточки (прозрачность — в маске)
+S_TRACK      = "#E9E7F6"   # дорожка шкалы прогресса
+S_DIVIDER    = "#E0DDF1"   # разделитель колонок подвала
+
+# ------------------------------------------------------------
+# ХОЛСТ
+# ------------------------------------------------------------
+
 SCHEDULE_WIDTH = 1080
-SCHEDULE_HEIGHT = 1350                     # 4:5 — основной формат
+SCHEDULE_HEIGHT = 1620                     # 2:3 — базовый формат
 
-S_SCALE_MIN = 0.55
-S_SCALE_MAX = 1.35          # занятий мало — карточки крупнее
-S_SCALE_STEP = 0.02          # квант подбора масштаба (стабильный результат)
+S_SCALE_MIN = 0.62
+S_SCALE_MAX = 1.12          # занятий мало — карточки крупнее
+S_SCALE_STEP = 0.02         # квант подбора масштаба (стабильный результат)
 
 # Лестница форматов: (высота холста, минимально допустимый масштаб).
 # Холст растёт только когда на более компактном формате текст уже упёрся
-# в пол и стал нечитаемым; вертикальный кроп не используется никогда.
-# Чем короче холст при том же кегле, тем КРУПНЕЙШЕ картинка в превью
-# чата (Telegram вписывает портрет в ширину сообщения), поэтому выбор
-# такой: самый короткий формат, на котором текст ещё не упёрся в полы.
+# в пол читаемости; вертикального кропа не используется никогда.
 SCHEDULE_RATIO_LADDER = (
-    (1350, 0.72),                          # 4:5 — основной формат
-    (1440, 0.66),                          # 3:4
-    (1560, 0.60),                          # 7-9 занятий
-    (1740, S_SCALE_MIN),                   # потолок: выше — уже «чрезмерно»
+    (1620, 0.92),                          # 2:3 — основной формат
+    (1740, 0.84),                          # плотный день
+    (1860, 0.76),                          # 7–9 занятий
+    (1980, S_SCALE_MIN),                   # потолок: выше — уже «чрезмерно»
 )
 SCHEDULE_HEIGHT_MAX = SCHEDULE_RATIO_LADDER[-1][0]
 
-SAFE_AREA = 62            # единый безопасный отступ со всех четырёх сторон
+SAFE_AREA = 52            # единый безопасный отступ со всех четырёх сторон
 SUPER_SAMPLE = 2          # рендер в 2x + LANCZOS -> чёткий текст
 
 # --- Текстовая шкала (дизайн-пиксели при масштабе 1.0) ---
 S_TYPE = {
-    "time": 46,            # время пары — крупно
-    "subject": 33,         # название предмета — крупно
-    "room": 43,            # АУДИТОРИЯ — акцент карточки
-    "teacher": 25,         # преподаватель — заметно меньше
-    "small": 21,           # второстепенное: прогресс, подгруппы, изменения
-    "roman": 21,           # номер пары в чипе
-    "cancel": 30,          # «ЗАНЯТИЕ ОТМЕНЕНО»
-    "tag": 17,             # ИЗМЕНЕНО / ДОБАВЛЕНО / ОТМЕНА
-    "header_title": 52,
-    "header_label": 19,
-    "header_date": 25,
-    "header_pill": 22,
-    "header_small": 18,
+    "header_label": 20,     # «РАСПИСАНИЕ» с разрядкой
+    "header_title": 58,     # группа / ФИО
+    "header_date": 27,      # «Четверг, 24 сентября 2026»
+    "header_pill": 30,      # число в счётчике занятий
+    "header_pill_word": 23,  # «занятий» в счётчике
+    "header_progress": 22,  # «Изучено: … акад. ч»
+    "roman": 26,            # номер пары в круге
+    "time": 34,             # время пары
+    "subject": 33,          # предмет
+    "teacher": 23,          # преподаватель
+    "room": 24,             # «Ауд. ПК108»
+    "hours": 27,            # «6 акад. ч»
+    "small": 21,            # перемена / «2 подгруппы» / изменения
+    "subgroup": 19,         # «1 П/ГР.»
+    "cancel": 21,           # «Занятие отменено»
+    "tag": 21,              # «ОТМЕНА»
+    "note": 20,             # сноска подвала
 }
-# Полы — это и есть «не уменьшать важное»: текст аудитории не мельчает
-# ниже ROOM_FONT_MIN, даже когда занятий очень много.
+# Полы: при плотном дне всё уплотняется, но читаемость не пробивается.
 S_TYPE_MIN = {
-    "time": 30,
-    "subject": 23,
-    "room": 34,
-    "teacher": 17,
-    "small": 15,
-    "roman": 15,
-    "cancel": 22,
-    "tag": 13,
-    "header_title": 34,
     "header_label": 15,
+    "header_title": 38,
     "header_date": 19,
-    "header_pill": 17,
-    "header_small": 14,
+    "header_pill": 22,
+    "header_pill_word": 16,
+    "header_progress": 16,
+    "roman": 18,
+    "time": 24,
+    "subject": 23,
+    "teacher": 16,
+    "room": 17,
+    "hours": 19,
+    "small": 15,
+    "subgroup": 14,
+    "cancel": 15,
+    "tag": 15,
+    "note": 15,
 }
 ROOM_FONT_MIN = S_TYPE_MIN["room"]
 
 # --- Отступы и зазоры: база и пол (умножаются на тот же масштаб) ---
 S_SPACE = {
-    "pad_x": 26, "pad_t": 20, "pad_b": 20,
-    "gap_head": 12, "gap_subj": 12, "gap_room": 12, "gap_extra": 8,
-    "card_gap": 16, "row_pad": 16, "row_gap": 10,
-    "chip_pad_x": 18, "chip_pad_y": 10, "band_pad": 12, "tag_pad_x": 11,
-    "chip_min_w": 300, "chip_min_h": 46,
+    "pad_x": 34, "pad_t": 28, "pad_b": 30,          # карточка
+    "gap_badge": 26,                                # круг номера → время
+    "gap_row": 22,                                  # строка времени → предмет
+    "gap_subject": 14,                              # предмет → преподаватель
+    "gap_items": 20,                                # между блоками подгрупп
+    "gap_panel": 28,                                # левая колонка ↔ плашка
+    "gap_icon": 9,                                  # иконка → текст
+    "card_gap": 14,                                 # между карточками
+    "gap_header": 34,                               # шапка → карточки
+    "panel_pad_x": 20, "panel_pad_y": 14,           # плашка аудитории
+    "panel_line_gap": 6,                            # строки в плашке
+    "pill_pad_x": 16, "pill_pad_y": 9,              # пилюли (отмена, статусы)
+    "band_pad_x": 14, "band_pad_y": 9,              # плашка изменений
+    "badge": 66,                                    # диаметр круга с номером
+    "icon": 22,                                     # размер иконок в строке
+    "radius": 32, "row_radius": 22,                 # радиусы карточек и плашек
 }
 S_SPACE_MIN = {
-    "pad_x": 18, "pad_t": 13, "pad_b": 13,
-    "gap_head": 7, "gap_subj": 7, "gap_room": 7, "gap_extra": 5,
-    "card_gap": 9, "row_pad": 10, "row_gap": 6,
-    "chip_pad_x": 11, "chip_pad_y": 6, "band_pad": 8, "tag_pad_x": 7,
-    "chip_min_w": 190, "chip_min_h": 36,
+    "pad_x": 22, "pad_t": 17, "pad_b": 18,
+    "gap_badge": 15, "gap_row": 13, "gap_subject": 8, "gap_items": 11,
+    "gap_panel": 16, "gap_icon": 5,
+    "card_gap": 8, "gap_header": 20,
+    "panel_pad_x": 12, "panel_pad_y": 8, "panel_line_gap": 3,
+    "pill_pad_x": 9, "pill_pad_y": 5,
+    "band_pad_x": 8, "band_pad_y": 5,
+    "badge": 42, "icon": 15,
+    "radius": 18, "row_radius": 13,
 }
-
-CHANGE_LINES_MAX = 3         # сколько строк изменений показать в карточке
+S_LINE_GAP_BASE = 4             # межстрочный зазор внутри блока текста
+PILL_RADIUS_RATIO = 0.5         # пилюли — «капсулы»
+CHANGE_LINES_MAX = 3            # сколько строк изменений показать в карточке
 
 # Вес начертаний для ролей текста
 _ROLE_WEIGHT = {
-    "time": "bold", "subject": "semibold", "room": "bold",
-    "teacher": "regular", "small": "regular", "roman": "bold",
-    "cancel": "bold", "tag": "bold", "header_title": "bold",
-    "header_label": "bold", "header_date": "regular",
-    "header_pill": "bold", "header_small": "regular",
+    "header_label": "bold", "header_title": "bold", "header_date": "regular",
+    "header_pill": "bold", "header_pill_word": "regular",
+    "header_progress": "regular",
+    "roman": "bold", "time": "bold", "time_end": "medium",
+    "subject": "semibold", "teacher": "regular", "room": "medium",
+    "hours": "bold", "small": "regular", "subgroup": "bold",
+    "cancel": "medium", "tag": "bold", "note": "regular",
 }
+
+
+def _type_floor(role: str) -> int:
+    return S_TYPE_MIN.get(role, 8)
 
 
 # ------------------------------------------------------------
@@ -3102,7 +3144,7 @@ class Pen:
         box = self.font.getbbox(text or " ")
         return tuple(v / SUPER_SAMPLE for v in box)
 
-    def line_h(self, ratio: float = 1.15) -> float:
+    def line_h(self, ratio: float = 1.16) -> float:
         """Высота строки: не меньше ascent+descent, иначе глифы вылезут."""
         return max(self.ascent + self.descent, self.size * ratio)
 
@@ -3152,7 +3194,7 @@ class Pen:
         return len(self.wrap(text, max_w)) <= max_lines
 
     def fit(self, text: str, max_w: float, min_size: int = 0,
-             max_lines: int = 1) -> dict:
+            max_lines: int = 1) -> dict:
         """Подогнать текст в ширину: сначала многострочность, затем
         уменьшение кегля (не ниже min_size), и только в самом крайнем
         случае — многоточие.
@@ -3202,67 +3244,26 @@ def _pen(size: int, weight: str = "regular") -> Pen:
 def _metrics_for(scale: float) -> dict:
     """Адаптивные метрики: кегли и отступы зависят от количества занятий.
 
-    Полы важнее масштаба: текст аудитории никогда не меньше
-    ROOM_FONT_MIN, преподаватель — не меньше своего S_TYPE_MIN. Так при
-    7-8 занятиях карточки становятся компактнее, а аудитория — нет.
+    Полы важнее масштаба: при плотном дне карточки становятся
+    компактнее, но аудитория и время не мельчают ниже своих полов.
     """
     scale = max(S_SCALE_MIN, min(S_SCALE_MAX, float(scale)))
     m: dict = {"scale": round(scale, 3)}
     for key, base in S_TYPE.items():
-        m[key] = max(S_TYPE_MIN[key], int(round(base * scale)))
+        m[key] = max(_type_floor(key), int(round(base * scale)))
     m["room"] = max(m["room"], ROOM_FONT_MIN)
     for key, base in S_SPACE.items():
         m[key] = max(S_SPACE_MIN[key], int(round(base * scale)))
-    m["line_gap"] = max(1, int(round(3 * scale)))
-    m["radius"] = max(12, int(round(26 * scale)))
-    m["row_radius"] = max(10, int(round(20 * scale)))
-    m["shadow"] = max(2, int(round(5 * scale)))
-    # Длинные названия переносятся; чем больше воздуха, тем больше строк.
-    m["subject_lines"] = 3 if scale >= 0.94 else 2
+    m["line_gap"] = max(1, int(round(S_LINE_GAP_BASE * scale)))
+    m["subject_lines"] = 3 if scale >= 0.96 else 2
+    m["shadow"] = max(8, int(round(18 * scale)))          # радиус размытия
+    m["shadow_y"] = max(3, int(round(8 * scale)))         # смещение вниз
+    m["shadow_alpha"] = 70                                # плотность тени (0…255)
     return m
 
 
 # ------------------------------------------------------------
-# ГОТИЧЕСКИЙ МИКРО-АКЦЕНТ — по одному на шапку и на разделитель подвала
-# ------------------------------------------------------------
-
-def _gothic_arch_polygon(x: float, y: float, w: float, h: float,
-                          n: int = 20) -> list:
-    """Контур стрельчатой (lancet) арки в прямоугольнике (x, y, w, h)."""
-    shoulder = y + h * 0.45
-    theta = _math.atan2(0.45 * h, w / 2)
-    radius = _math.hypot(w / 2, 0.45 * h)
-    pts = [(x, y + h), (x, shoulder)]
-    for i in range(n + 1):                       # левая дуга
-        angle = _math.pi + theta * i / n
-        pts.append((x + w + radius * _math.cos(angle),
-                    shoulder + radius * _math.sin(angle)))
-    for i in range(n + 1):                       # правая дуга
-        angle = -theta + theta * i / n
-        pts.append((x + radius * _math.cos(angle),
-                    shoulder + radius * _math.sin(angle)))
-    pts.extend([(x + w, shoulder), (x + w, y + h)])
-    return pts
-
-
-def _arch_ops(x: float, y: float, w: float, h: float, color: str,
-              hole: str, ring: float = 2.0, uid: str = "deco:arch") -> list:
-    """Арка-контур: залили силуэт, вырезали середину цветом подложки."""
-    ops = [{"op": "poly", "points": _gothic_arch_polygon(x, y, w, h),
-            "fill": color, "kind": "deco", "id": uid, "owner": None,
-            "box": (x, y, x + w, y + h)}]
-    if w > ring * 2 + 4 and h > ring * 2 + 4:
-        ops.append({"op": "poly",
-                    "points": _gothic_arch_polygon(x + ring, y + ring,
-                                                  w - 2 * ring, h - 2 * ring),
-                    "fill": hole, "kind": "deco", "id": uid + ":hole",
-                    "owner": None, "box": (x + ring, y + ring,
-                                          x + w - ring, y + h - ring)})
-    return ops
-
-
-# ------------------------------------------------------------
-# LAYOUT: ops-примитивы (ops — данные, а не вызовы рисования)
+# OPS-ПРИМИТИВЫ (ops — данные, а не вызовы рисования)
 # ------------------------------------------------------------
 
 def _rect_op(box, radius, fill=None, outline=None, width=0.0, *,
@@ -3275,10 +3276,45 @@ def _rect_op(box, radius, fill=None, outline=None, width=0.0, *,
             "owner": owner}
 
 
-def _line_op(x0, y0, x1, y1, color, width=1.0, *, uid="deco:line") -> dict:
-    return {"op": "line", "box": (float(x0), float(y0), float(x1), float(y1)),
+def _ellipse_op(box, fill=None, outline=None, width=0.0, *,
+                kind="icon", uid="", owner=None) -> dict:
+    x0, y0, x1, y1 = (float(v) for v in box)
+    return {"op": "ellipse", "box": (min(x0, x1), min(y0, y1),
+                                    max(x0, x1), max(y0, y1)),
+            "fill": fill, "outline": outline, "width": float(width or 0),
+            "kind": kind, "id": uid, "owner": owner}
+
+
+def _poly_op(points, fill, *, kind="deco", uid="", owner=None) -> dict:
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    return {"op": "poly", "points": [(float(px), float(py)) for px, py in points],
+            "fill": fill, "kind": kind, "id": uid, "owner": owner,
+            "box": (min(xs), min(ys), max(xs), max(ys))}
+
+
+def _line_op(x0, y0, x1, y1, color, width=1.0, *, uid="deco:line",
+             owner=None) -> dict:
+    x0, y0, x1, y1 = (float(v) for v in (x0, y0, x1, y1))
+    return {"op": "line",
+            "box": (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)),
             "color": color, "width": float(width), "kind": "deco",
-            "id": uid, "owner": None}
+            "id": uid, "owner": owner,
+            "points": (x0, y0, x1, y1)}
+
+
+def _shadow_op(box, radius: float, *, uid="deco:shadow", blur: float = 16.0,
+               dy: float = 0.0, alpha: int = 70,
+               fill: str = S_SHADOW) -> dict:
+    """Мягкая тень: прямоугольник под карточкой, размытый на рендере.
+
+    blur/dy/alpha описывают размытие: рендер рисует маску в 1x и после
+    LANCZOS-даунскейла тень выглядит как настоящая (без «слоёных» полос).
+    """
+    x0, y0, x1, y1 = (float(v) for v in box)
+    return {"op": "shadow", "box": (x0, y0, x1, y1), "radius": float(radius),
+            "blur": float(blur), "dy": float(dy), "alpha": int(alpha),
+            "fill": fill, "kind": "shadow", "id": uid, "owner": None}
 
 
 def text_placement(pen: Pen, lines: list, box, align: str = "left",
@@ -3321,9 +3357,10 @@ def text_placement(pen: Pen, lines: list, box, align: str = "left",
                 off = pen.ink(ch)
                 left = min(left, cursor + off[0])
                 right = max(right, cursor + off[2])
-                top_i = (dy + off[1]) if top_i is None else min(top_i, dy + off[1])
-                bottom_i = (dy + off[3]) if bottom_i is None else max(bottom_i,
-                                                                      dy + off[3])
+                top_i = (dy + off[1]) if top_i is None else min(top_i,
+                                                               dy + off[1])
+                bottom_i = (dy + off[3]) if bottom_i is None else max(
+                    bottom_i, dy + off[3])
                 cursor += pen.width(ch) + spacing
             box_ink = (left, top_i, right, bottom_i)
         else:
@@ -3366,7 +3403,7 @@ def _flow_text(m: dict, x: float, y: float, w: float, text: str, role: str,
     """Текст в потоке блока: (ops, занятая высота)."""
     size = m[role]
     pen = _pen(size, weight or _ROLE_WEIGHT.get(role, "regular"))
-    floor = S_TYPE_MIN.get(role, 8) if min_size is None else min_size
+    floor = _type_floor(role) if min_size is None else min_size
     res = pen.fit(text, w, floor, max_lines)
     block_h = (res["line_h"] * len(res["lines"])
                + m["line_gap"] * max(0, len(res["lines"]) - 1))
@@ -3385,7 +3422,8 @@ def _shift_op(op: dict, dx: float, dy: float) -> dict:
     if box is not None:
         shifted["box"] = (box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy)
     if shifted.get("op") == "text":
-        shifted["origins"] = [(ox + dx, oy + dy) for ox, oy in shifted["origins"]]
+        shifted["origins"] = [(ox + dx, oy + dy)
+                              for ox, oy in shifted["origins"]]
         b0, b1, b2, b3 = shifted["bbox"]
         shifted["bbox"] = (b0 + dx, b1 + dy, b2 + dx, b3 + dy)
     if shifted.get("op") == "poly":
@@ -3397,274 +3435,375 @@ def _shift_ops(ops: list, dx: float, dy: float) -> list:
     return [_shift_op(op, dx, dy) for op in ops]
 
 
-def _shadow_ops(m: dict, box, radius: float, clip=None) -> list:
-    """Мягкая тень: сдвиговые скруглённые прямоугольники от цвета тени
-    к цвету фона — после LANCZOS выглядит как размытие.
-
-    clip=(W, H) — тень обрезается по холсту, чтобы ни один bbox не
-    выходил за canvas (это же проверяет validate_layout).
-    """
-    x0, y0, x1, y1 = box
-    bg = _hex_rgb(S_BG)
-    shade = _hex_rgb(S_SHADOW)
-    ops: list = []
-    steps = 4
-    for i in range(steps, 0, -1):
-        t = i / steps
-        color = _rgb_hex(*[int(bg[c] + (shade[c] - bg[c]) * t * 0.55)
-                          for c in range(3)])
-        grow = i * (m["shadow"] / 2.0)
-        rect = (x0 - grow, y0 - grow * 0.5 + i * (m["shadow"] / 2.0),
-                x1 + grow, y1 + grow * 0.5 + i * (m["shadow"] / 2.0))
-        if clip:
-            cw, ch = clip
-            rect = (max(0.0, rect[0]), max(0.0, rect[1]),
-                    min(float(cw), rect[2]), min(float(ch), rect[3]))
-        ops.append(_rect_op(rect, radius + grow, fill=color, kind="shadow",
-                            uid="deco:shadow"))
-    return ops
-
-
 def _hex_rgb(value: str) -> tuple:
     text = str(value).lstrip("#")
     return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
 
 
 def _rgb_hex(*parts) -> str:
-    return "#{:02X}{:02X}{:02X}".format(*[max(0, min(255, int(v))) for v in parts])
+    return "#{:02X}{:02X}{:02X}".format(*[max(0, min(255, int(v)))
+                                          for v in parts])
+
+
+def _mix(color_a: str, color_b: str, t: float) -> str:
+    """Смешать два цвета: t = 0 -> color_a, t = 1 -> color_b."""
+    a, b = _hex_rgb(color_a), _hex_rgb(color_b)
+    return _rgb_hex(*[a[i] + (b[i] - a[i]) * t for i in range(3)])
+
+
+def _fade(color: str, t: float) -> str:
+    """Приблизить цвет к цвету холста (мягкая имитация прозрачности)."""
+    return _mix(color, S_BG, t)
 
 
 # ------------------------------------------------------------
-# LAYOUT: чип аудитории и статусные плашки
+# ИКОНКИ: простые векторные глифы (без внешних ассетов)
 # ------------------------------------------------------------
 
-def _chip_ops(m: dict, x: float, y: float, max_w: float, text: str, *,
-              size: int, weight: str, text_fill: str, bg: str, border: str,
-              uid: str, owner: str, role: str = "", max_lines: int = 2,
-              min_size: Optional[int] = None, ring: float = 1.4,
-              min_w: Optional[float] = None) -> tuple:
-    """Чип с авто-шириной: текст по центру, кегль не ниже пола.
+def _circle_points(cx: float, cy: float, r: float, n: int = 28) -> list:
+    return [(cx + r * _math.cos(2 * _math.pi * i / n),
+             cy + r * _math.sin(2 * _math.pi * i / n)) for i in range(n)]
 
-    Для аудитории min_size = ROOM_FONT_MIN: «АУД. ПК108» никогда не
-    превращается в мелкий текст — вместо уменьшения чип grows/wrap'ится.
 
-    Возвращает (ops, ширина, высота).
+def _arc_points(cx: float, cy: float, r: float, a0: float, a1: float,
+                n: int = 20) -> list:
+    """Точки дуги от угла a0 до a1 (радианы) — для «плеч» человечков."""
+    return [(cx + r * _math.cos(a0 + (a1 - a0) * i / n),
+             cy + r * _math.sin(a0 + (a1 - a0) * i / n)) for i in range(n + 1)]
+
+
+def _person_ops(x: float, y: float, s: float, color: str, *,
+                uid: str, owner=None) -> list:
+    """Человечек: голова + плечи (сплошные заливки)."""
+    cx = x + s / 2
+    head_r = s * 0.185
+    head = _circle_points(cx, y + s * 0.22, head_r)
+    body_r = s * 0.315
+    base = y + s * 0.94
+    body = (_arc_points(cx, base, body_r, _math.pi, 2 * _math.pi)
+            + [(cx + body_r, base), (cx - body_r, base)])
+    return [
+        _poly_op(head, color, kind="icon", uid=uid + ":head", owner=owner),
+        _poly_op(body, color, kind="icon", uid=uid + ":body", owner=owner),
+    ]
+
+
+# Иконки, которые умеет рисовать _icon_ops (всё остальное — без иконки).
+_KNOWN_ICONS = frozenset({"person", "people", "clock", "cap", "calendar",
+                          "cross"})
+
+
+def _icon_ops(name: str, x: float, y: float, s: float, color: str, *,
+              uid: str, owner=None, ink: str = S_CARD) -> list:
+    """Иконка в квадрате (x, y, s, s). Возвращает список ops.
+
+    ink — цвет деталей поверх плашки (иконки рисуются цветом карточки,
+    когда стоят на насыщенном фоне).
     """
-    pad_x, pad_y = m["chip_pad_x"], m["chip_pad_y"]
-    pen = _pen(size, weight)
-    inner_w = max(40.0, max_w - 2 * pad_x)
-    floor = size if min_size is None else min_size
-    res = pen.fit(text, inner_w, floor, max_lines)
-    used = _pen(res["size"], weight)
-    line_h = res["line_h"]
-    text_w = max((used.width(line) for line in res["lines"]), default=0.0)
-    floor_w = m["chip_min_w"] if min_w is None else min_w
-    width = min(max_w, max(min(floor_w, max_w), text_w + 2 * pad_x))
-    height = max(m["chip_min_h"], line_h * len(res["lines"]) + 2 * pad_y)
-    ops = [_rect_op((x, y, x + width, y + height),
-                    min(height / 2.0, m["radius"] + 6), fill=bg, outline=border,
-                    width=ring, kind="chip", uid=uid + ":bg", owner=owner)]
-    ops.append(_text_op(_pen(res["size"], weight),
-                        (x + pad_x, y, x + width - pad_x, y + height), text,
-                        text_fill, align="center", valign="middle",
-                        max_lines=max_lines, min_size=res["size"],
-                        uid=uid, owner=owner, role=role))
+    if name == "person":
+        return _person_ops(x, y + s * 0.02, s * 0.96, color, uid=uid,
+                           owner=owner)
+    if name == "people":
+        # Двое: за спиной — приглушённый напарник, впереди — основной.
+        back = _person_ops(x + s * 0.40, y - s * 0.02, s * 0.62,
+                           _fade(color, 0.36), uid=uid + ":b", owner=owner)
+        front = _person_ops(x - s * 0.04, y + s * 0.16, s * 0.70, color,
+                            uid=uid + ":f", owner=owner)
+        return back + front
+    if name == "clock":
+        w = max(1.2, s * 0.085)
+        cx, cy = x + s / 2, y + s / 2
+        r = s / 2 - w / 2
+        return [
+            _ellipse_op((cx - r, cy - r, cx + r, cy + r), outline=color,
+                        width=w, kind="icon", uid=uid + ":ring", owner=owner),
+            _line_op(cx, cy, cx, cy - r * 0.50, color, w, uid=uid + ":h1",
+                     owner=owner),
+            _line_op(cx, cy, cx + r * 0.40, cy, color, w, uid=uid + ":h2",
+                     owner=owner),
+        ]
+    if name == "cap":
+        top = [(x, y + s * 0.42), (x + s * 0.5, y + s * 0.12),
+               (x + s, y + s * 0.42), (x + s * 0.5, y + s * 0.72)]
+        base = [(x + s * 0.24, y + s * 0.50), (x + s * 0.76, y + s * 0.50),
+                (x + s * 0.71, y + s * 0.88), (x + s * 0.29, y + s * 0.88)]
+        return [
+            _poly_op(top, color, kind="icon", uid=uid + ":top", owner=owner),
+            _poly_op(base, _fade(color, 0.30), kind="icon", uid=uid + ":base",
+                     owner=owner),
+        ]
+    if name == "calendar":
+        # Плотная плитка календаря с «дырочками» — только заливки, без
+        # тонких обводок (после даунскейла линии «звенят»).
+        left, right = x + s * 0.22, x + s * 0.78
+        top, bottom = y + s * 0.20, y + s * 0.84
+        bar = y + s * 0.40
+        dot = s * 0.06
+        ops = [
+            _rect_op((left, y + s * 0.10, left + s * 0.10, bar), s * 0.045,
+                     fill=ink, kind="icon", uid=uid + ":t1", owner=owner),
+            _rect_op((right - s * 0.10, y + s * 0.10, right, bar), s * 0.045,
+                     fill=ink, kind="icon", uid=uid + ":t2", owner=owner),
+            _rect_op((left, bar, right, bottom), s * 0.10, fill=ink,
+                     kind="icon", uid=uid + ":body", owner=owner),
+        ]
+        for index, (dx, dy) in enumerate(((0.30, 0.52), (0.50, 0.52),
+                                          (0.70, 0.52), (0.30, 0.70),
+                                          (0.50, 0.70), (0.70, 0.70))):
+            left_x = x + s * dx - dot / 2
+            top_y = y + s * dy - dot / 2
+            ops.append(_ellipse_op((left_x, top_y, left_x + dot, top_y + dot),
+                                   fill=color, kind="icon",
+                                   uid=f"{uid}:dot{index}", owner=owner))
+        return ops
+    if name == "cross":
+        w = max(1.4, s * 0.14)
+        pad = s * 0.26
+        return [
+            _line_op(x + pad, y + pad, x + s - pad, y + s - pad, color, w,
+                     uid=uid + ":d1", owner=owner),
+            _line_op(x + s - pad, y + pad, x + pad, y + s - pad, color, w,
+                     uid=uid + ":d2", owner=owner),
+        ]
+    return []
+
+
+def _decor_ops(W: int, H: int) -> list:
+    """Едва заметные диагональные подложки фона (как в референсе)."""
+    shapes = [
+        ([(0.50 * W, 0), (W, 0), (W, 0.26 * H), (0.62 * W, 0.09 * H)],
+         S_BG_LIGHT),
+        ([(0, 0.70 * H), (0, H), (0.44 * W, H), (0.20 * W, 0.86 * H)],
+         S_BG_DEEP),
+        ([(W, 0.80 * H), (W, H), (0.70 * W, H)], S_BG_LIGHT),
+    ]
+    ops: list = []
+    for index, (points, color) in enumerate(shapes):
+        ops.append(_poly_op(points, color, kind="deco",
+                            uid=f"deco:bg{index}"))
+    return ops
+
+# ------------------------------------------------------------
+# LAYOUT: пилюли, плашки и строки с иконками
+# ------------------------------------------------------------
+
+def _pill_ops(m: dict, x: float, y: float, text: str, *, role: str,
+              fill=None, text_fill: str = S_PURPLE_D, border=None,
+              icon=None, icon_color=None, weight=None, uid="", owner=None,
+              radius_ratio: float = PILL_RADIUS_RATIO) -> tuple:
+    """Пилюля-капсула: опциональная иконка + текст. Возвращает (ops, w, h).
+
+    Ширина — по содержимому: пилюли не растягиваются на всю карточку.
+    """
+    pen = _pen(m[role], weight or _ROLE_WEIGHT.get(role, "regular"))
+    pad_x, pad_y = m["pill_pad_x"], m["pill_pad_y"]
+    if icon not in _KNOWN_ICONS:            # «✗» и эмодзи не рисуем
+        icon = None
+    icon_size = m["icon"] * 0.84 if icon else 0.0
+    gap = m["gap_icon"] if icon else 0.0
+    text_w = pen.width(text)
+    height = max(pad_y * 2 + pen.line_h(), pad_y * 2 + icon_size)
+    width = pad_x * 2 + (icon_size + gap if icon else 0) + text_w
+    ops: list = []
+    if fill:
+        ops.append(_rect_op((x, y, x + width, y + height),
+                            height * radius_ratio, fill=fill, outline=border,
+                            width=1.2 if border else 0.0, kind="chip",
+                            uid=uid + ":bg", owner=owner))
+    cursor = x + pad_x
+    if icon:
+        ops += _icon_ops(icon, cursor, y + (height - icon_size) / 2, icon_size,
+                         icon_color or text_fill, uid=uid + ":icon",
+                         owner=owner)
+        cursor += icon_size + gap
+    ops.append(_text_op(pen,
+                        (cursor, y, cursor + text_w + 1, y + height), text,
+                        text_fill, valign="middle", max_lines=1,
+                        min_size=_type_floor(role), uid=uid + ":text",
+                        owner=owner, role=role))
     return ops, width, height
 
 
-def _tag_ops(m: dict, x_right: float, y: float, max_w: float, label: str,
-             color: str, bg: str, uid: str, owner: str) -> tuple:
-    """Маленькая статусная плашка в правой части шапки карточки."""
-    if not label:
-        return [], 0.0
-    pen = _pen(m["tag"], "bold")
+def _meta_slot_ops(m: dict, right_x: float, y_center: float, label: str,
+                   icon, *, uid: str, owner=None) -> tuple:
+    """Тихая пометка справа в строке времени: «⏱ перемена 15 мин».
+
+    Возвращает (ops, ширина). Без иконки — просто приглушённый текст.
+    """
+    pen = _pen(m["small"], _ROLE_WEIGHT["small"])
+    if icon not in _KNOWN_ICONS:
+        icon = None
+    icon_size = m["icon"] * 0.62 if icon else 0.0
+    gap = m["gap_icon"] if icon else 0.0
     text_w = pen.width(label)
-    if text_w + 2 * m["tag_pad_x"] > max_w:
-        text_w = max(0.0, max_w - 2 * m["tag_pad_x"])
-    width = min(max_w, text_w + 2 * m["tag_pad_x"])
-    height = max(m["tag"] + 10, pen.line_h() + 4)
-    x = x_right - width
-    ops = [_rect_op((x, y, x + width, y + height), height / 2.0, fill=bg,
-                    kind="chip", uid=uid + ":bg", owner=owner)]
-    ops.append(_text_op(pen, (x + 4, y, x + width - 4, y + height), label,
-                        color, align="center", valign="middle",
-                        min_size=S_TYPE_MIN["tag"], uid=uid, owner=owner))
+    width = (icon_size + gap if icon else 0) + text_w
+    x = right_x - width
+    line_h = pen.line_h()
+    ops: list = []
+    if icon:
+        ops += _icon_ops(icon, x, y_center - icon_size / 2, icon_size,
+                         S_FAINT, uid=uid + ":icon", owner=owner)
+    ops.append(_text_op(pen, (x + icon_size + gap, y_center - line_h / 2,
+                              right_x, y_center + line_h / 2), label, S_MUTED,
+                        valign="middle", max_lines=1,
+                        min_size=_type_floor("small"), uid=uid, owner=owner,
+                        role="small"))
     return ops, width
 
 
-def _banner_ops(m: dict, x: float, y: float, w: float, label: str,
-                uid: str, owner: str) -> tuple:
-    """Крупная плашка «ЗАНЯТИЕ ОТМЕНЕНО»: красный фон, белый текст.
+def _person_row_ops(m: dict, x: float, y: float, w: float, text: str, *,
+                    uid: str, owner=None, fill=S_MUTED,
+                    min_size=None) -> tuple:
+    """Строка «👤 преподаватель»: иконка + приглушённый текст."""
+    pen = _pen(m["teacher"], _ROLE_WEIGHT["teacher"])
+    icon_size = m["icon"] * 0.92
+    gap = m["gap_icon"]
+    line_h = pen.line_h()
+    height = max(line_h, icon_size)
+    text_w = pen.shorten(text, max(40.0, w - icon_size - gap))
+    ops = _icon_ops("person", x, y + (height - icon_size) / 2, icon_size,
+                    _fade(fill, 0.18), uid=uid + ":icon", owner=owner)
+    ops.append(_text_op(pen, (x + icon_size + gap, y,
+                              x + icon_size + gap + pen.width(text_w) + 1,
+                              y + height), text_w, fill, valign="middle",
+                        max_lines=1,
+                        min_size=_type_floor("teacher") if min_size is None
+                        else min_size, uid=uid, owner=owner, role="teacher"))
+    return ops, height
 
-    Заметнее любой второстепенной информации карточки, но аудитория
-    из-за неё не исчезает — чип рисуется ниже.
+
+def _time_ops(m: dict, start: str, end: str, x: float, y: float, max_w: float,
+              *, cancelled: bool = False, uid: str, owner=None) -> tuple:
+    """Время пары: начало — основным цветом, конец — приглушённым.
+
+    Возвращает (ops, ширина, высота). Кегль не опускается ниже пола:
+    если строка не влезает, сокращается подпись конца.
     """
-    pen = _pen(m["cancel"], "bold")
-    pad_x = m["chip_pad_x"] * 1.3
-    res = pen.fit(label, w - 2 * pad_x, S_TYPE_MIN["cancel"], 2)
-    height = max(m["cancel"] + 16,
-                 res["line_h"] * len(res["lines"]) + 2 * m["chip_pad_y"])
-    ops = [_rect_op((x, y, x + w, y + height), m["row_radius"], fill=S_RED,
-                    kind="chip", uid=uid + ":bg", owner=owner)]
-    ops.append(_text_op(_pen(res["size"], "bold"),
-                        (x + pad_x, y, x + w - pad_x, y + height), label,
-                        S_CARD, align="center", valign="middle",
-                        max_lines=2, min_size=res["size"], uid=uid,
-                        owner=owner))
+    size = m["time"]
+    floor = _type_floor("time")
+    start_text = start or "—"
+    end_text = end or ""
+    while True:
+        p_start = _pen(size, "bold")
+        p_sep = _pen(size, "regular")
+        p_end = _pen(size, "medium")
+        gap = size * 0.26
+        need = p_start.width(start_text) + (gap * 2 + p_sep.width("—")
+                                           + p_end.width(end_text)
+                                           if end_text else 0)
+        if need <= max_w or size <= floor:
+            break
+        size -= 1
+    line_h = p_start.line_h()
+    if end_text and need > max_w:
+        room = max_w - p_start.width(start_text) - p_sep.width("—") - gap * 2
+        end_text = p_end.shorten(end_text, max(0.0, room))
+    ops: list = []
+    cursor = x
+    start_w = p_start.width(start_text)
+    ops.append(_text_op(p_start, (cursor, y, cursor + start_w + 1, y + line_h),
+                        start_text, S_RED_D if cancelled else S_INK,
+                        valign="middle", max_lines=1, min_size=size,
+                        uid=uid + ":start", owner=owner, role="time"))
+    cursor += start_w
+    if end_text:
+        cursor += gap
+        sep_w = p_sep.width("—")
+        ops.append(_text_op(p_sep, (cursor, y, cursor + sep_w + 1, y + line_h),
+                            "—", S_FAINT, valign="middle", max_lines=1,
+                            min_size=size, uid=uid + ":sep", owner=owner,
+                            role="time_end"))
+        cursor += sep_w + gap
+        end_w = p_end.width(end_text)
+        ops.append(_text_op(p_end, (cursor, y, cursor + end_w + 1, y + line_h),
+                            end_text, S_FAINT, valign="middle", max_lines=1,
+                            min_size=size, uid=uid + ":end", owner=owner,
+                            role="time_end"))
+        cursor += end_w
+    return ops, cursor - x, line_h
+
+
+def _subgroup_caption(m: dict, x: float, y: float, w: float, text: str, *,
+                      uid: str, owner=None, fill=S_PURPLE_D) -> tuple:
+    """Подпись подгруппы «1 П/ГР.» с лёгкой разрядкой."""
+    pen = _pen(m["subgroup"], "bold")
+    spacing = max(0.6, m["subgroup"] * 0.06)
+    label = clean_text(text).upper()
+    if pen.spaced_width(label, spacing) > w:
+        label = pen.shorten(label, w)
+    # Коробка чуть ниже полной строки: подпись — заголовок блока, она
+    # должна стоять вплотную к предмету, не разъезжаясь с ним.
+    height = pen.line_h() * 0.92
+    ops = [_text_op(pen, (x, y, x + w, y + height), label, fill,
+                    valign="middle", max_lines=1, spacing=spacing,
+                    min_size=_type_floor("subgroup"), uid=uid, owner=owner,
+                    role="subgroup")]
     return ops, height
 
 
 # ------------------------------------------------------------
-# LAYOUT: тело занятия (предмет → отмена → аудитория → мелочи → изменения)
+# LAYOUT: плашка аудитории (зелёный акцент карточки)
 # ------------------------------------------------------------
 
-def layout_item_body(m: dict, item: dict, x: float, w: float, *,
-                    show_teacher: bool = True, subject_prefix: str = "",
-                    cancel_label: Optional[str] = None) -> tuple:
-    """Одно занятие/подгруппа: предмет → отмена → АУДИТОРИЯ → мелочи → изменения.
+def _room_panel_ops(m: dict, item: dict, right_x: float, y: float,
+                    max_w: float, *, uid: str, owner=None) -> tuple:
+    """Зелёная плашка: «👥 Ауд. ПК108» и ниже «6 акад. ч».
 
-    Координаты относительные (x — левый край блока, y считается от 0).
-    Возвращает (ops, высота): зазор добавляется ПЕРЕД блоком, поэтому
-    высота всегда точная — хвостового отступа нет.
+    Аудитория остаётся главным цветовым акцентом карточки, но кегль
+    спокойный: «Ауд. …» — приглушённый зелёно-серый, изученные часы —
+    зелёный полужирный. Плашка выравнивается по правому краю карточки.
     """
-    ops: list = []
-    y = 0.0
+    room_text = f"Ауд. {item['room']}"
+    hours = clean_text(item.get("hours") or "")
+    pad_x, pad_y = m["panel_pad_x"], m["panel_pad_y"]
+    room_pen = _pen(m["room"], _ROLE_WEIGHT["room"])
+    hours_pen = _pen(m["hours"], _ROLE_WEIGHT["hours"])
+    icon_size = m["icon"] * 0.66
+    gap = m["gap_icon"]
+    inner_max = max(48.0, max_w - 2 * pad_x)
+    room_w_max = max(30.0, inner_max - icon_size - gap)
+    if room_pen.width(room_text) > room_w_max:
+        room_text = room_pen.shorten(room_text, room_w_max)
+    room_w = icon_size + gap + room_pen.width(room_text)
+    hours_w = hours_pen.width(hours) if hours else 0.0
+    width = min(max_w, max(room_w, hours_w) + 2 * pad_x)
+    line_gap = m["panel_line_gap"]
+    content_h = room_pen.line_h() + (line_gap + hours_pen.line_h()
+                                    if hours else 0)
+    height = pad_y * 2 + content_h
+    x = right_x - width
+    ops: list = [_rect_op((x, y, x + width, y + height), m["row_radius"],
+                          fill=S_GREEN_L, outline=S_GREEN_B, width=1.1,
+                          kind="panel", uid=uid + ":bg", owner=owner)]
+    cursor = y + pad_y
+    room_line_h = room_pen.line_h()
+    ops += _icon_ops("people", x + pad_x, cursor + (room_line_h - icon_size) / 2,
+                     icon_size, S_GREEN, uid=uid + ":icon", owner=owner)
+    ops.append(_text_op(room_pen,
+                        (x + pad_x + icon_size + gap, cursor,
+                         x + width - pad_x, cursor + room_line_h), room_text,
+                        S_GREEN_M, valign="middle", max_lines=1,
+                        min_size=ROOM_FONT_MIN, uid=uid + ":room", owner=owner,
+                        role="room"))
+    if hours:
+        cursor += room_line_h + line_gap
+        hours_line_h = hours_pen.line_h()
+        ops.append(_text_op(hours_pen,
+                            (x + pad_x, cursor, x + width - pad_x,
+                             cursor + hours_line_h), hours, S_GREEN_D,
+                            valign="middle", max_lines=1,
+                            min_size=_type_floor("hours"), uid=uid + ":hours",
+                            owner=owner, role="hours"))
+    return ops, width, height
 
-    def gap(size: float) -> None:
-        nonlocal y
-        if y > 0:
-            y += size
 
-    # 1. ПРЕДМЕТ — крупно. Для «плейсхолдера»-отмены его роль берёт на
-    #    себя баннер отмены (писать «Занятие отменено» дважды не нужно).
-    subject_text = (f"{subject_prefix} · {item['subject']}" if subject_prefix
-                    else item["subject"])
-    if not (item["cancelled"] and item["placeholder"]):
-        gap(m["gap_subj"])
-        block_ops, block_h = _flow_text(
-            m, x, y, w, subject_text, "subject",
-            S_RED_D if item["cancelled"] else S_INK,
-            max_lines=m["subject_lines"], min_size=S_TYPE_MIN["subject"],
-            uid=item["uid"] + ":subject", owner=item["owner"],
-        )
-        ops += block_ops
-        y += block_h
-
-    # 2. СТАТУС ОТМЕНЫ — крупнее всей второстепенной информации
-    if item["cancelled"]:
-        gap(m["gap_room"])
-        banner_ops, banner_h = _banner_ops(
-            m, x, y, w, cancel_label or "ЗАНЯТИЕ ОТМЕНЕНО",
-            item["uid"] + ":cancel", item["owner"])
-        ops += banner_ops
-        y += banner_h
-
-    # 3. АУДИТОРИЯ — главный акцент карточки после времени и предмета.
-    #    Чип показываем всегда, когда аудитория есть (даже у отменённого
-    #    занятия); у обычного занятия без аудитории — нейтральный чип,
-    #    чтобы слот не «прыгал»; у отменённого без аудитории — не мусорим.
-    room_known = bool(item["room"])
-    show_room = room_known or not item["cancelled"]
-    room_text = f"АУД. {item['room']}" if room_known else "аудитория не указана"
-
-    side: list = []
-    if show_teacher and item["teacher"]:
-        side.append({"role": "teacher", "text": item["teacher"],
-                     "fill": S_MUTED, "weight": "regular"})
-    if item["progress"] and not (item.get("progress_kind") == "first"
-                                 and m["scale"] < 0.82):
-        side.append({
-            "role": "small", "text": item["progress"],
-            "fill": S_GREEN_D if item["progress"].startswith("Изучено") else S_FAINT,
-            "weight": "medium",
-        })
-    for entry in side:
-        pen = _pen(m[entry["role"]], entry["weight"])
-        entry["width"] = max(pen.width(line) for line in pen.wrap(entry["text"], w))
-        entry["line_h"] = pen.line_h()
-
-    # Второстепенное (преподаватель/прогресс) становится в одну строку с
-    # чипом аудитории, только если встроку влезают ОБА блока в свои
-    # естественные размеры. Иначе мелочи уходят строками ниже — чип при
-    # этом остаётся во всю ширину и НЕ уменьшается.
-    chip_max = w
-    chip_floor_w = min(m["chip_min_w"], max(200.0, w * 0.42))
-    side_w = 0.0
-    beside_chip = bool(side) and show_room
-    if beside_chip:
-        side_w = max(entry["width"] for entry in side)
-        room_w = (max(_pen(m["room"], "bold").width(room_text), chip_floor_w)
-                  + 2 * m["chip_pad_x"])
-        if room_w + m["gap_extra"] + side_w > w:
-            beside_chip = False
-    if show_room:
-        gap(m["gap_room"])
-        chip_ops, chip_w, chip_h = _chip_ops(
-            m, x, y, chip_max if not beside_chip else max(
-                chip_floor_w, w - side_w - m["gap_extra"]),
-            room_text, size=m["room"], weight="bold", min_w=chip_floor_w,
-            text_fill=S_GREEN_D if room_known else S_MUTED,
-            bg=S_GREEN_L if room_known else S_PURPLE_L,
-            border=S_GREEN_B if room_known else S_PURPLE_B,
-            uid=item["uid"] + ":room", owner=item["owner"], role="room",
-            min_size=ROOM_FONT_MIN,
-        )
-        ops += chip_ops
-    else:
-        chip_ops, chip_w, chip_h, beside_chip = [], 0.0, 0.0, False
-
-    row_lines = side if not beside_chip else []
-    if beside_chip:
-        block_h = sum(e["line_h"] for e in side) + m["line_gap"] * (len(side) - 1)
-        cursor = y + max(0.0, (max(chip_h, block_h) - block_h) / 2)
-        left_x = x + chip_w + m["gap_extra"]
-        for entry in side:
-            ops.append(_text_op(
-                _pen(m[entry["role"]], entry["weight"]),
-                (left_x, cursor, x + w, cursor + entry["line_h"]),
-                entry["text"], entry["fill"], align="right", valign="middle",
-                max_lines=1, min_size=S_TYPE_MIN[entry["role"]],
-                uid=item["uid"] + ":" + entry["role"], owner=item["owner"],
-                role=entry["role"],
-            ))
-            cursor += entry["line_h"] + m["line_gap"]
-        y += max(chip_h, block_h)
-    else:
-        y += chip_h
-    for entry in row_lines:
-        gap(m["gap_extra"])
-        extra_ops, extra_h = _flow_text(
-            m, x, y, w, entry["text"], entry["role"], entry["fill"],
-            weight=entry["weight"], uid=item["uid"] + ":" + entry["role"],
-            owner=item["owner"], min_size=S_TYPE_MIN[entry["role"]],
-        )
-        ops += extra_ops
-        y += extra_h
-
-    # 4. Группы (staff-расписание) — второстепенная строка
-    if item["groups"]:
-        gap(m["gap_extra"])
-        group_ops, group_h = _flow_text(
-            m, x, y, w, f"Группы: {item['groups']}", "small", S_MUTED,
-            uid=item["uid"] + ":groups", owner=item["owner"],
-        )
-        ops += group_ops
-        y += group_h
-
-    # 5. ИЗМЕНЕНИЯ — внутри карточки, плашкой под занятием
-    if item.get("change_lines"):
-        gap(m["gap_room"])
-    band_ops, band_h = layout_change_band(m, item, x, y, w)
-    if band_h:
-        ops += band_ops
-        y += band_h
-
-    return ops, y
-
+# ------------------------------------------------------------
+# LAYOUT: изменения внутри карточки
+# ------------------------------------------------------------
 
 def layout_change_band(m: dict, item: dict, x: float, y: float,
                        w: float) -> tuple:
-    """Плашка «что изменилось» внутри карточки пары."""
+    """Плашка «что изменилось»: лавандовая, по ширине текста."""
     lines = list(item.get("change_lines") or [])
     if not lines:
         return [], 0.0
@@ -3673,29 +3812,120 @@ def layout_change_band(m: dict, item: dict, x: float, y: float,
     if hidden > 0:
         shown = shown + [f"и ещё {hidden} изм."]
     pen = _pen(m["small"], "medium")
-    inner_x = x + m["band_pad"]
-    inner_w = max(40.0, w - 2 * m["band_pad"])
-    text_ops: list = []
-    cursor = y + m["band_pad"]
+    pad_x, pad_y = m["band_pad_x"], m["band_pad_y"]
+    inner_w = max(40.0, w - 2 * pad_x)
+    cursor = y + pad_y
+    ops: list = []
     widest = 0.0
     for index, line in enumerate(shown):
         text = line if pen.fits(line, inner_w) else pen.shorten(line, inner_w)
-        widest = max(widest, pen.width(text))
-        text_ops.append(_text_op(
-            pen, (inner_x, cursor, inner_x + inner_w, cursor + pen.line_h()),
-            text, S_PURPLE_D, valign="middle", max_lines=1,
-            min_size=S_TYPE_MIN["small"],
-            uid=f"{item['uid']}:band{index}", owner=item["owner"],
-        ))
-        cursor += pen.line_h() + 3
-    height = cursor - 3 + m["band_pad"] - y
-    # Плашка по ширине текста: длинная полоса на всю карточку перетягивает
-    # внимание с аудитории.
-    band_w = min(w, widest + 2 * m["band_pad"])
-    ops = [_rect_op((x, y, x + band_w, y + height), m["row_radius"], fill=S_BAND,
-                    outline=S_BAND_BD, width=1.0, kind="band",
-                    uid=item["uid"] + ":band:bg", owner=item["owner"])]
-    ops += text_ops
+        text_w = pen.width(text)
+        widest = max(widest, text_w)
+        line_h = pen.line_h()
+        ops.append(_text_op(pen, (x + pad_x, cursor, x + pad_x + text_w + 1,
+                                  cursor + line_h), text, S_PURPLE_D,
+                            valign="middle", max_lines=1,
+                            min_size=_type_floor("small"),
+                            uid=f"{item['uid']}:band{index}",
+                            owner=item["owner"], role="small"))
+        cursor += line_h + m["panel_line_gap"]
+    height = cursor - m["panel_line_gap"] + pad_y - y
+    band_w = min(w, widest + 2 * pad_x)
+    ops.insert(0, _rect_op((x, y, x + band_w, y + height), m["row_radius"],
+                           fill=S_PURPLE_L, kind="band",
+                           uid=item["uid"] + ":band:bg",
+                           owner=item["owner"]))
+    return ops, height
+
+
+# ------------------------------------------------------------
+# LAYOUT: тело занятия (предмет → преподаватель → аудитория)
+# ------------------------------------------------------------
+
+def layout_item_body(m: dict, item: dict, x: float, w: float, *,
+                     show_teacher: bool = True) -> tuple:
+    """Одно занятие: предмет, преподаватель, плашка аудитории справа.
+
+    Координаты относительные (x — левый край блока, y считается от 0).
+    Возвращает (ops, высота): зазор добавляется ПЕРЕД блоком, поэтому
+    высота всегда точная — хвостового отступа нет.
+    """
+    panel_ops: list = []
+    panel_w = 0.0
+    panel_h = 0.0
+    if item["room"]:
+        panel_ops, panel_w, panel_h = _room_panel_ops(
+            m, item, x + w, 0.0, min(w * 0.60, 470.0),
+            uid=item["uid"] + ":panel", owner=item["owner"],
+        )
+    left_w = w if panel_w <= 0 else max(140.0, w - panel_w - m["gap_panel"])
+    ops: list = []
+    y = 0.0
+
+    # 1. ПРЕДМЕТ (у «плейсхолдера»-отмены его заменяет пилюля отмены)
+    if not (item["cancelled"] and item["placeholder"]):
+        subj_ops, subj_h = _flow_text(
+            m, x, y, left_w, item["subject"], "subject",
+            S_RED_D if item["cancelled"] else S_INK,
+            max_lines=m["subject_lines"], min_size=_type_floor("subject"),
+            uid=item["uid"] + ":subject", owner=item["owner"],
+        )
+        ops += subj_ops
+        y += subj_h
+
+    # 2. ПРЕПОДАВАТЕЛЬ
+    if show_teacher and item["teacher"]:
+        if y > 0:
+            y += m["gap_subject"]
+        teacher_ops, teacher_h = _person_row_ops(
+            m, x, y, left_w, item["teacher"],
+            uid=item["uid"] + ":teacher", owner=item["owner"],
+        )
+        ops += teacher_ops
+        y += teacher_h
+
+    row_h = max(y, panel_h)
+    ops += _shift_ops(panel_ops, 0, 0)      # плашка — по верху блока
+
+    # 3. ИЗМЕНЕНИЯ — плашкой под занятием (на всю ширину блока)
+    if item.get("change_lines"):
+        band_ops, band_h = layout_change_band(m, item, x,
+                                             row_h + m["gap_subject"], w)
+        ops += band_ops
+        row_h += m["gap_subject"] + band_h
+    return ops, row_h
+
+
+def layout_cancelled_item(m: dict, item: dict, x: float, w: float, *,
+                          uid: str, owner=None,
+                          show_teacher: bool = True) -> tuple:
+    """Отменённое занятие: розовая плашка внутри карточки.
+
+    Сверху — пилюля «Занятие отменено» и красный бейдж «ОТМЕНА», ниже —
+    предмет (если он известен), преподаватель и аудитория.
+    """
+    pad_x, pad_y = m["panel_pad_x"], m["panel_pad_y"]
+    inner_x = x + pad_x
+    inner_w = w - 2 * pad_x
+    pill_ops, pill_w, pill_h = _pill_ops(
+        m, inner_x, pad_y, "Занятие отменено", role="cancel",
+        fill=S_RED_PILL, text_fill=S_RED_D, uid=uid + ":cancel", owner=owner,
+    )
+    tag_ops, tag_w, tag_h = _pill_ops(
+        m, 0.0, pad_y, "ОТМЕНА", role="tag", fill=S_RED, text_fill=S_CARD,
+        weight="bold", uid=uid + ":tag", owner=owner,
+    )
+    tag_ops = _shift_ops(tag_ops, inner_x + inner_w - tag_w, 0)
+    body_ops, body_h = layout_item_body(m, item, inner_x, inner_w,
+                                        show_teacher=show_teacher)
+    # Зазор нужен только если под пилюлей есть что показать: иначе
+    # компактная отмена «раздувалась» бы до размера обычной карточки.
+    body_y = pad_y + max(pill_h, tag_h) + (m["gap_subject"] if body_h else 0)
+    height = body_y + body_h + pad_y
+    ops: list = [_rect_op((x, 0, x + w, height), m["row_radius"],
+                          fill=S_RED_L, outline=S_RED_B, width=1.1,
+                          kind="panel", uid=uid + ":bg", owner=owner)]
+    ops += pill_ops + tag_ops + _shift_ops(body_ops, 0, body_y)
     return ops, height
 
 
@@ -3703,27 +3933,24 @@ def layout_change_band(m: dict, item: dict, x: float, y: float,
 # LAYOUT: карточка пары
 # ------------------------------------------------------------
 
-def _breath_metrics(m: dict, extra: float) -> dict:
-    """Раздвинуть внутренние отступы карточки, НЕ трогая кегли.
+def _meta_label_for(spec: dict, has_next: bool) -> tuple:
+    """Тихая пометка в строке времени: (текст, иконка).
 
-    Используется, когда занятий мало и холст большой: пустоту закрывает
-    воздух внутри карточек, а не раздутый шрифт — аудитория остаётся
-    ровно того размера, который подобрал масштаб.
+    Приоритет — перемена: это то, что нужно знать до звонка. Если пауза
+    в данных не пришла, но в паре несколько подгрупп, показываем их число.
     """
-    if extra <= 0:
-        return m
-    m2 = dict(m)
-    pad_add = extra * 0.34
-    m2["pad_t"] = m["pad_t"] + pad_add
-    m2["pad_b"] = m["pad_b"] + pad_add
-    gap_add = extra * 0.11
-    for key in ("gap_head", "gap_subj", "gap_room", "gap_extra"):
-        m2[key] = m[key] + gap_add
-    m2["row_pad"] = m["row_pad"] + extra * 0.06
-    return m2
+    break_text = clean_text(spec.get("break"))
+    if break_text and has_next:
+        return f"перемена {break_text}", "clock"
+    items = spec["items"]
+    if len(items) > 1:
+        word = _plural(len(items), "подгруппа", "подгруппы", "подгрупп")
+        return f"{len(items)} {word}", None
+    return "", None
 
 
-def layout_card(m: dict, spec: dict, w: float) -> tuple:
+def layout_card(m: dict, spec: dict, w: float, *, has_next: bool = False,
+                index: int = 0) -> tuple:
     """Карточка одной пары: номер + время, затем занятия/подгруппы.
 
     Возвращает (ops, высота) в относительных координатах (0,0) — левый
@@ -3733,172 +3960,146 @@ def layout_card(m: dict, spec: dict, w: float) -> tuple:
     ops: list = []
     owner = spec["owner"]
     uid = spec["owner"]
-    pad_x, pad_t = m["pad_x"], m["pad_t"]
+    pad_x, pad_t, pad_b = m["pad_x"], m["pad_t"], m["pad_b"]
     inner_x = pad_x
     inner_w = w - 2 * pad_x
     cancelled_all = bool(spec["cancelled_all"])
     y = float(pad_t)
 
-    # --- ряд 1: номер пары + время + статус изменения ---
-    number = clean_text(spec.get("number")) or "—"
-    roman_pen = _pen(m["roman"], "bold")
-    box_h = max(m["chip_min_h"] * 0.82, roman_pen.line_h() + 12)
-    box_w = max(box_h, roman_pen.width(number) + 2 * m["tag_pad_x"])
+    # --- ряд 1: круг с номером пары, время, тихая пометка справа
+    diameter = m["badge"]
     accent = S_RED_D if cancelled_all else S_PURPLE_D
     accent_bg = S_RED_L if cancelled_all else S_PURPLE_L
-    ops.append(_rect_op((inner_x, y, inner_x + box_w, y + box_h), box_h / 2.0,
-                        fill=accent_bg, outline=S_RED_B if cancelled_all else None,
-                        width=1.0 if cancelled_all else 0.0, kind="chip",
-                        uid=f"{uid}:num:bg", owner=owner))
-    ops.append(_text_op(roman_pen, (inner_x, y, inner_x + box_w, y + box_h),
-                        number, accent, align="center", valign="middle",
-                        min_size=S_TYPE_MIN["roman"], uid=f"{uid}:num",
-                        owner=owner))
+    ops.append(_ellipse_op((inner_x, y, inner_x + diameter,
+                            y + diameter), fill=accent_bg, kind="icon",
+                           uid=f"{uid}:num:bg", owner=owner))
+    ops.append(_text_op(_pen(m["roman"], "bold"),
+                        (inner_x, y, inner_x + diameter, y + diameter),
+                        clean_text(spec.get("number")) or "—", accent,
+                        align="center", valign="middle",
+                        min_size=_type_floor("roman"), uid=f"{uid}:num",
+                        owner=owner, role="roman"))
 
-    tag_ops, tag_w = _tag_ops(
-        m, inner_x + inner_w, y + (box_h - max(m["tag"] + 10,
-                                              roman_pen.line_h() + 4)) / 2,
-        inner_w * 0.45, spec.get("tag") or "", spec.get("tag_fill") or S_MUTED,
-        spec.get("tag_bg") or S_PURPLE_L, f"{uid}:tag", owner,
+    meta_text, meta_icon = _meta_label_for(spec, has_next)
+    meta_tag = ""
+    if not meta_text and not cancelled_all \
+            and spec.get("tag") in ("ИЗМЕНЕНО", "ДОБАВЛЕНО"):
+        meta_tag = spec["tag"]
+    meta_w = 0.0
+    if meta_text:
+        meta_pen = _pen(m["small"], _ROLE_WEIGHT["small"])
+        meta_w = meta_pen.width(meta_text)
+        if meta_icon in _KNOWN_ICONS:
+            meta_w += m["icon"] * 0.62 + m["gap_icon"]
+    elif meta_tag:
+        tag_pen = _pen(m["tag"], "bold")
+        meta_w = tag_pen.width(meta_tag) + 2 * m["pill_pad_x"]
+    time_x = inner_x + diameter + m["gap_badge"]
+    time_max = max(120.0, inner_w - diameter - 2 * m["gap_badge"] - meta_w
+                   - m["gap_panel"])
+    time_ops, time_w, time_h = _time_ops(
+        m, clean_text(spec.get("start")) or _first_clock(spec.get("time")),
+        _second_clock(spec.get("time")), time_x, 0.0, time_max,
+        cancelled=cancelled_all, uid=f"{uid}:time", owner=owner,
     )
-    ops += tag_ops
-
-    time_x = inner_x + box_w + m["gap_head"]
-    time_w = max(60.0, inner_w - box_w - 2 * m["gap_head"] - tag_w)
-    time_ops, time_h = _flow_text(
-        m, time_x, y, time_w, spec["time"], "time", S_INK,
-        uid=f"{uid}:time", owner=owner, min_size=S_TYPE_MIN["time"],
-    )
-    # Время центрируем по высоте чипа номера, если оно ниже.
-    if time_h < box_h:
-        shift = (box_h - time_h) / 2
-        time_ops = _shift_ops(time_ops, 0, shift)
-        time_h = box_h
-    ops += time_ops
-    y += max(box_h, time_h) + m["gap_head"]
+    row_h = max(diameter, time_h)
+    time_y = y + (row_h - time_h) / 2
+    ops += _shift_ops(time_ops, 0, time_y)
+    if meta_text:
+        meta_ops, _meta_used = _meta_slot_ops(
+            m, inner_x + inner_w, y + row_h / 2, meta_text, meta_icon,
+            uid=f"{uid}:meta", owner=owner,
+        )
+        ops += meta_ops
+    elif meta_tag:
+        tag_ops, tag_w, tag_h = _pill_ops(
+            m, 0.0, 0.0, meta_tag, role="tag", fill=spec["tag_bg"],
+            text_fill=spec["tag_fill"], weight="bold", uid=f"{uid}:tag",
+            owner=owner,
+        )
+        ops += _shift_ops(tag_ops, inner_x + inner_w - tag_w,
+                          y + (row_h - tag_h) / 2)
+    y += row_h
 
     items = spec["items"]
-    multi = bool(spec.get("multi"))
-    teachers = spec.get("teachers") or []
-    calm = not any(item["cancelled"] for item in items)
-    # Преподаватель одной строкой под блоком: когда подгруппы спокойные
-    # либо когда карточка плотная и каждая строка на вес золота. Рядом с
-    # «отменено» общая строка читалась бы как относящаяся к отмене.
-    shared_teacher = ""
-    if multi and len(teachers) == 1 and (calm or m["scale"] < 0.85):
-        shared_teacher = teachers[0]
-
-    if multi:
-        # В плотном режиме (много занятий) метка подгруппы не занимает
-        # отдельную строку: она в начале предмета, а у отменённой строки —
-        # внутри баннера отмены. Так аудитория остаётся крупной, а карточка
-        # — компактной.
-        compact = m["scale"] < 0.85
-        for index, item in enumerate(items):
-            row_pad = m["row_pad"]
-            row_x = inner_x - 6
-            row_w = inner_w + 12
-            label = _subgroup_label(item["subgroup"]) or f"{index + 1} занятие"
-            head_pen = _pen(m["small"], "bold")
-            head_h = 0.0 if compact else head_pen.line_h() + 4
-            subject_prefix, cancel_label = "", None
-            if compact:
-                if item["cancelled"]:
-                    if len(items) > 1:
-                        cancel_label = f"{label.upper()} · ЗАНЯТИЕ ОТМЕНЕНО"
-                else:
-                    subject_prefix = label
-            elif item["cancelled"]:
-                label = (f"{label} · отменено" if len(items) > 1
-                         else "занятие отменено")
-            body_ops, body_h = layout_item_body(
-                m, item, row_x + row_pad, row_w - 2 * row_pad,
-                show_teacher=bool(item["teacher"]) and not shared_teacher,
-                subject_prefix=subject_prefix, cancel_label=cancel_label,
-            )
-            height = row_pad * 2 + head_h + body_h
-            ops.append(_rect_op((row_x, y, row_x + row_w, y + height),
-                                m["row_radius"],
-                                fill=S_RED_L if item["cancelled"] else S_ROW_BG,
-                                outline=S_RED_B if item["cancelled"] else S_ROW_BD,
-                                width=1.0, kind="rowbg",
-                                uid=f"{uid}:r{index}:bg", owner=owner))
-            if head_h > 0:
-                ops.append(_text_op(
-                    head_pen, (row_x + row_pad, y + row_pad - 2,
-                               row_x + row_w - row_pad, y + row_pad - 2 + head_h),
-                    label, S_RED_D if item["cancelled"] else S_PURPLE_D,
-                    valign="middle", max_lines=1, min_size=S_TYPE_MIN["small"],
-                    uid=f"{uid}:r{index}:sub", owner=owner,
-                ))
-            ops += _shift_ops(body_ops, 0, y + row_pad + head_h)
-            y += height + m["row_gap"]
-        y -= m["row_gap"]
-        if shared_teacher:
-            y += m["gap_room"]
-            teacher_ops, teacher_h = _flow_text(
-                m, inner_x, y, inner_w, shared_teacher, "teacher", S_MUTED,
-                uid=f"{uid}:teacher", owner=owner,
-                min_size=S_TYPE_MIN["teacher"],
-            )
-            ops += teacher_ops
-            y += teacher_h
+    multi = len(items) > 1 or any(item["subgroup"] for item in items)
+    if not items:
+        # Синтетическая карточка удалённой пары без подгрупп: только плашка
+        y += m["gap_row"]
+        pill_ops, pill_w, pill_h = _pill_ops(
+            m, inner_x, y, "Занятие отменено", role="cancel",
+            fill=S_RED_PILL, text_fill=S_RED_D, uid=f"{uid}:cancel",
+            owner=owner,
+        )
+        ops += pill_ops
+        y += pill_h
     else:
-        item = dict(items[0])
-        item["uid"] = uid
-        body_ops, body_h = layout_item_body(m, item, inner_x, inner_w)
-        ops += _shift_ops(body_ops, 0, y)
-        y += body_h
+        for position, item in enumerate(items):
+            if position:
+                y += m["gap_items"]
+            label = _subgroup_label(item["subgroup"]) or ""
+            if multi and label and not item["cancelled"]:
+                caption_ops, caption_h = _subgroup_caption(
+                    m, inner_x, y, inner_w, label,
+                    uid=f"{uid}:i{position}:caption", owner=owner,
+                )
+                ops += caption_ops
+                y += caption_h + max(2, m["gap_subject"] * 0.25)
+            if item["cancelled"]:
+                block_ops, block_h = layout_cancelled_item(
+                    m, item, inner_x, inner_w, uid=f"{uid}:i{position}",
+                    owner=owner,
+                )
+            else:
+                block_ops, block_h = layout_item_body(
+                    m, item, inner_x, inner_w,
+                )
+            ops += _shift_ops(block_ops, 0, y)
+            y += block_h
 
-    return ops, y + m["pad_b"]
+    return ops, y + pad_b
 
 
-def layout_break_row(m: dict, w: float, text: str) -> tuple:
-    """Компактная строка «перемена N мин» между карточками."""
-    pen = _pen(m["small"], "medium")
-    label = f"перемена {text}" if text else ""
-    if not label:
-        return [], 0.0
-    if not pen.fits(label, w - 160):
-        label = pen.shorten(label, w - 160)
-    text_w = pen.width(label)
-    height = pen.line_h() + m["gap_extra"]
-    cy = height / 2
-    cx0 = w / 2 - text_w / 2
-    cx1 = w / 2 + text_w / 2
-    ops = [
-        _line_op(SAFE_AREA + 8, cy, cx0 - 18, cy, S_BORDER, uid="deco:br:l"),
-        _line_op(cx1 + 18, cy, w - SAFE_AREA - 8, cy, S_BORDER,
-                 uid="deco:br:r"),
-    ]
-    ops.append(_text_op(pen, (cx0, 0, cx1, height), label, S_FAINT,
-                        align="center", valign="middle",
-                        min_size=S_TYPE_MIN["small"], uid="break:text"))
-    return ops, height
+def _first_clock(value) -> str:
+    """«08:30» из «08:30 — 09:50» (страховка для данных без start/end)."""
+    parts = re.split(r"\s*[-—]\s*", clean_text(value))
+    return parts[0] if parts and parts[0] else ""
 
+
+def _second_clock(value) -> str:
+    parts = re.split(r"\s*[-—]\s*", clean_text(value))
+    return parts[1] if len(parts) > 1 else ""
+
+
+# ------------------------------------------------------------
+# LAYOUT: пустой день
+# ------------------------------------------------------------
 
 def layout_empty_card(m: dict, w: float, h: float) -> tuple:
     """Пустой день: одна спокойная карточка по центру области."""
-    ops: list = _shadow_ops(m, (0, 0, w, h), m["radius"])  # clip: карточка внутри safe area
+    ops: list = [_shadow_op((0, 0, w, h), m["radius"], uid="empty:shadow")]
     ops.append(_rect_op((0, 0, w, h), m["radius"], fill=S_CARD,
-                        outline=S_BORDER, width=1.0, kind="card",
+                        outline=S_BORDER, width=1.1, kind="card",
                         uid="empty:bg"))
-    title_pen = _pen(max(m["subject"], 26), "bold")
+    icon_size = max(30, int(round(44 * m["scale"])))
+    title_pen = _pen(m["subject"], "semibold")
     note_pen = _pen(m["small"], "regular")
-    block = title_pen.line_h() + 10 + note_pen.line_h()
-    top = max(18.0, (h - block) / 2)
-    ops += _arch_ops(w / 2 - 9, max(14.0, top - 34), 18, 22, S_GOTHIC, S_CARD,
-                     uid="empty:arch")
-    for index, (text, pen, fill, floor) in enumerate((
-            ("Занятий нет", title_pen, S_INK, S_TYPE_MIN["subject"]),
+    block = icon_size + 20 + title_pen.line_h() + 12 + note_pen.line_h()
+    top = max(24.0, (h - block) / 2)
+    ops += _icon_ops("calendar", (w - icon_size) / 2, top, icon_size,
+                     S_CARD, uid="empty:icon", ink=S_PURPLE)
+    cursor = top + icon_size + 20
+    for index, (text, pen, fill, role) in enumerate((
+            ("Занятий нет", title_pen, S_INK, "subject"),
             ("Расписание на этот день не опубликовано", note_pen, S_MUTED,
-             S_TYPE_MIN["small"]),
+             "small"),
     )):
-        y = top if index == 0 else top + title_pen.line_h() + 10
         line_h = pen.line_h()
-        ops.append(_text_op(pen, (16, y, w - 16, y + line_h), text, fill,
-                           align="center", valign="middle", max_lines=1,
-                           min_size=floor, uid=f"empty:text:{index}"))
+        ops.append(_text_op(pen, (24, cursor, w - 24, cursor + line_h), text,
+                            fill, align="center", valign="middle",
+                            max_lines=1, min_size=_type_floor(role),
+                            uid=f"empty:text:{index}"))
+        cursor += line_h + 12
     return ops, h
 
 
@@ -3914,8 +4115,8 @@ def _day_caption(schedule) -> str:
 
 
 def layout_header(m: dict, schedule, ctx: dict, title: Optional[str],
-                 W: int) -> tuple:
-    """Шапка: метка + группа/ФИО + дата | счётчик занятий + прогресс.
+                  W: int) -> tuple:
+    """Шапка: иконка + метка + группа/ФИО + дата | счётчик + прогресс.
 
     Возвращает (ops, y низа шапки).
     """
@@ -3924,163 +4125,254 @@ def layout_header(m: dict, schedule, ctx: dict, title: Optional[str],
     x = float(SAFE_AREA)
     y = float(SAFE_AREA)
     right_edge = float(W - SAFE_AREA)
+    icon_size = float(max(42, int(round(64 * m["scale"]))))
 
-    # --- правая колонка: pill «N занятий» + прогресс ---
+    # --- правая колонка: счётчик занятий, шкала прогресса, «Изучено»
     lesson_count = count_lessons(schedule.lessons)
     count_word = _plural(lesson_count, "занятие", "занятия", "занятий")
     num_pen = _pen(m["header_pill"], "bold")
-    word_pen = _pen(max(S_TYPE_MIN["header_small"], m["header_pill"] - 6), "regular")
+    word_pen = _pen(m["header_pill_word"], "regular")
     num_txt = str(lesson_count)
-    pill_h = max(38, int(num_pen.line_h() + 18))
-    pill_w = (2 * m["tag_pad_x"] + num_pen.width(num_txt) + 5
-              + word_pen.width(count_word))
+    pill_h = max(int(num_pen.line_h() + 2 * m["pill_pad_y"]),
+                 int(icon_size * 0.86))
+    pill_w = float(int(m["pill_pad_x"] * 2 + num_pen.width(num_txt) + 7
+                      + word_pen.width(count_word)))
     forecast = ctx.get("forecast")
     progress_on = bool(ctx.get("is_group") and forecast is not None
-                        and forecast.studied_minutes > 0)
+                       and forecast.studied_minutes > 0)
     progress_txt = study_badge_text(forecast) if progress_on else ""
-    prog_pen = _pen(m["header_small"], "regular")
+    prog_pen = _pen(m["header_progress"], "regular")
     progress_w = prog_pen.width(progress_txt) if progress_txt else 0.0
-    bar_w = max(180.0, min(progress_w, 320.0))
+    bar_w = max(210.0, min(progress_w, 330.0))
+    bar_h = float(max(7, int(round(12 * m["scale"]))))
     right_w = max(pill_w, progress_w, bar_w)
     right_x = right_edge - right_w
 
-    left_w = max(160.0, right_x - 28 - x)
+    text_x = x + icon_size + m["gap_badge"]
+    left_w = max(200.0, right_x - 30 - text_x)
 
-    # --- левая часть: микро-арка + метка, заголовок, дата ---
-    ops += _arch_ops(x, y + 2, 15, 24, S_GOTHIC, S_BG, uid="header:arch")
+    # --- иконка календаря на лавандовом квадрате
+    ops.append(_rect_op((x, y, x + icon_size, y + icon_size),
+                        icon_size * 0.30, fill=S_PURPLE, kind="icon",
+                        uid="header:icon:bg", owner="header"))
+    ops += _icon_ops("calendar", x, y, icon_size, S_PURPLE, uid="header:icon",
+                     owner="header", ink=S_CARD)
+
+    # --- метка, название группы/ФИО, дата
     label_pen = _pen(m["header_label"], "bold")
     label = clean_text(title or "РАСПИСАНИЕ").upper()
-    spacing = max(1.6, m["header_label"] * 0.16)
-    label_w = label_pen.spaced_width(label, spacing)
-    label_x = x + 15 + 12
-    if label_x + label_w > x + left_w:
-        label = label_pen.shorten(label, max(40.0, x + left_w - label_x))
-        label_w = label_pen.spaced_width(label, spacing)
-    ops.append(_text_op(label_pen, (label_x, y, label_x + left_w - 27,
-                                   y + label_pen.line_h()), label, S_PURPLE,
-                       align="left", valign="middle", spacing=spacing,
-                       min_size=S_TYPE_MIN["header_label"], uid="header:label",
-                       owner="header"))
-    label_bottom = y + label_pen.line_h()
+    spacing = max(1.6, m["header_label"] * 0.14)
+    if label_pen.spaced_width(label, spacing) > left_w:
+        label = label_pen.shorten(label, left_w)
+    label_y = y + icon_size * 0.06
+    ops.append(_text_op(label_pen, (text_x, label_y, text_x + left_w,
+                                    label_y + label_pen.line_h()), label,
+                        S_PURPLE, valign="middle", spacing=spacing,
+                        min_size=_type_floor("header_label"),
+                        uid="header:label", owner="header"))
+    label_bottom = label_y + label_pen.line_h()
 
     title_pen = _pen(m["header_title"], "bold")
-    big_title = clean_text(schedule.staff_name or schedule.group) if is_staff \
-        else clean_text(schedule.group or GROUP_NAME)
+    big_title = sanitize_text(schedule.staff_name or schedule.group) if is_staff \
+        else sanitize_text(schedule.group or GROUP_NAME)
     title_lines = 2 if is_staff else 1
-    title_res = title_pen.fit(big_title, left_w, S_TYPE_MIN["header_title"],
-                              title_lines)
-    title_y = label_bottom + 8
+    title_res = title_pen.fit(big_title, left_w,
+                              _type_floor("header_title"), title_lines)
+    title_y = label_bottom + 12
+    title_h = title_res["line_h"] * len(title_res["lines"])
     ops.append(_text_op(_pen(title_res["size"], "bold"),
-                        (x, title_y, x + left_w,
-                         title_y + title_res["line_h"] * len(title_res["lines"])),
-                        big_title, S_INK, valign="top", max_lines=title_lines,
-                        min_size=title_res["size"], uid="header:title",
-                        owner="header", line_gap=m["line_gap"]))
-    title_bottom = title_y + title_res["line_h"] * len(title_res["lines"])
+                        (text_x, title_y, text_x + left_w, title_y + title_h),
+                        big_title, S_INK, valign="top",
+                        max_lines=title_lines, min_size=title_res["size"],
+                        uid="header:title", owner="header",
+                        line_gap=m["line_gap"]))
+    title_bottom = title_y + title_h
 
     date_pen = _pen(m["header_date"], "regular")
-    date_y = title_bottom + 6
-    date_op = _text_op(date_pen, (x, date_y, x + left_w,
-                                 date_y + date_pen.line_h()),
-                       _day_caption(schedule), S_MUTED, valign="middle",
-                       min_size=S_TYPE_MIN["header_date"], uid="header:date",
-                       owner="header")
+    date_y = title_bottom + 10
+    date_h = date_pen.line_h()
+    date_op = _text_op(date_pen, (text_x, date_y, text_x + left_w,
+                                  date_y + date_h), _day_caption(schedule),
+                       S_MUTED, valign="middle",
+                       min_size=_type_floor("header_date"),
+                       uid="header:date", owner="header")
     ops.append(date_op)
-    date_bottom = date_y + date_pen.line_h()
-    # Пилюля «Сегодня»/«Завтра» — сразу за ink-краем даты: картинка про
-    # ОДИН конкретный день, поэтому относимость дня показана явно.
+    date_bottom = date_y + date_h
     day_label = day_label_for(schedule.date)
-    pill_w_day = 0.0
     if day_label in ("Сегодня", "Завтра"):
-        day_pen = _pen(m["tag"], "bold")
-        pill_w_day = day_pen.width(day_label) + 2 * m["tag_pad_x"]
-        if date_op["bbox"][2] + m["gap_head"] + pill_w_day > x + left_w:
-            pill_w_day = 0.0             # не влезает рядом с датой — не рисуем
-    if pill_w_day:
-        day_x = date_op["bbox"][2] + m["gap_head"]
-        day_h = max(m["tag"] + 10, _pen(m["tag"], "bold").line_h() + 4)
-        day_y = date_y + (date_pen.line_h() - day_h) / 2
-        ops.append(_rect_op((day_x, day_y, day_x + pill_w_day, day_y + day_h),
-                           day_h / 2.0, fill=S_PURPLE_L, kind="chip",
-                           uid="header:day:bg", owner="header"))
-        ops.append(_text_op(_pen(m["tag"], "bold"),
-                           (day_x, day_y, day_x + pill_w_day, day_y + day_h),
-                           day_label, S_PURPLE_D, align="center",
-                           valign="middle", min_size=S_TYPE_MIN["tag"],
-                           uid="header:day", owner="header"))
-        date_bottom = max(date_bottom, day_y + day_h)
+        day_ops, day_w, day_h = _pill_ops(
+            m, 0.0, 0.0, day_label, role="tag", fill=S_PURPLE_L,
+            text_fill=S_PURPLE_D, weight="bold", uid="header:day",
+            owner="header",
+        )
+        day_x = date_op["bbox"][2] + m["gap_icon"] * 1.8
+        if day_x + day_w <= text_x + left_w:
+            ops += _shift_ops(day_ops, day_x,
+                              date_y + (date_h - day_h) / 2)
+            date_bottom = max(date_bottom, date_y + date_h)
 
-    # --- правая часть: счётник и прогресс ---
+    # --- счётчик занятий, шкала прогресса, «Изучено»
     pill_y = y + 4
+    ops.append(_shadow_op((right_x, pill_y + 2, right_x + pill_w,
+                           pill_y + pill_h + 2), pill_h / 2, uid="header:pill:shadow",
+                          blur=12, dy=4, alpha=58))
     ops.append(_rect_op((right_x, pill_y, right_x + pill_w, pill_y + pill_h),
-                       pill_h / 2.0, fill=S_CARD, outline=S_BORDER, width=1.0,
-                       kind="chip", uid="header:pill:bg", owner="header"))
-    cursor = right_x + m["tag_pad_x"]
-    ops.append(_text_op(num_pen, (cursor, pill_y, cursor + num_pen.width(num_txt),
-                                 pill_y + pill_h), num_txt, S_PURPLE,
-                       valign="middle", min_size=S_TYPE_MIN["header_pill"],
-                       uid="header:pill:num", owner="header"))
-    cursor += num_pen.width(num_txt) + 5
-    ops.append(_text_op(word_pen, (cursor, pill_y, right_x + pill_w - m["tag_pad_x"],
-                                  pill_y + pill_h), count_word, S_MUTED,
-                       valign="middle", min_size=S_TYPE_MIN["header_small"],
-                       uid="header:pill:word", owner="header"))
+                        pill_h / 2.0, fill=S_CARD, kind="chip",
+                        uid="header:pill:bg", owner="header"))
+    cursor = right_x + m["pill_pad_x"]
+    ops.append(_text_op(num_pen, (cursor, pill_y, cursor + num_pen.width(num_txt) + 1,
+                                  pill_y + pill_h), num_txt, S_PURPLE,
+                        valign="middle", max_lines=1,
+                        min_size=_type_floor("header_pill"),
+                        uid="header:pill:num", owner="header"))
+    cursor += num_pen.width(num_txt) + 7
+    ops.append(_text_op(word_pen, (cursor, pill_y, right_x + pill_w,
+                                   pill_y + pill_h), count_word, S_MUTED,
+                        valign="middle", max_lines=1,
+                        min_size=_type_floor("header_pill_word"),
+                        uid="header:pill:word", owner="header"))
     right_bottom = pill_y + pill_h
     if progress_txt:
-        prog_y = right_bottom + 10
-        ops.append(_text_op(prog_pen, (right_edge - bar_w, prog_y, right_edge,
-                                     prog_y + prog_pen.line_h()), progress_txt,
-                           S_MUTED, align="right", valign="middle",
-                           min_size=S_TYPE_MIN["header_small"],
-                           uid="header:progress", owner="header"))
-        bar_y = prog_y + prog_pen.line_h() + 6
-        bar_h = max(4, int(round(4 * m["scale"])))
+        bar_y = right_bottom + m["gap_row"] * 0.7
+        ops.append(_rect_op((right_edge - bar_w, bar_y, right_edge,
+                             bar_y + bar_h), bar_h / 2.0, fill=S_TRACK,
+                            kind="shape", uid="header:bar:bg", owner="header"))
         share = 0.0
         if forecast.total_minutes > 0:
             share = min(1.0, forecast.studied_minutes / forecast.total_minutes)
-        ops.append(_rect_op((right_edge - bar_w, bar_y, right_edge, bar_y + bar_h),
-                           bar_h / 2.0, fill=S_TRACK, kind="shape",
-                           uid="header:bar:bg", owner="header"))
         if share > 0:
-            fill_w = max(bar_h, bar_w * share)
+            fill_w = max(bar_h * 1.6, bar_w * share)
             ops.append(_rect_op((right_edge - bar_w, bar_y,
                                  right_edge - bar_w + fill_w, bar_y + bar_h),
-                               bar_h / 2.0, fill=S_PURPLE, kind="shape",
-                               uid="header:bar", owner="header"))
-        right_bottom = bar_y + bar_h
+                                bar_h / 2.0, fill=S_PURPLE, kind="shape",
+                                uid="header:bar", owner="header"))
+        prog_y = bar_y + bar_h + m["gap_icon"] + 4
+        ops.append(_text_op(prog_pen, (right_edge - max(bar_w, progress_w),
+                                       prog_y, right_edge,
+                                       prog_y + prog_pen.line_h()),
+                            progress_txt, S_MUTED, align="right",
+                            valign="middle", max_lines=1,
+                            min_size=_type_floor("header_progress"),
+                            uid="header:progress", owner="header"))
+        right_bottom = prog_y + prog_pen.line_h()
 
-    return ops, max(date_bottom, label_bottom, right_bottom) + m["card_gap"] + 6
+    return ops, max(label_bottom, date_bottom, right_bottom) + m["gap_header"]
+
+
+def _split_note(raw: str) -> tuple:
+    """Сноска -> (заголовок со двоеточием, значение)."""
+    text = clean_text(raw)
+    head, _, tail = text.partition(": ")
+    return head + (":" if tail else ""), tail
+
+
+def _note_pen_size(m: dict, note_lines: list, share: float) -> int:
+    """Кегль сносок: настолько крупный, чтобы колонки встали по ширине.
+
+    Заголовок сноски должен остаться в одну строку, а значения переносятся
+    по словам — поэтому колонки получают ширину по самому длинному
+    фрагменту. Если места мало, кегль аккуратно уменьшается (не ниже пола).
+    """
+    floor = _type_floor("note")
+    size = int(m["note"])
+    while size > floor:
+        pen = _pen(size, _ROLE_WEIGHT["note"])
+        needed = 0.0
+        for raw in note_lines[:2]:
+            head, tail = _split_note(raw)
+            longest_word = max((pen.width(word) for word in tail.split()), default=0.0)
+            needed += max(pen.width(head), longest_word)
+        if needed <= share:
+            break
+        size -= 1
+    return size
+
+
+def _note_columns(pen: Pen, note_lines: list, widths: list) -> list:
+    """Сноски подвала, разложенные в колонки по заданным ширинам."""
+    columns: list = []
+    for index, raw in enumerate(note_lines[:len(widths)]):
+        col_w = widths[index]
+        head, tail = _split_note(raw)
+        lines = [pen.shorten(head, col_w)]
+        if tail:
+            lines += [pen.shorten(line, col_w)
+                      for line in pen.wrap(tail, col_w)]
+        columns.append(lines)
+    return columns
+
+
+def _note_natural_widths(m: dict, note_lines: list, size: int) -> list:
+    """Естественные ширины колонок подвала (по самому длинному фрагменту)."""
+    pen = _pen(size, _ROLE_WEIGHT["note"])
+    widths: list = []
+    for raw in note_lines[:2]:
+        head, tail = _split_note(raw)
+        longest_word = max((pen.width(word) for word in tail.split()), default=0.0)
+        widths.append(max(pen.width(head), longest_word))
+    return widths
 
 
 def layout_footer(m: dict, W: int, H: int, note_lines: list) -> tuple:
-    """Подвал: тонкий разделитель с аркой и сноска про академический час.
+    """Подвал: светлая плашка, иконка, колонки со сносками.
 
     Возвращает (ops, высота подвала). Если сноски нет — подвала нет.
     """
     if not note_lines:
         return [], 0.0
-    pen = _pen(m["header_small"], "regular")
+    scale = m["scale"]
+    pad_x = float(max(18, int(round(36 * scale))))
+    pad_y = float(max(12, int(round(20 * scale))))
+    inset = float(max(18, int(round(62 * scale))))
+    panel_x0 = SAFE_AREA + inset
+    panel_x1 = W - SAFE_AREA - inset
+    icon_size = float(max(26, int(round(38 * scale))))
+    gap = float(max(14, int(round(30 * scale))))
+    text_x0 = panel_x0 + pad_x + icon_size + m["gap_icon"] * 2
+    text_x1 = panel_x1 - pad_x
+    share = max(120.0, text_x1 - text_x0 - gap * 2)
+    note_size = _note_pen_size(m, note_lines, share)
+    pen = _pen(note_size, _ROLE_WEIGHT["note"])
+    naturale = _note_natural_widths(m, note_lines, note_size)
+    if len(naturale) > 1 and sum(naturale) > 0:
+        widths = [share * value / sum(naturale) for value in naturale]
+    elif naturale:
+        widths = [share]
+    else:
+        widths = []
+    columns = _note_columns(pen, note_lines, widths)
     line_h = pen.line_h()
-    note_h = len(note_lines) * line_h + max(0, len(note_lines) - 1) * 4
-    divider_h = 20
-    total = note_h + 14 + divider_h
-    top = H - SAFE_AREA - total
-    ops: list = []
-    cy = top + divider_h / 2
-    half = 150
-    cx = W / 2
-    ops.append(_line_op(cx - half, cy, cx - 16, cy, S_GOTHIC, uid="footer:div:l"))
-    ops.append(_line_op(cx + 16, cy, cx + half, cy, S_GOTHIC, uid="footer:div:r"))
-    ops += _arch_ops(cx - 6, top, 12, 18, S_GOTHIC, S_BG, uid="footer:arch")
-    cursor = top + divider_h + 14
-    for index, line in enumerate(note_lines):
-        ops.append(_text_op(pen, (SAFE_AREA, cursor, W - SAFE_AREA,
-                                 cursor + line_h), line, S_MUTED,
-                           align="center", valign="middle",
-                           min_size=S_TYPE_MIN["header_small"],
-                           uid=f"footer:note:{index}", owner="footer"))
-        cursor += line_h + 4
-    return ops, total
+    row_gap = max(2, int(round(m["panel_line_gap"] * 0.7)))
+    rows = max(len(column) for column in columns)
+    content_h = rows * line_h + (rows - 1) * row_gap
+    height = content_h + 2 * pad_y
+    top = H - SAFE_AREA - height
+    ops: list = [_rect_op((panel_x0, top, panel_x1, top + height),
+                          m["row_radius"], fill=_fade(S_PURPLE_L, 0.42),
+                          kind="panel", uid="footer:panel")]
+    icon_y = top + (height - icon_size) / 2
+    ops += _icon_ops("cap", panel_x0 + pad_x, icon_y, icon_size, S_PURPLE,
+                     uid="footer:icon", owner="footer")
+    note_index = 0
+    if len(columns) > 1:
+        divider_x = text_x0 + widths[0] + gap
+        ops.append(_line_op(divider_x, top + pad_y * 0.7, divider_x,
+                            top + height - pad_y * 0.7, S_DIVIDER, 1.0,
+                            uid="footer:divider", owner="footer"))
+    for column_index, lines in enumerate(columns):
+        col_x = text_x0 + sum(widths[:column_index]) + gap * 2 * column_index
+        block = len(lines) * line_h + (len(lines) - 1) * row_gap
+        cursor = top + (height - block) / 2
+        for line in lines:
+            ops.append(_text_op(pen, (col_x, cursor, col_x + widths[column_index],
+                                      cursor + line_h), line, S_MUTED,
+                                valign="middle", max_lines=1,
+                                min_size=_type_floor("note"),
+                                uid=f"footer:note:{note_index}",
+                                owner="footer"))
+            cursor += line_h + row_gap
+            note_index += 1
+    return ops, height
 
 
 # ------------------------------------------------------------
@@ -4102,15 +4394,11 @@ def _progress_text_for(lesson, ctx: dict) -> str:
     minutes = ctx.get("subject_totals", {}).get(normalized, 0)
     if minutes > 0:
         return f"Изучено: {format_academic_hours(minutes)}"
-    return "Первое занятие по предмету"
+    return ""
 
 
 def _subgroup_shared_teacher(items: list) -> list:
-    """Преподаватели подгрупп одной пары (без отменённых строк).
-
-    Один уникальный ФИО → общая строка под блоком подгрупп;
-    несколько → преподаватель пишется в своей строке подгруппы.
-    """
+    """Преподаватели подгрупп одной пары (без отменённых строк)."""
     teachers = set()
     for entry in items:
         lesson = entry["lesson"]
@@ -4142,27 +4430,25 @@ def _change_lines(details: list) -> list:
 
 def _item_dict(lesson, kind: str, details: list, ctx: dict, owner: str,
                uid: str) -> dict:
-    room = clean_text(getattr(lesson, "room", ""))
-    teacher = clean_text(getattr(lesson, "teacher", ""))
+    room = sanitize_text(getattr(lesson, "room", ""))
+    teacher = sanitize_text(getattr(lesson, "teacher", ""))
     subject_raw = getattr(lesson, "subject", "")
     placeholder = is_placeholder_subject(subject_raw)
     cancelled = placeholder or kind == "removed"
     progress = "" if cancelled else _progress_text_for(lesson, ctx)
-    # «Первое занятие по предмету» — ровно то же, что пустая история:
-    # в плотном режиме строка убирается первой, «Изучено: N акад. ч» —
-    # нет, это полезная информация.
-    progress_kind = ("studied" if progress.startswith("Изучено")
-                     else "first" if progress else "")
+    hours = ""
+    if progress.startswith("Изучено: "):
+        hours = progress[len("Изучено: "):]
     return {
         "lesson": lesson, "kind": kind, "details": details or [],
         "uid": uid, "owner": owner,
         "subgroup": clean_text(getattr(lesson, "subgroup", "")),
-        "subject": display_subject_text(subject_raw),
+        "subject": sanitize_text(display_subject_text(subject_raw)),
         "room": "" if room in ("", "—", "-") else room,
         "teacher": "" if teacher in ("", "—", "-") else teacher,
         "groups": clean_text(getattr(lesson, "groups", "")),
         "placeholder": placeholder, "cancelled": cancelled,
-        "progress": progress, "progress_kind": progress_kind,
+        "progress": progress, "hours": hours,
         "change_lines": _change_lines(details),
         "time": _time_range(lesson),
     }
@@ -4181,12 +4467,7 @@ def _time_range(source) -> str:
 
 
 def build_specs(schedule, changes: list, ctx: dict) -> list:
-    """Список карточек дня: пары из расписания + отменённые целиком пары.
-
-    Удалённая пара раньше жила в правой колонке; теперь у неё своя
-    карточка с плашкой «ЗАНЯТИЕ ОТМЕНЕНО», иначе информация потерялась
-    бы вместе с колонкой.
-    """
+    """Список карточек дня: пары из расписания + отменённые целиком пары."""
     specs: list = []
     by_number: dict = {}
     for index, pair in enumerate(schedule.pairs):
@@ -4202,6 +4483,8 @@ def build_specs(schedule, changes: list, ctx: dict) -> list:
         spec = {
             "index": index, "owner": owner, "number": number,
             "time": _time_range(pair),
+            "start": clean_text(getattr(pair, "start", "")),
+            "end": clean_text(getattr(pair, "end", "")),
             "break": clean_text(getattr(pair, "break_duration", "")),
             "items": items, "raw": raw_items, "synthetic": False,
         }
@@ -4219,7 +4502,10 @@ def build_specs(schedule, changes: list, ctx: dict) -> list:
             spec = {
                 "index": extra, "owner": f"card:{extra}",
                 "number": number or "—",
-                "time": _time_range(old), "break": "", "items": [],
+                "time": _time_range(old),
+                "start": clean_text(old.get("start")),
+                "end": clean_text(old.get("end")),
+                "break": "", "items": [],
                 "raw": [], "synthetic": True,
             }
             by_number[number] = spec
@@ -4229,7 +4515,8 @@ def build_specs(schedule, changes: list, ctx: dict) -> list:
         spec["items"].append(_item_dict(lesson, "removed", [], ctx,
                                        spec["owner"],
                                        f"{spec['owner']}:i{len(spec['items'])}"))
-        spec["raw"].append({"lesson": lesson, "kind": "removed", "details": []})
+        spec["raw"].append({"lesson": lesson, "kind": "removed",
+                            "details": []})
 
     specs.sort(key=lambda item: (ROMAN_PAIRS.get(item["number"], 99),
                                  item["index"]))
@@ -4245,23 +4532,37 @@ def build_specs(schedule, changes: list, ctx: dict) -> list:
         kinds = {item["kind"] for item in spec["items"]}
         tag, tag_fill, tag_bg = "", S_MUTED, S_PURPLE_L
         if "removed" in kinds:
-            tag, tag_fill, tag_bg = "ОТМЕНА", S_RED_D, S_RED_B
+            tag, tag_fill, tag_bg = "ОТМЕНА", S_RED_D, S_RED_L
         elif "added" in kinds:
             tag, tag_fill, tag_bg = "ДОБАВЛЕНО", S_GREEN_D, S_GREEN_L
         elif "changed" in kinds:
             tag, tag_fill, tag_bg = "ИЗМЕНЕНО", S_PURPLE_D, S_PURPLE_L
         spec["tag"], spec["tag_fill"], spec["tag_bg"] = tag, tag_fill, tag_bg
-        # Решение «общая строка преподавателя или в каждой подгруппе»
-        # принимает layout: оно зависит от масштаба. Здесь — только данные.
         spec["teachers"] = _subgroup_shared_teacher(spec["raw"])
         spec["multi"] = (len(spec["items"]) > 1
                          or any(i["subgroup"] for i in spec["items"]))
     return specs
 
 
-# ------------------------------------------------------------
-# PLAN: подбор масштаба/высоты и полная раскладка
-# ------------------------------------------------------------
+def _breath_metrics(m: dict, extra: float) -> dict:
+    """Раздвинуть внутренние отступы карточки, НЕ трогая кегли.
+
+    Используется, когда занятий мало и холст большой: пустоту закрывает
+    воздух внутри карточек, а не раздутый шрифт.
+    """
+    if extra <= 0:
+        return m
+    m2 = dict(m)
+    pad_add = extra * 0.30
+    m2["pad_t"] = m["pad_t"] + pad_add
+    m2["pad_b"] = m["pad_b"] + pad_add
+    gap_add = extra * 0.13
+    for key in ("gap_row", "gap_subject", "gap_items"):
+        m2[key] = m[key] + gap_add
+    # Отступы плашек не «дышат»: иначе компактный блок отмены рос бы
+    # быстрее обычной карточки и переставал быть компактным.
+    return m2
+
 
 def build_plan(schedule, changes: list, title: Optional[str], scale: float,
                H: int, ctx: dict, specs: Optional[list] = None) -> dict:
@@ -4270,7 +4571,7 @@ def build_plan(schedule, changes: list, title: Optional[str], scale: float,
     W = SCHEDULE_WIDTH
     if specs is None:
         specs = build_specs(schedule, changes, ctx)
-    ops: list = []
+    ops: list = list(_decor_ops(W, H))
     owners: dict = {}
 
     header_ops, content_top = layout_header(m, schedule, ctx, title, W)
@@ -4289,20 +4590,14 @@ def build_plan(schedule, changes: list, title: Optional[str], scale: float,
         """Один проход измерения: стек блоков + их суммарная высота."""
         stack = []
         for index, spec in enumerate(specs):
-            card_ops, card_h = layout_card(metrics, spec, inner_w)
+            card_ops, card_h = layout_card(metrics, spec, inner_w,
+                                          has_next=index + 1 < len(specs),
+                                          index=index)
             stack.append({"kind": "card", "ops": card_ops, "height": card_h,
                           "spec": spec})
-            # «перемена N мин» в паре описывает паузу ПОСЛЕ неё, поэтому
-            # строка идёт за карточкой — ровно между двумя карточками.
-            # У последней пары дня пауза не нужна: за ней нечего делить.
-            if spec["break"] and index + 1 < len(specs):
-                break_ops, break_h = layout_break_row(metrics, W, spec["break"])
-                if break_h > 0:
-                    stack.append({"kind": "break", "ops": break_ops,
-                                  "height": break_h, "spec": None})
         gap = metrics["card_gap"]
         if widen_gaps and len(stack) > 1:
-            gap += min(slack_for_gaps / max(1, len(stack) - 1), gap * 0.6)
+            gap += min(slack_for_gaps / max(1, len(stack) - 1), gap * 0.9)
         total = (sum(item["height"] for item in stack)
                  + gap * max(0, len(stack) - 1))
         return stack, total, gap
@@ -4312,10 +4607,8 @@ def build_plan(schedule, changes: list, title: Optional[str], scale: float,
     stack, total, gap = measure(m)
     fits = total <= available
     if fits and available - total > 4:
-        # Остаток воздуха — в зазоры между карточками (не более +60%),
-        # чтобы не было «карточки вверху, пустота внизу». Вариант
-        # принимаем только если он честно влез: иначе откат к базовой
-        # measure(), никакого «влез/не влез» на уровне валидатора.
+        # Остаток воздуха — в зазоры между карточками (не более +90%),
+        # чтобы не было «карточки вверху, пустота внизу».
         slack_for_gaps = available - total
         widen_gaps = len(stack) > 1
         wide = measure(m)
@@ -4325,18 +4618,13 @@ def build_plan(schedule, changes: list, title: Optional[str], scale: float,
         else:
             slack_for_gaps, widen_gaps = 0.0, False
     # Занятий мало: воздух добавляем ВНУТРЬ карточек (отступы и зазоры
-    # блоков), кегли не трогаем. Так единственная карточка дня занимает
-    # холст, а не висит узкой полосой; остаток опускаем список к
-    # оптическому центру.
+    # блоков), кегли не трогаем.
     shift_top = 0.0
     if fits and stack:
         slack = available - total
         n_cards = sum(1 for item in stack if item["kind"] == "card")
         if slack > m["card_gap"] * 2 and n_cards:
-            breath = min(260.0, slack * 0.9 / n_cards)
-            # «Воздух» — аддитивная надбавка, поэтому перебор
-            # половины шага сходится: вариант с дыханием всегда
-            # не больше базового + breath * n_cards.
+            breath = min(220.0, slack * 0.85 / n_cards)
             while breath > 6:
                 breathed = measure(_breath_metrics(m, breath))
                 if breathed[1] <= available:
@@ -4345,56 +4633,44 @@ def build_plan(schedule, changes: list, title: Optional[str], scale: float,
                     break
                 breath /= 2.0
             if available - total > m["card_gap"] * 2:
-                shift_top = min(140.0, (available - total) * 0.42)
+                shift_top = min(120.0, (available - total) * 0.40)
 
     # --- расстановка ---
     cards: list = []
     y = float(content_top) + shift_top
     if not stack:
-        empty_h = max(150.0, min(320.0, available))
+        empty_h = max(220.0, min(420.0, available))
         y = content_top + max(0.0, (available - empty_h) / 2)
         empty_ops, _ = layout_empty_card(m, inner_w, empty_h)
         ops += _shift_ops(empty_ops, inner_x, y)
         owners["empty"] = (inner_x, y, inner_x + inner_w, y + empty_h)
     else:
         for entry in stack:
-            if entry["kind"] == "break":
-                ops += _shift_ops(entry["ops"], 0, y)
-                y += entry["height"] + gap
-                continue
             spec = entry["spec"]
             height = entry["height"]
             box = (inner_x, y, inner_x + inner_w, y + height)
             owners[spec["owner"]] = box
-            # Тень строим сразу в абсолютных координатах (и обрезаем по
-            # холсту) — сдвиг ей не нужен.
-            ops += _shadow_ops(m, box, m["radius"], clip=(W, H))
-            card_bg = (S_RED_L if spec["cancelled_all"] else S_CARD)
-            card_bd = S_RED_B if spec["cancelled_all"] else S_BORDER
-            ops.append(_rect_op(box, m["radius"], fill=card_bg, outline=card_bd,
-                                width=1.2, kind="card",
+            ops.append(_shadow_op(box, m["radius"], uid=f"{spec['owner']}:shadow",
+                                  blur=m["shadow"], dy=m["shadow_y"],
+                                  alpha=m["shadow_alpha"]))
+            ops.append(_rect_op(box, m["radius"], fill=S_CARD,
+                                outline=S_BORDER, width=1.1, kind="card",
                                 uid=f"{spec['owner']}:bg"))
-            accent = (S_RED if spec["cancelled_all"]
-                     else S_GREEN if spec["tag"] == "ДОБАВЛЕНО" else S_PURPLE)
-            bar_w = max(5.0, m["pad_x"] * 0.3)
-            inset = height * 0.22
-            ops.append(_rect_op((inner_x + 1, y + inset, inner_x + 1 + bar_w,
-                                 y + height - inset), bar_w / 2.0, fill=accent,
-                                kind="shape", uid=f"{spec['owner']}:accent",
-                                owner=spec["owner"]))
             ops += _shift_ops(entry["ops"], inner_x, y)
             cards.append({"owner": spec["owner"], "box": box, "spec": spec})
             y += height + gap
 
     owners["header"] = (0.0, 0.0, float(W), float(content_top + shift_top))
-    owners["footer"] = (0.0, float(footer_top), float(W), float(H))
+    owners["footer"] = (0.0, float(footer_top), float(W),
+                        float(footer_top + footer_h))
 
     plan = {
         "W": W, "H": H, "metrics": m, "scale": m["scale"],
         "ops": ops, "owners": owners, "cards": cards, "specs": specs,
         "content_top": content_top + shift_top,
         "content_bottom": y - gap if stack else y,
-        "footer_top": footer_top, "footer_h": footer_h, "note_lines": note_lines,
+        "footer_top": footer_top, "footer_h": footer_h,
+        "note_lines": note_lines,
         "fits": fits, "needed": total + content_top + footer_h + 2 * SAFE_AREA,
         "title": title, "elements": ops, "left": (inner_x, inner_w),
         "empty": not stack,
@@ -4405,7 +4681,7 @@ def build_plan(schedule, changes: list, title: Optional[str], scale: float,
 def fit_scale(schedule, changes, title, ctx, specs, H: int) -> dict:
     """Наибольший читаемый масштаб для данной высоты холста.
 
-    Дискретный бинарный поиск по сетке S_SCALE_STEP: sizes монотонны по
+    Дискретный бинарный поиск по сетке S_SCALE_STEP: размеры монотонны по
     масштабу, поэтому «наибольший влезший» — это и есть оптимум.
     """
     lo, hi = S_SCALE_MIN, S_SCALE_MAX
@@ -4427,7 +4703,7 @@ def fit_scale(schedule, changes, title, ctx, specs, H: int) -> dict:
 
 
 def choose_plan(schedule, changes, title, ctx, specs) -> dict:
-    """Выбор формата: 4:5, при нехватке воздуха — 3:4, дальше — потолок.
+    """Выбор формата: 2:3, при нехватке воздуха — выше по лестнице.
 
     Холст растёт только если иначе текст упёрся бы в пол; вертикального
     кропа не бывает ни при каких обстоятельствах.
@@ -4441,9 +4717,6 @@ def choose_plan(schedule, changes, title, ctx, specs) -> dict:
     needed = int((fallback or {}).get("needed") or SCHEDULE_HEIGHT_MAX)
     H = max(SCHEDULE_RATIO_LADDER[-1][0], min(needed, SCHEDULE_HEIGHT_MAX))
     plan = fit_scale(schedule, changes, title, ctx, specs, H)
-    # Контент не влез даже на потолке формата: растём холстом (кропа не
-    # бывает никогда). Каждый шаг берёт свежеизмеренный `needed`, поэтому
-    # рост сходится за 1-2 прохода и не оставляет пустого хвоста.
     for _ in range(3):
         if plan["fits"]:
             break
@@ -4476,6 +4749,30 @@ class SupersampleCanvas:
         return self.image.resize((self.W, self.H), Image.LANCZOS)
 
 
+def _draw_shadow(canvas: SupersampleCanvas, op: dict) -> None:
+    """Мягкая тень карточки: размытый прямоугольник под ней.
+
+    Размытие считается в масштабе финальной картинки (1x) — это вчетверо
+    дешевле по пикселям и после даунскейла неотличимо от 2x.
+    """
+    W, H, ss = canvas.W, canvas.H, canvas.ss
+    x0, y0, x1, y1 = op["box"]
+    blur = float(op.get("blur") or 16)
+    dy = float(op.get("dy") or 0)
+    inset = max(1.0, blur * 0.18)
+    mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (x0 + inset, y0 + dy + inset * 0.4, x1 - inset, y1 + dy - inset * 0.2),
+        radius=max(1.0, op["radius"] - inset * 0.4),
+        fill=int(op.get("alpha") or 70),
+    )
+    mask = mask.filter(ImageFilter.GaussianBlur(blur))
+    if ss != 1:
+        mask = mask.resize((W * ss, H * ss), Image.BILINEAR)
+    canvas.image.paste(Image.new("RGB", canvas.image.size,
+                                 op.get("fill") or S_SHADOW), (0, 0), mask)
+
+
 def draw_ops(canvas: SupersampleCanvas, ops: list) -> None:
     """Единственное место, которое что-то рисует: только исполняет ops."""
     draw = canvas.draw
@@ -4495,6 +4792,15 @@ def draw_ops(canvas: SupersampleCanvas, ops: list) -> None:
                                    fill=op.get("fill"),
                                    outline=outline if width else None,
                                    width=width if outline else 0)
+        elif kind == "ellipse":
+            x0, y0, x1, y1 = (op["box"][i] * ss for i in range(4))
+            if x1 - x0 < 1 or y1 - y0 < 1:
+                continue
+            outline = op.get("outline")
+            width = int(round((op.get("width") or 0) * ss))
+            draw.ellipse((x0, y0, x1, y1), fill=op.get("fill"),
+                         outline=outline if width else None,
+                         width=width if outline else 0)
         elif kind == "text":
             font = _font_for(int(op["size"] * ss), op["weight"])
             spacing = (op.get("spacing") or 0.0) * ss
@@ -4513,7 +4819,7 @@ def draw_ops(canvas: SupersampleCanvas, ops: list) -> None:
             draw.polygon([(px * ss, py * ss) for px, py in op["points"]],
                          fill=op["fill"])
         elif kind == "line":
-            x0, y0, x1, y1 = (op["box"][i] * ss for i in range(4))
+            x0, y0, x1, y1 = (op["points"][i] * ss for i in range(4))
             width = max(1, int(round(op.get("width") or 1) * ss))
             # Хайрлайн должен попадать в целые пиксели ДИЗАЙНА: после
             # даунскейла LANCZOS линия на полупикселе растворяется в фоне.
@@ -4522,13 +4828,22 @@ def draw_ops(canvas: SupersampleCanvas, ops: list) -> None:
             elif abs(x1 - x0) < 0.5:
                 x0 = x1 = _math.floor(x0 / ss) * ss + ss / 2.0
             draw.line((x0, y0, x1, y1), fill=op["color"], width=width)
+        elif kind == "shadow":
+            _draw_shadow(canvas, op)
 
 
 # ------------------------------------------------------------
 # ВАЛИДАЦИЯ LAYOUT (перед сохранением)
 # ------------------------------------------------------------
 
-_BG_KINDS = ("card", "rowbg", "shadow", "band", "chip", "shape", "deco", None)
+def _intersect_area(a, b) -> float:
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
 
 
 def validate_layout(plan: dict) -> list:
@@ -4568,7 +4883,7 @@ def validate_layout(plan: dict) -> list:
         if x0 < -eps or y0 < -eps or x1 > W + eps or y1 > H + eps:
             problems.append(f"«{uid}»: вышел за холст")
         # 2) safe area — только для значимого контента
-        if op.get("kind") in ("text", "card", "rowbg", "band", "chip"):
+        if op.get("kind") in ("text", "card", "panel", "chip", "band"):
             if (x0 < SAFE_AREA - eps or y0 < SAFE_AREA - eps
                     or x1 > W - SAFE_AREA + eps or y1 > H - SAFE_AREA + eps):
                 problems.append(f"«{uid}»: вышел за safe area")
@@ -4602,8 +4917,7 @@ def validate_layout(plan: dict) -> list:
                 )
             seen_ids.setdefault(uid, []).append(op)
 
-    # 5) пересечения текстовых блоков (текст внутри чипа — не пересечение:
-    #    чип — это фон, он в _BG_KINDS и не участвует в проверке)
+    # 5) пересечения текстовых блоков внутри одного блока-владельца
     texts = [op for op in ops if op["op"] == "text" and op.get("bbox")]
     for i in range(len(texts)):
         for j in range(i + 1, len(texts)):
@@ -4633,16 +4947,6 @@ def validate_layout(plan: dict) -> list:
     return problems
 
 
-def _intersect_area(a, b) -> float:
-    x0 = max(a[0], b[0])
-    y0 = max(a[1], b[1])
-    x1 = min(a[2], b[2])
-    y1 = min(a[3], b[3])
-    if x1 <= x0 or y1 <= y0:
-        return 0.0
-    return (x1 - x0) * (y1 - y0)
-
-
 # ------------------------------------------------------------
 # ТОЧКА ВХОДА: render_schedule_image
 # ------------------------------------------------------------
@@ -4658,12 +4962,11 @@ def render_schedule_image(
 ) -> Path:
     """PNG расписания ОДНОГО ДНЯ, заточенный под превью Telegram.
 
-    - Формат вертикальный: 1080×1350 (4:5), при большом количестве
-      занятий — 3:4 и далее по лестнице; никогда не режется.
+    - Формат вертикальный: 1080×1620 (2:3), при плотном дне — выше по
+      лестнице форматов; кропа не бывает никогда.
     - Одна картинка = одна дата. Никаких «сегодня + завтра» вместе.
-    - Аудитория — главный акцент карточки после времени и предмета:
-      крупный жирный зелёный чип «АУД. УК303», который читается прямо
-      из превью чата, без зума.
+    - Карточка пары: номер, время, предмет, преподаватель и аудитория —
+      мягкой зелёной плашкой, а не «кричащим» чипом.
     - Отдельной колонки «Изменения» нет: ИЗМЕНЕНО/ДОБАВЛЕНО/ОТМЕНА и
       сами правки показываются внутри карточки соответствующей пары.
     - `changes=None` -> обычный день; `changes=[...]` -> карточки с
@@ -4745,10 +5048,10 @@ def render_schedule_image(
             "cards": len(plan["cards"]),
         })
         logger.info(
-            "Изображение сохранено: %s (%sx%s, 4:%s, масштаб %s, карточек %s, "
-            "проблем layout: %s, эллипсис: %s)",
-            path, plan["W"], plan["H"],
-            round(plan["H"] / plan["W"] * 4), plan["scale"], len(plan["cards"]),
+            "Изображение сохранено: %s (%sx%s, соотношение %.2f, масштаб %s, "
+            "карточек %s, проблем layout: %s, эллипсис: %s)",
+            path, plan["W"], plan["H"], plan["H"] / plan["W"], plan["scale"],
+            len(plan["cards"]),
             len(problems), ", ".join(truncated) if truncated else "нет",
         )
         if problems:
