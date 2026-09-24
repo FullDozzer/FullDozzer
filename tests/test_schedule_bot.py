@@ -50,17 +50,68 @@ def empty_schedule(day: date) -> bot.Schedule:
     return bot.Schedule(date=day, group=bot.GROUP_NAME, lessons=[])
 
 
-def lesson_card_span() -> tuple:
-    """(x0, x1) карточки пары в левой колонке — из констант layout.
+# --- Хелперы проверок рендера (дизайн «один день = одна картинка») ---
 
-    Колонка «Изменения» присутствует всегда, поэтому карточки пар
-    заканчиваются задолго до правого края холста. Пиксельные проверки
-    «справа в карточке» должны опираться на эту геометрию, а не на
-    жёстко заданные координаты.
+def hex_rgb(value: str) -> tuple:
+    text = str(value).lstrip("#")
+    return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def rendered_text() -> str:
+    """Весь текст, реально нарисованный на последней картинке."""
+    plan = bot._LAST_RENDER["plan"]
+    return "\n".join(
+        " ".join(op["lines"]) for op in plan["ops"] if op["op"] == "text"
+    )
+
+
+def ops_with(role: str) -> list:
+    """Отрисованные блоки с указанной ролью (room — аудитория)."""
+    plan = bot._LAST_RENDER["plan"]
+    return [op for op in plan["ops"] if op.get("role") == role]
+
+
+def text_sizes(role: str) -> list:
+    return [op["size"] for op in ops_with(role)]
+
+
+def close(color, target, tol=8) -> bool:
+    return all(abs(color[i] - target[i]) <= tol for i in range(3))
+
+
+def op_box(op: dict) -> tuple:
+    """Габарит блока: ink-бокс у текста, прямоугольник у shapes/chip."""
+    return op.get("bbox") or op["box"]
+
+
+def plan_small_ops():
+    """Второстепенные строки карточки: сноски и статусные метки."""
+    plan = bot._LAST_RENDER["plan"]
+    return [op for op in plan["ops"]
+            if op["op"] == "text" and op.get("role") in ("small", "tag")]
+
+
+def outside_safe_area(img, margin=None) -> list:
+    """Пиксели контента (белый/насыщенный), прижатые ближе margin к краю.
+
+    Тени — оттенки фона — специально не считаются: они декоративные.
     """
-    content_w = bot.SCHEDULE_WIDTH - 2 * bot.S_MARGIN
-    left_w = content_w - bot.S_RIGHT_COL_W - bot.S_COL_GAP
-    return bot.S_MARGIN, bot.S_MARGIN + left_w
+    margin = margin or bot.SAFE_AREA
+    px = img.convert("RGB").load()
+    w, h = img.size
+    bad = []
+    for y in range(h):
+        for x in range(w):
+            edge = min(x, y, w - 1 - x, h - 1 - y)
+            if edge >= margin:
+                continue
+            r, g, b = px[x, y]
+            # тёмный текст, белая карточка или цветной бейдж у края
+            if (r < 120 and g < 120 and b < 120) or (r > 250 and g > 250 and b > 250):
+                bad.append((x, y))
+            elif abs(r - 27) < 40 and abs(g - 156) < 40 and abs(b - 98) < 40:
+                bad.append((x, y))
+    return bad
 
 
 class FakeBot:
@@ -1188,83 +1239,259 @@ class TestScheduleComparison(unittest.TestCase):
 
 
 class TestPillowRendering(unittest.TestCase):
-    def test_render_subgroups_and_changes_fixed_format(self):
-        schedule = bot.Schedule(
-            date=date(2026, 9, 7),
-            group=bot.GROUP_NAME,
-            lessons=[
-                lesson("I", None, "Химия Н и Г", "УК307", "Арнаутова А.В."),
-                lesson("II", "1"),
-                lesson("II", "2", room="ПК305"),
-                lesson(
-                    "III", None, "Очень длинное название предмета для проверки "
-                    "переноса текста в несколько строк внутри Pillow",
-                    "ПК217", "Степанов Сергей Владимирович Иванов Пётр Петрович",
-                    "11:40", "13:00",
-                ),
-            ],
-        )
-        changes = bot.compare_schedules(
-            bot.Schedule(
-                date=date(2026, 9, 7),
-                group=bot.GROUP_NAME,
-                lessons=[
-                    lesson("I", None, "Химия Н и Г", "УК307", "Арнаутова А.В."),
-                    lesson("II", "1"),
-                    lesson("II", "2", room="ПК303"),
-                    lesson(
-                        "III", None, "Очень длинное название предмета для проверки "
-                        "переноса текста в несколько строк внутри Pillow",
-                        "ПК217", "Степанов Сергей Владимирович Иванов Пётр Петрович",
-                        "11:40", "13:00",
-                    ),
-                ],
-            ),
-            schedule,
-        )
-        self.assertEqual(len(changes), 1)
-        normal = bot.render_schedule_image(schedule)
-        changed = bot.render_schedule_image(schedule, changes=changes)
-        with Image.open(normal) as img_n, Image.open(changed) as img_c:
-            # Основной формат: 1080×920 и у обычной, и у изменённой
-            # (изменения идут в отдельную колонку, а не растят картинку).
-            self.assertEqual(img_n.size, (1080, 920))
-            self.assertEqual(img_c.size, (1080, 920))
-        # Layout-валидация: текст в границах, подгруппы и бейджи
-        # помещаются, пересечений нет.
+    """Рендер дня: вертикальный формат, аудитория — акцент, инлайн-изменения."""
+
+    def four_pairs(self, day=date(2026, 9, 24)):
+        return bot.Schedule(date=day, group=bot.GROUP_NAME, lessons=[
+            lesson("I", None, "Пожарная безопасность", "ПК108",
+                   "Фахретдинов Р. Ф.", "08:30", "09:50"),
+            lesson("II", None, "Ин.яз.", "УК103", "Мурзабулатова Ф.Ф.",
+                   "10:00", "11:20"),
+            lesson("III", None, "Химия Н и Г", "УК307", "Арнаутова А.В.",
+                   "11:35", "12:55"),
+            lesson("V", None, "Физ-ра", "бол зал 2", "Кинзябаев А.И.",
+                   "14:55", "16:15"),
+        ])
+
+    # --- формат ---
+    def test_image_is_portrait_4_to_5(self):
+        """Один день = одна вертикальная картинка 4:5 (1080×1350)."""
+        self.assertEqual((bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT),
+                         (1080, 1350))
+        path = bot.render_schedule_image(self.four_pairs())
+        with Image.open(path) as img:
+            w, h = img.size
+        self.assertEqual((w, h), (1080, 1350))
+        self.assertGreater(h, w, "картинка должна быть вертикальной")
+        self.assertEqual(round(h / w, 2), 1.25, "соотношение ~4:5")
+        # длинная сторона в разумных пределах: без «чрезмерно высокого» холста
+        self.assertLessEqual(h, 1740)
+
+    def test_text_is_supersampled_and_sharp(self):
+        """Рендер идёт в 2x и даунскейлится — иначе текст в превью мыльный."""
+        self.assertGreaterEqual(bot.SUPER_SAMPLE, 2)
+        path = bot.render_schedule_image(self.four_pairs())
+        with Image.open(path) as img:
+            # финал всегда в 1x: холст не «случайно» в два раза больше
+            self.assertEqual(img.size, (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
+            self.assertEqual(img.format, "PNG")
+
+    def test_file_is_small_enough_for_telegram(self):
+        path = bot.render_schedule_image(self.four_pairs())
+        size = Path(path).stat().st_size
+        self.assertLess(size, 1.5 * 1024 * 1024,
+                        "PNG для Telegram должен оставаться лёгким")
+
+    def test_nothing_sits_in_the_unsafe_border(self):
+        """Все важные элементы — в safe area: превью Telegram скругляет края."""
+        path = bot.render_schedule_image(self.four_pairs())
+        with Image.open(path) as img:
+            self.assertEqual(outside_safe_area(img, bot.SAFE_AREA - 6), [],
+                             "контент прижат к краю холста")
+
+    def plan_problems(self):
+        return bot._LAST_RENDER["problems"]
+
+    def test_layout_report_has_no_problems(self):
+        for day in (date(2026, 9, 24), date(2026, 9, 25)):
+            bot.render_schedule_image(self.four_pairs(day))
+            self.assertEqual(bot._LAST_RENDER["problems"], [])
+            self.assertGreater(bot._LAST_RENDER["elements"], 10)
+
+    # --- аудитория как главный акцент ---
+    def test_room_is_rendered_big_and_bold(self):
+        path = bot.render_schedule_image(self.four_pairs())
+        room_sizes = text_sizes("room")
+        self.assertEqual(len(room_sizes), 4)
+        for op in ops_with("room"):
+            self.assertIn("АУД.", op["lines"][0])
+        room = min(room_sizes)
+        self.assertGreaterEqual(room, bot.ROOM_FONT_MIN)
+        # крупнее преподавателя и любой второстепенной строки
+        self.assertGreater(room, max(text_sizes("teacher")))
+        self.assertGreater(room, max(text_sizes("small")))
+        # и сопоставимо со временем/предметом, а не мелкий текст в углу
+        self.assertGreaterEqual(room, max(text_sizes("subject")))
+        self.assertGreater(room, 0.9 * max(text_sizes("time")))
+        with Image.open(path) as img:
+            px = img.convert("RGB").load()
+            # зелёный чип аудитории реально нарисован
+            green = hex_rgb(bot.S_GREEN_D)
+            self.assertTrue(any(
+                close(px[x, y], green, 10)
+                for y in range(0, img.height, 2) for x in range(0, img.width, 2)
+            ), "зелёный текст аудитории не найден")
+
+    def test_room_font_never_drops_below_floor_with_many_lessons(self):
+        """Много занятий — компакте Everything, КРОМЕ текста аудитории."""
+        lessons = [lesson(chr(ord("I") + i), None, f"Предмет {i}",
+                          f"ПК{i:03d}", "Иванова А.А.",
+                          f"{8 + i:02d}:00", f"{9 + i:02d}:00")
+                   for i in range(9)]
+        path = bot.render_schedule_image(
+            bot.Schedule(date=date(2026, 9, 24), group=bot.GROUP_NAME,
+                         lessons=lessons))
+        plan = bot._LAST_RENDER["plan"]
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        self.assertLess(plan["scale"], 0.75, "плотный день должен уплотниться")
+        for op in ops_with("room"):
+            self.assertGreaterEqual(op["size"], bot.ROOM_FONT_MIN)
+        self.assertLess(max(text_sizes("teacher")), bot.ROOM_FONT_MIN)
+        with Image.open(path) as img:
+            self.assertEqual(img.size[0], bot.SCHEDULE_WIDTH)
+            self.assertGreater(img.size[1], bot.SCHEDULE_HEIGHT,
+                               "если не влезает — растёт холст, а не кроп")
+            self.assertEqual(outside_safe_area(img, bot.SAFE_AREA - 6), [])
+
+    # --- изменения внутри карточки, без правой колонки ---
+    def test_changes_render_inline_without_right_column(self):
+        schedule = bot.Schedule(date=date(2026, 9, 24), group=bot.GROUP_NAME,
+                                lessons=[
+                                    lesson("II", None, "Ин.яз.", "УК103",
+                                           "Мурзабулатова Ф.Ф."),
+                                ])
+        changes = [bot.ScheduleChange(
+            kind="changed", pair="II", subgroup=None,
+            old={"room": "УК105"}, new={"room": "УК103"},
+            details=[{"field": "room", "label": "Аудитория",
+                      "old": "УК105", "new": "УК103"}],
+        )]
+        path = bot.render_schedule_image(schedule, changes=changes,
+                                       title="РАСПИСАНИЕ ИЗМЕНИЛОСЬ")
+        text = rendered_text()
+        # и старая, и новая аудитория — внутри карточки
+        self.assertIn("Аудитория: УК105 → УК103", text)
+        self.assertIn("АУД. УК103", text)
+        self.assertIn("ИЗМЕНЕНО", text)
+        # колонки «Изменения» больше нет ни в layout, ни на картинке
+        plan = bot._LAST_RENDER["plan"]
+        self.assertNotIn("panel", plan["owners"])
+        self.assertFalse([op for op in plan["ops"]
+                         if str(op.get("id")).startswith("panel")])
+        self.assertNotIn("right", plan)
+        with Image.open(path) as img:
+            w, h = img.size
+            self.assertEqual((w, h), (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
+            # правая половина не зарезервирована под колонку: карточка
+            # занимает всю ширину safe area
+            box = plan["cards"][0]["box"]
+            self.assertAlmostEqual(box[0], bot.SAFE_AREA, delta=1)
+            self.assertAlmostEqual(box[2], w - bot.SAFE_AREA, delta=1)
+
+    def test_removed_pair_gets_its_own_cancelled_card(self):
+        """Раньше удалённая пара жила в правой колонке — теперь это карточка."""
+        schedule = bot.Schedule(date=date(2026, 9, 24), group=bot.GROUP_NAME,
+                                lessons=[lesson("I", None, "Математика",
+                                                 "УК201", "Иванова А.А.",
+                                                 "08:30", "09:50")])
+        changes = [bot.ScheduleChange(
+            kind="removed", pair="III", subgroup=None,
+            old={"pair": "III", "start": "11:35", "end": "12:55",
+                 "subject": "Химия", "room": "УК307", "teacher": "—",
+                 "subgroup": None},
+            new=None, details=[],
+        )]
+        bot.render_schedule_image(schedule, changes=changes)
+        text = rendered_text()
+        self.assertIn("ЗАНЯТИЕ ОТМЕНЕНО", text)
+        self.assertIn("АУД. УК307", text)   # аудитию не выбрасываем
+        plan = bot._LAST_RENDER["plan"]
+        self.assertEqual(len(plan["cards"]), 2)
+        cancelled = plan["specs"][1]
+        self.assertTrue(cancelled["cancelled_all"])
         self.assertEqual(bot._LAST_RENDER["problems"], [])
 
-    def test_render_added_and_removed_subgroups(self):
-        old = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
-                           lessons=[lesson("II", "1")])
-        new = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
-                           lessons=[
-                               lesson("II", "1"),
-                               lesson("II", "2", room="ПК303",
-                                      teacher="Амирханова Г.А."),
-                           ])
-        changes = bot.compare_schedules(old, new)
-        self.assertEqual(changes[0].kind, "added")
-        path = bot.render_schedule_image(new, changes=changes)
-        self.assertTrue(path.exists())
-
-    def test_render_many_changes_doesnt_crash(self):
-        lessons = []
-        changes = []
+    def test_many_changes_do_not_crash_or_crop(self):
+        items, changes = [], []
         for i in range(1, 12):
-            lessons.append(lesson("II", str(i), subject=f"Предмет {i}"))
+            items.append(lesson("II", str(i), subject=f"Предмет {i}",
+                                room=f"ПК{i:03d}"))
             changes.append(bot.ScheduleChange(
-                kind="added",
-                pair="II",
-                subgroup=str(i),
-                old=None,
-                new={"subject": f"Предмет {i}", "room": "ПК100", "teacher": "—"},
-                details=[],
+                kind="added", pair="II", subgroup=str(i), old=None,
+                new={"subject": f"Предмет {i}", "room": f"ПК{i:03d}",
+                     "teacher": "—"}, details=[],
             ))
-        schedule = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
-                                lessons=lessons)
+        schedule = bot.Schedule(date=date(2026, 9, 24), group=bot.GROUP_NAME,
+                               lessons=items)
         path = bot.render_schedule_image(schedule, changes=changes)
-        self.assertTrue(path.exists())
+        self.assertTrue(Path(path).exists())
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        with Image.open(path) as img:
+            self.assertGreater(img.size[1], img.size[0])
+            self.assertLessEqual(img.size[1], bot.SCHEDULE_HEIGHT_MAX,
+                                 "11 подгрупп не должны ломать формат холста")
+
+    def test_added_subgroup_and_removed_subgroup_render(self):
+        schedule = bot.Schedule(date=date(2026, 9, 24), group=bot.GROUP_NAME,
+                                lessons=[
+                                    lesson("II", "1", "Ин.яз.", "ПК103",
+                                           "Мурзабулатова Ф.Ф."),
+                                    lesson("II", "2", "Ин.яз.", "ПК303",
+                                           "Амирханова Г.А."),
+                                ])
+        changes = [bot.ScheduleChange(
+            kind="removed", pair="II", subgroup="3",
+            old={"pair": "II", "start": "10:00", "end": "11:20",
+                 "subject": "Химия", "room": "—", "teacher": "—",
+                 "subgroup": "3"},
+            new=None, details=[],
+        )]
+        path = bot.render_schedule_image(schedule, changes=changes)
+        text = rendered_text()
+        self.assertIn("1 п/гр.", text)
+        self.assertIn("2 п/гр.", text)
+        self.assertTrue(Path(path).exists())
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+
+    def test_long_subject_wraps_and_never_overflows(self):
+        schedule = bot.Schedule(date=date(2026, 9, 24), group=bot.GROUP_NAME,
+                                lessons=[lesson(
+                                    "I", None,
+                                    "Очень длинное название предмета, которое "
+                                    "точно не помещается в одну строку карточки "
+                                    "целиком даже после уменьшения размера "
+                                    "шрифта внутри всех доступных переносов",
+                                    "УК103", "Степанов Сергей Владимирович",
+                                    "08:30", "09:50")])
+        path = bot.render_schedule_image(schedule)
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        subject = [op for op in bot._LAST_RENDER["plan"]["ops"]
+                   if op["op"] == "text" and "длинное" in " ".join(op["lines"])]
+        self.assertTrue(subject)
+        self.assertGreater(len(subject[0]["lines"]), 1,
+                           "длинное название должно переноситься, а не резаться")
+        plan = bot._LAST_RENDER["plan"]
+        card = plan["cards"][0]["box"]
+        for op in subject:
+            self.assertLessEqual(op["bbox"][0], card[2])
+            self.assertLessEqual(op["bbox"][3], card[3])
+        with Image.open(path) as img:
+            self.assertEqual(outside_safe_area(img, bot.SAFE_AREA - 6), [])
+
+    def test_empty_day_renders_single_portrait_card(self):
+        path = bot.render_schedule_image(empty_schedule(date(2026, 9, 8)))
+        text = rendered_text()
+        self.assertIn("Занятий нет", text)
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        with Image.open(path) as img:
+            self.assertEqual(img.size, (1080, 1350))
+
+    def test_two_days_never_share_one_image(self):
+        """Сегодня и завтра — две отдельные картинки, каждая про свой день."""
+        today = bot.render_schedule_image(self.four_pairs(date(2026, 9, 24)))
+        tomorrow = bot.render_schedule_image(self.four_pairs(date(2026, 9, 25)))
+        self.assertNotEqual(Path(today).name, Path(tomorrow).name)
+        for path, day in ((today, date(2026, 9, 24)), (tomorrow, date(2026, 9, 25))):
+            bot.render_schedule_image(self.four_pairs(day))
+            text = rendered_text()
+            caption = bot._day_caption(bot.Schedule(
+                date=day, group=bot.GROUP_NAME, lessons=[]))
+            other = date(2026, 9, 25) if day == date(2026, 9, 24) else date(2026, 9, 24)
+            other_caption = bot._day_caption(bot.Schedule(
+                date=other, group=bot.GROUP_NAME, lessons=[]))
+            self.assertIn(caption, text)
+            self.assertNotIn(other_caption, text)
+            self.assertEqual(text.count("2026"), 1)
 
 
 class TestLessonCount(unittest.TestCase):
@@ -1359,77 +1586,101 @@ class TestLessonCount(unittest.TestCase):
 
 
 class TestCancelledLessonRendering(unittest.TestCase):
-    """Отмена занятия («~..............») на картинке расписания."""
+    """Отмена занятия («~..............») на картинке расписания.
 
-    GREEN = (35, 149, 102)        # S_GREEN
-    GREEN_LIGHT = (233, 247, 240)  # S_GREEN_L
-    MUTED = (120, 128, 148)        # S_MUTED
-    RED = (212, 93, 101)           # S_RED
+    Отменённая пара — это обычная карточка в той же колонке: мягкий
+    красно-розовый фон, крупная плашка «ЗАНЯТИЕ ОТМЕНЕНО», аудитория
+    остаётся, если она есть в данных.
+    """
 
-    def cancelled_schedule(self):
+    RED = hex_rgb(bot.S_RED)          # плашка отмены
+    RED_BG = hex_rgb(bot.S_RED_L)     # фон отменённой карточки
+    GREEN_TEXT = hex_rgb(bot.S_GREEN_D)
+    GREEN_BG = hex_rgb(bot.S_GREEN_L)
+
+    def cancelled_schedule(self, room="—"):
         return bot.Schedule(
             date=date(2026, 9, 11),
             group=bot.GROUP_NAME,
             lessons=[
-                lesson("IV", "2", "~..............", "—", "—",
+                lesson("IV", "2", "~..............", room, "—",
                        "13:25", "14:45"),
             ],
         )
 
-    def color_rows(self, path, color, y0=150):
-        # Точность ±6: залитые бейджи совпадают точно, глифы текста —
-        # с частичным покрытием (±единицы в каналах).
-        with Image.open(path) as img:
-            im = img.convert("RGB")
-            px = im.load()
-            return [
-                y for y in range(y0, im.height)
-                if any(abs(px[x, y][0] - color[0]) <= 6
-                       and abs(px[x, y][1] - color[1]) <= 6
-                       and abs(px[x, y][2] - color[2]) <= 6
-                       for x in range(100, im.width - 40, 2))
-            ]
-
-    @staticmethod
-    def white_card_rows(img):
-        """Строки белой карточки (x 100..900, ниже шапки)."""
-        px = img.convert("RGB").load()
-        return [
-            y for y in range(150, img.height - 30)
-            if any(px[x, y] == (255, 255, 255) for x in range(100, 900, 4))
-        ]
-
-    def test_cancelled_block_has_no_room_chip_and_shows_red_text(self):
+    def test_cancelled_card_is_red_and_has_no_right_panel(self):
         path = bot.render_schedule_image(self.cancelled_schedule())
-        # У отменённого занятия нет чипа аудитории (зелёного) вообще…
-        self.assertEqual(self.color_rows(path, self.GREEN), [])
-        self.assertEqual(self.color_rows(path, self.GREEN_LIGHT), [])
-        # …но есть красная надпись «Занятие отменено» и бейдж ОТМЕНА.
-        red = self.color_rows(path, self.RED)
-        self.assertTrue(red, "красная надпись «Занятие отменено» не найдена")
+        plan = bot._LAST_RENDER["plan"]
+        with Image.open(path) as img:
+            box = tuple(int(v) for v in plan["cards"][0]["box"])
+            px = img.convert("RGB").load()
+            # мягкий красно-розовый фон карточки
+            self.assertTrue(any(
+                close(px[x, box[1] + 4], self.RED_BG, 6)
+                for x in range(box[0] + 30, box[2] - 30, 7)
+            ), "фон отменённой карточки не красно-розовый")
+            # крупная плашка «ЗАНЯТИЕ ОТМЕНЕНО» внутри карточки
+            banner = [op for op in plan["ops"] if op["op"] == "text"
+                      and "ЗАНЯТИЕ ОТМЕНЕНО" in " ".join(op["lines"])]
+            self.assertEqual(len(banner), 1)
+            self.assertTrue(box[0] <= banner[0]["bbox"][0]
+                            and banner[0]["bbox"][2] <= box[2],
+                            "плашка отмены вышла за карточку")
+            self.assertTrue(any(
+                close(px[x, int(banner[0]["bbox"][1]) + 2], self.RED, 8)
+                for x in range(int(banner[0]["bbox"][0]),
+                               int(banner[0]["bbox"][2]), 5)
+            ), "плашка отмены не нарисована красным")
+        self.assertNotIn("panel", plan["owners"])
 
-    def test_cancelled_block_is_compact(self):
-        """Блок без аудитории/преподавателя короче обычного блока.
+    def test_cancelled_card_keeps_room_when_data_has_a_room(self):
+        """Отменённое занятие без аудитории ≠ отмена с аудиторией: чип нужен."""
+        path = bot.render_schedule_image(self.cancelled_schedule(room="УК307"))
+        text = rendered_text()
+        self.assertIn("ЗАНЯТИЕ ОТМЕНЕНО", text)
+        self.assertIn("АУД. УК307", text)
+        rooms = ops_with("room")
+        self.assertEqual(len(rooms), 1)
+        self.assertGreaterEqual(rooms[0]["size"], bot.ROOM_FONT_MIN)
+        # статус отмены всё равно заметнее второстепенных строк
+        small = [op for op in plan_small_ops()]
+        if small:
+            self.assertGreater(rooms[0]["size"], max(op["size"] for op in small))
+        with Image.open(path) as img:
+            px = img.convert("RGB").load()
+            chip_y = int(rooms[0]["bbox"][1] + 1)
+            self.assertTrue(any(
+                close(px[x, chip_y], self.GREEN_TEXT, 10)
+                for x in range(0, img.width, 3)
+            ), "аудитория отменённой пары не подсвечена зелёным")
 
-        Формат картинки фиксированный (1080×920), поэтому сравниваем
-        площадь белой карточки, а не высоту холста.
-        """
-        cancelled = bot.render_schedule_image(bot.Schedule(
-            date=date(2026, 9, 11),
-            group=bot.GROUP_NAME,
+    def test_cancelled_card_without_room_says_so_quietly(self):
+        bot.render_schedule_image(self.cancelled_schedule())
+        text = rendered_text()
+        self.assertIn("ЗАНЯТИЕ ОТМЕНЕНО", text)
+        self.assertNotIn("АУД.", text)
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+
+    def test_cancellation_is_shorter_than_a_full_card(self):
+        """Отменённая карточка компактнее обычной: меньше строк — меньше блок."""
+        bot.render_schedule_image(bot.Schedule(
+            date=date(2026, 9, 11), group=bot.GROUP_NAME,
             lessons=[lesson("IV", None, "~..............", "—", "—",
                             "13:25", "14:45")],
         ))
-        normal = bot.render_schedule_image(bot.Schedule(
-            date=date(2026, 9, 10),
-            group=bot.GROUP_NAME,
+        cancelled_box = bot._LAST_RENDER["plan"]["cards"][0]["box"]
+        cancelled_size = bot._LAST_RENDER["size"]
+        bot.render_schedule_image(bot.Schedule(
+            date=date(2026, 9, 10), group=bot.GROUP_NAME,
             lessons=[lesson("IV", None, "Ин.яз в проф", "ПК103",
                             "Мурзабулатова Ф.Ф.", "13:25", "14:45")],
         ))
-        with Image.open(cancelled) as a, Image.open(normal) as b:
-            self.assertEqual(a.size, b.size)  # оба 1080×920
-            self.assertLess(self.white_card_rows(a), self.white_card_rows(b))
-
+        normal_box = bot._LAST_RENDER["plan"]["cards"][0]["box"]
+        self.assertEqual(cancelled_size, bot._LAST_RENDER["size"],
+                         "холст не должен зависеть от содержимого карточки")
+        self.assertLess(cancelled_box[3] - cancelled_box[1],
+                        normal_box[3] - normal_box[1],
+                        "отменённая карточка не компактнее обычной")
     def test_cancellation_in_change_notification_text(self):
         """Уведомление об отмене — словами, без «~..............»."""
         old = bot.Schedule(date=date(2026, 9, 11), group=bot.GROUP_NAME,
@@ -1447,95 +1698,11 @@ class TestCancelledLessonRendering(unittest.TestCase):
 
 
 class TestImageLayoutFixes(unittest.TestCase):
-    """Разметка картинки: блок «перемена» и низ картинки без подвала."""
+    """Разметка: перерыв между карточками, низ картинки, подгруппы."""
 
-    def test_schedule_image_format_is_1080x920(self):
-        """Основной формат карточки расписания — 1080×920."""
-        self.assertEqual((bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT),
-                         (1080, 920))
-        path = bot.render_schedule_image(empty_schedule(date(2026, 9, 8)))
-        with Image.open(path) as img:
-            self.assertEqual(img.size, (1080, 920))
-
-    BG = (247, 247, 250)          # S_BG
-    MUTED = (120, 128, 148)       # S_MUTED — сноска в подвале
-    GOTHIC = (221, 217, 239)      # S_GOTHIC — микро-акцент подвала
-
-    def drawn_rows(self, path, bg=None):
-        """Строки, где есть хоть один пиксель не цвета фона."""
-        bg = bg or self.BG
-        with Image.open(path) as img:
-            im = img.convert("RGB")
-            px = im.load()
-            return [
-                y for y in range(im.height)
-                if any(px[x, y] != bg
-                       for x in range(20, im.width - 20, 4))
-            ]
-
-    def note_rows(self, path, color=None):
-        """Строки сноска в подвале (по умолчанию S_MUTED), точность ±6."""
-        color = color or self.MUTED
-        with Image.open(path) as img:
-            im = img.convert("RGB")
-            px = im.load()
-            return [
-                y for y in range(im.height)
-                if any(abs(px[x, y][0] - color[0]) <= 6
-                       and abs(px[x, y][1] - color[1]) <= 6
-                       and abs(px[x, y][2] - color[2]) <= 6
-                       for x in range(60, im.width - 60, 2))
-            ]
-
-    def gothic_rows(self, path):
-        """Строки готического разделителя-арки (S_GOTHIC)."""
-        with Image.open(path) as img:
-            im = img.convert("RGB")
-            px = im.load()
-            return [
-                y for y in range(im.height)
-                if any(px[x, y] == self.GOTHIC
-                       for x in range(60, im.width - 60, 2))
-            ]
-
-    @staticmethod
-    def card_content_rows(img):
-        """Строки контента карточки в левой части (белая/строки подгрупп)."""
-        px = img.convert("RGB").load()
-        return [
-            y for y in range(150, 900)
-            if any(px[x, y] in ((255, 255, 255), (250, 250, 253))
-                   for x in range(60, 640, 4))
-        ]
-
-    def scan(self, path):
-        """Возвращает (ширина, высота, низ последней карточки, строки ниже)."""
-        with Image.open(path) as img:
-            im = img.convert("RGB")
-            width, height = im.size
-            px = im.load()
-            card_rows = [
-                y for y in range(height)
-                if any(px[x, y] == (255, 255, 255)
-                       for x in range(200, width - 200, 8))
-            ]
-        last_card = max(card_rows)
-        drawn_rows = self.drawn_rows(path)
-        below_cards = [y for y in drawn_rows if y > last_card + 12]
-        return width, height, last_card, below_cards
-
-    def subject_left_x(self, path):
-        """Левая граница тёмного текста (предмет) в карточке."""
-        with Image.open(path) as img:
-            im = img.convert("RGB")
-            width, height = im.size
-            px = im.load()
-            for x in range(width):
-                for y in range(150, height):
-                    r, g, b = px[x, y]
-                    if r < 80 and g < 80 and b < 80:
-                        return x
-        return -1
+    BG = hex_rgb(bot.S_BG)
+    MUTED = hex_rgb(bot.S_MUTED)
+    GOTHIC = hex_rgb(bot.S_GOTHIC)
 
     def make(self, break_duration="", day=None):
         item = lesson("I", None, "Химия Н и Г", "УК307", "Арнаутова А.В.",
@@ -1544,130 +1711,178 @@ class TestImageLayoutFixes(unittest.TestCase):
         return bot.Schedule(date=day or date(2026, 9, 9),
                             group=bot.GROUP_NAME, lessons=[item])
 
-    def test_nothing_below_last_card_except_study_note(self):
-        """Под последней карточкой — только курсивная сноска (её тут нет)."""
+    def drawn_rows(self, path):
+        """Строки, где есть хоть один пиксель не цвета фона."""
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            return [
+                y for y in range(im.height)
+                if any(px[x, y] != self.BG
+                       for x in range(20, im.width - 20, 4))
+            ]
+
+    @staticmethod
+    def footer_note_rows(plan):
+        """Строки сноски подвала из плана."""
+        return [op for op in plan["ops"]
+                if str(op.get("id")).startswith("footer:note")]
+
+    def rows_of(self, path, color, tol=6):
+        with Image.open(path) as img:
+            px = img.convert("RGB").load()
+            return [
+                y for y in range(img.height)
+                if any(close(px[x, y], color, tol)
+                       for x in range(60, img.width - 60, 2))
+            ]
+
+    def test_break_row_is_compact_line_between_cards(self):
+        """«перемена N мин» — отдельная тихая строка НАД карточкой пары."""
+        first = lesson("I", None, "Химия", "УК307", "Арнаутова А.В.",
+                       "08:30", "09:50")
+        first.break_duration = "30 мин"
+        schedule = bot.Schedule(date=date(2026, 9, 9), group=bot.GROUP_NAME,
+                                lessons=[
+                                    first,
+                                    lesson("II", None, "Ин.яз.", "ПК103",
+                                           "Мурзабулатова Ф.Ф.", "10:00",
+                                           "11:20"),
+                                ])
+        path = bot.render_schedule_image(schedule)
+        plan = bot._LAST_RENDER["plan"]
+        breaks = [op for op in plan["ops"] if op["op"] == "text"
+                  and "перемена" in " ".join(op["lines"]).lower()]
+        self.assertEqual(len(breaks), 1)
+        b = breaks[0]
+        first_card = plan["cards"][0]["box"]
+        second_card = plan["cards"][1]["box"]
+        # пауза объявлена у пары I -> строка между карточкой I и карточкой II
+        self.assertGreaterEqual(b["bbox"][1], first_card[3],
+                                "строка перемены залезла в свою карточку")
+        self.assertLessEqual(b["bbox"][3], second_card[1] + 1,
+                             "строка перемены залезла в следующую карточку")
+        # компактная: не больше высоты служебной строки
+        self.assertLess(b["bbox"][3] - b["bbox"][1],
+                        plan["cards"][1]["box"][3] -
+                        plan["cards"][1]["box"][1])
+        # текст перемены тихий (S_MUTED), а не основной
+        self.assertLess(b["size"], min(text_sizes("room")))
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        # рядом с текстом — тонкие разделительные линии (hairline)
+        with Image.open(path) as img:
+            px = img.convert("RGB").load()
+            bg = hex_rgb(bot.S_BG)
+            band = range(int(b["bbox"][1]) - 6, int(b["bbox"][3]) + 6)
+            hair_rows = []
+            for y in band:
+                left = [x for x in range(0, int(b["bbox"][0]) - 12)
+                        if sum(abs(px[x, y][i] - bg[i]) for i in range(3)) >= 6]
+                right = [x for x in range(int(b["bbox"][2]) + 12, img.width)
+                         if sum(abs(px[x, y][i] - bg[i]) for i in range(3)) >= 6]
+                if len(left) > 150 and len(right) > 150:
+                    hair_rows.append(y)
+        self.assertTrue(hair_rows,
+                        "вокруг текста перемены нет разделительных линий")
+
+    def test_break_line_does_not_move_room_or_subject(self):
+        """Наличие перемены не сдвигает левый край контента карточки."""
+        with_break = bot.render_schedule_image(
+            self.make("30 мин", day=date(2026, 9, 9)))
+        without_break = bot.render_schedule_image(
+            self.make("", day=date(2026, 9, 10)))
+
+        def room_left(path):
+            bot.render_schedule_image(
+                self.make("30 мин" if path == with_break else "",
+                          day=date(2026, 9, 9) if path == with_break
+                          else date(2026, 9, 10)))
+            return min(op["bbox"][0] for op in ops_with("room"))
+
+        left_with_break = room_left(with_break)
+        left_without = room_left(without_break)
+        self.assertAlmostEqual(left_with_break, left_without, delta=1.0)
+
+    def test_nothing_below_last_card_except_footer(self):
+        """Под последней карточкой — только подвал (арка + сноска)."""
         schedule = bot.parse_schedule(PROVIDED_HTML, date(2026, 9, 7))
         path = bot.render_schedule_image(schedule)
-        width, height, last_card, below_cards = self.scan(path)
-        # Подписи «ИНК · расписание» больше нет: ниже последней карточки
-        # не рисуется ничего, кроме сноски про академический час.
-        self.assertEqual(
-            set(below_cards) - set(self.note_rows(path))
-            - set(self.gothic_rows(path)), set(),
-            "под последней карточкой нарисовано что-то кроме сноски",
-        )
-        # Последний нарисованный элемент не прижат к нижнему краю.
-        self.assertGreaterEqual(height - 1 - max(self.drawn_rows(path)), 20)
-        self.assertGreaterEqual(height - 1 - last_card, 20)
-
-    def test_bottom_padding_with_summary_block(self):
-        """Блок «Что изменилось» — последний элемент, снизу есть padding."""
-        old = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
-                           lessons=[lesson("II", "1")])
-        new = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
-                           lessons=[lesson("II", "1", room="ПК305")])
-        changes = bot.compare_schedules(old, new)
-        path = bot.render_schedule_image(new, changes=changes)
-        width, height, last_card, below_cards = self.scan(path)
-        drawn = self.drawn_rows(path)
-        # Ниже карточек — только подвал (разделитель-арка; сноска
-        # не нужна: история пуста), никакой подписи.
-        self.assertEqual(
-            set(below_cards) - set(self.note_rows(path))
-            - set(self.gothic_rows(path)), set()
-        )
-        # Блок входит в высоту картинки и не обрезан снизу.
-        self.assertGreaterEqual(height - 1 - max(drawn), 20)
-
-    def test_empty_schedule_bottom_padding(self):
-        """Пустое расписание: под карточкой только подвал, padding на месте."""
-        path = bot.render_schedule_image(empty_schedule(date(2026, 9, 8)))
-        width, height, last_card, below_cards = self.scan(path)
-        self.assertEqual(
-            set(below_cards) - set(self.note_rows(path))
-            - set(self.gothic_rows(path)), set(),
-            "под карточкой пустого расписания что-то нарисовано",
-        )
-        self.assertGreaterEqual(height - 1 - max(self.drawn_rows(path)), 20)
-        self.assertGreaterEqual(height - 1 - last_card, 20)
-
-    def test_break_line_does_not_move_subject(self):
-        # Разные даты: иначе второй рендер перезапишет файл первого.
-        with_break = bot.render_schedule_image(
-            self.make("30 мин", day=date(2026, 9, 9)))
-        x_with = self.subject_left_x(with_break)
-        without_break = bot.render_schedule_image(
-            self.make("", day=date(2026, 9, 10)))
-        x_without = self.subject_left_x(without_break)
-        self.assertGreater(x_with, 0)
-        self.assertEqual(x_with, x_without)
-
-    def test_break_text_is_drawn_in_card_header(self):
-        """«Перемена N мин» — в шапке карточки, не наезжает на предмет.
-
-        Разные даты: иначе второй рендер перезапишет файл первого.
-        """
-        with_break = bot.render_schedule_image(
-            self.make("30 мин", day=date(2026, 9, 9)))
-        without_break = bot.render_schedule_image(
-            self.make("", day=date(2026, 9, 10)))
-
-        # Текст перемены прижат к правому краю карточки пары; правее
-        # карточки — колонка «Изменения», её не сканируем.
-        card_x0, card_x1 = lesson_card_span()
-        scan_x0 = (card_x0 + card_x1) // 2
-
-        def header_muted_rows(path):
-            # Точность ±6: глифы FreeType имеют пиксели частичного
-            # покрытия (±единицы в каналах относительно S_MUTED).
-            with Image.open(path) as img:
-                px = img.convert("RGB").load()
-                return [
-                    y for y in range(165, 215)
-                    if any(abs(px[x, y][0] - self.MUTED[0]) <= 6
-                           and abs(px[x, y][1] - self.MUTED[1]) <= 6
-                           and abs(px[x, y][2] - self.MUTED[2]) <= 6
-                           for x in range(scan_x0, card_x1, 2))
-                ]
-
-        self.assertTrue(
-            header_muted_rows(with_break), "текст перемены не найден"
-        )
-        self.assertEqual(header_muted_rows(without_break), [])
-
-    def test_subgroups_are_still_rendered(self):
+        rows = self.drawn_rows(path)
+        with Image.open(path) as img:
+            plan = bot._LAST_RENDER["plan"]
+            height = img.height
+            last_card_bottom = int(max(c["box"][3] for c in plan["cards"]))
+            footer_rows = (set(self.rows_of(path, self.GOTHIC))
+                           | set(self.rows_of(path, self.MUTED)))
+        below = [y for y in rows if y > last_card_bottom + 20]
+        notes = self.footer_note_rows(plan)
+        self.assertEqual(set(below) - footer_rows, set(),
+                         "под последней карточкой есть лишние элементы")
+        self.assertEqual(bool(below), bool(notes),
+                         "подвал рисуется только когда есть сноска")
+        # нижний контент не прижат к краю холста (safe area минус
+        # антиалиасинг нижних выносных элементов)
+        self.assertGreaterEqual(height - 1 - max(rows), bot.SAFE_AREA - 20)
+        self.assertGreaterEqual(height - 1 - last_card_bottom,
+                                bot.SAFE_AREA - 20)
+    def test_footer_is_bottom_anchored(self):
+        """Подвал прижат к низу, контент не залезает в него и в поля."""
+        plans = []
+        for schedule in (
+            empty_schedule(date(2026, 9, 8)),
+            bot.Schedule(date=date(2026, 9, 9), group=bot.GROUP_NAME,
+                         lessons=[lesson("I", None, "Химия", "УК307",
+                                         "Арнаутова А.В.", "08:30", "09:50")]),
+        ):
+            bot.render_schedule_image(schedule)
+            plans.append(bot._LAST_RENDER["plan"])
+        for plan in plans:
+            self.assertLessEqual(plan["content_bottom"],
+                                 plan["H"] - bot.SAFE_AREA + 1)
+            self.assertLess(plan["content_bottom"], plan["footer_top"] + 1)
+            if plan["footer_h"]:
+                # подвал прижат к низу холста, а не висит под карточками
+                self.assertGreaterEqual(
+                    plan["footer_top"],
+                    plan["H"] - bot.SAFE_AREA - plan["footer_h"] - 1)
+                self.assertLessEqual(plan["owners"]["footer"][3],
+                                     plan["H"] - bot.SAFE_AREA + 1)
+            else:
+                self.assertEqual(plan["footer_top"],
+                                 plan["H"] - bot.SAFE_AREA)
+        self.assertEqual(plans[0]["H"], plans[1]["H"],
+                         "формат дня фиксирован: пустой день не короче")
+    def test_subgroups_make_a_taller_card_not_a_second_image(self):
         schedule = bot.parse_schedule(PROVIDED_HTML, date(2026, 9, 7))
-        # Пара II с двумя подгруппами выше пары IV без подгрупп.
         pairs = {p.number: p for p in schedule.pairs}
         self.assertEqual(len(pairs["II"].lessons), 2)
         two = bot.Schedule(date=date(2026, 9, 7), group=bot.GROUP_NAME,
                            lessons=[x for x in schedule.lessons
                                     if x.pair == "II"])
-        # Другая дата: иначе рендер «one» перезапишет файл «two».
         one = bot.Schedule(date=date(2026, 9, 8), group=bot.GROUP_NAME,
                            lessons=[x for x in schedule.lessons
                                     if x.pair == "IV"])
         path_two = bot.render_schedule_image(two)
-        path_one = bot.render_schedule_image(one)
-        with Image.open(path_two) as img_two, \
-                Image.open(path_one) as img_one:
-            # Формат фиксированный; карточка с подгруппами выше:
-            # больше строк контента внутри холста.
-            self.assertEqual(img_two.size, (1080, 920))
-            self.assertEqual(img_one.size, (1080, 920))
-            self.assertGreater(self.card_content_rows(img_two),
-                               self.card_content_rows(img_one))
+        bot.render_schedule_image(one)
+        box_one = bot._LAST_RENDER["plan"]["cards"][0]["box"]
+        bot.render_schedule_image(two)
+        box_two = bot._LAST_RENDER["plan"]["cards"][0]["box"]
+        with Image.open(path_two) as img_two:
+            self.assertEqual(img_two.size,
+                             (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
+        # подгруппы — строки ВНУТРИ одной карточки, карточка выше
+        self.assertGreater(len(bot._LAST_RENDER["plan"]["specs"][0]["items"]),
+                           1)
+        self.assertGreater(box_two[3] - box_two[1], box_one[3] - box_one[1])
+        text = rendered_text()
+        self.assertIn("1 п/гр.", text)
+        self.assertIn("2 п/гр.", text)
+        # у каждой подгруппы своя аудитория
+        self.assertEqual(len(ops_with("room")), 2)
 
 
 class TestScheduleCardDesign(unittest.TestCase):
-    """Новый дизайн карточки: формат 1080×920, зоны, валидация layout."""
-
-    BG = (247, 247, 250)
-    MUTED = (120, 128, 148)
-    PURPLE = (89, 73, 216)
-    GREEN = (35, 149, 102)
-    RED = (212, 93, 101)
-    GOTHIC = (221, 217, 239)
+    """Дизайн карточки: вертикальный формат, зоны, валидация layout."""
 
     def schedule_with_subgroups(self, day=None):
         return bot.Schedule(
@@ -1684,159 +1899,139 @@ class TestScheduleCardDesign(unittest.TestCase):
             ],
         )
 
-    def test_main_format_is_1080x920(self):
+    def test_format_is_vertical_and_ratio_ladder_is_consistent(self):
         self.assertEqual((bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT),
-                         (1080, 920))
+                         (1080, 1350))
+        heights = [h for h, _ in bot.SCHEDULE_RATIO_LADDER]
+        self.assertEqual(heights[0], bot.SCHEDULE_HEIGHT)
+        self.assertEqual(heights, sorted(heights), "лестница форматов по росту")
+        self.assertTrue(all(h > bot.SCHEDULE_WIDTH for h in heights),
+                        "все форматы вертикальные")
+        self.assertLessEqual(max(heights), 1740)
         path = bot.render_schedule_image(self.schedule_with_subgroups())
         with Image.open(path) as img:
-            self.assertEqual(img.size, (1080, 920))
+            self.assertEqual(img.size, (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
+
+    def plan_problems(self):
+        return bot._LAST_RENDER["problems"]
 
     def test_layout_validation_clean(self):
         """validate_layout: нет выходов за bounds и пересечений."""
-        path = bot.render_schedule_image(self.schedule_with_subgroups())
+        bot.render_schedule_image(self.schedule_with_subgroups())
         self.assertEqual(bot._LAST_RENDER["problems"], [])
         self.assertGreater(bot._LAST_RENDER["elements"], 10)
+        self.assertTrue(bot._LAST_RENDER["truncated"] == [])
 
-    def test_render_without_changes_registers_empty_panel_with_zone(self):
-        """Регрессия: /today без изменений падал с KeyError: 'zone'.
-
-        Плашка «Изменений нет» в правой колонке регистрировалась в
-        отчёте layout без ключа zone, и validate_layout ронял весь
-        рендер. Обычный рендер (changes=None) — самый частый сценарий —
-        должен проходить валидацию без единой проблемы.
-        """
-        schedule = bot.Schedule(
-            date=date(2026, 9, 23), group=bot.GROUP_NAME,
-            lessons=[
-                lesson("II", None, "~..............", "—", "—",
-                       "10:00", "11:20"),
-                lesson("III", None, "Основы экономики", "УК303",
-                       "Кильдиярова Г.Р.", "11:35", "12:55"),
-                lesson("IV", None, "Основы экономики", "УК303",
-                       "Кильдиярова Г.Р.", "13:25", "14:45"),
-            ],
-        )
-        path = bot.render_schedule_image(schedule)  # changes=None
-        self.assertTrue(Path(path).exists())
-        self.assertEqual(bot._LAST_RENDER["problems"], [])
-        self.assertEqual(bot._LAST_RENDER["size"], (1080, 920))
-
-    def test_validate_layout_reports_missing_zone_instead_of_raising(self):
-        """Неполный элемент отчёта — проблема layout, а не исключение."""
-        W, H = bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT
-        plan = {
-            "W": W, "H": H,
-            "left": (bot.S_MARGIN, 656), "right": (716, bot.S_RIGHT_COL_W),
-            "content_bottom": 300,
-            "owners": {"header": (0, 0, W, bot.S_HEADER_BOTTOM),
-                       "footer": (0, 800, W, H),
-                       "panel": (716, 164, 1044, 284)},
-            "elements": [
-                # как регистрировалась плашка «Изменений нет» до фикса
-                {"id": "panel:empty_bg", "kind": "shape",
-                 "bbox": (716, 198, 1044, 284), "owner": "panel"},
-                {"id": "ghost", "kind": "text", "owner": "panel"},
-            ],
-        }
+    def test_validate_layout_reports_broken_plan_instead_of_raising(self):
+        """План с выбитым за карточку блоком -> список проблем, не исключение."""
+        bot.render_schedule_image(self.schedule_with_subgroups())
+        plan = dict(bot._LAST_RENDER["plan"])
+        ops = [dict(op) for op in plan["ops"]]
+        room = next(i for i, op in enumerate(ops)
+                    if op.get("role") == "room")
+        box = plan["cards"][0]["box"]
+        # уводим чип аудитории за правый край карточки
+        x0, y0, x1, y1 = ops[room]["bbox"]
+        shift = (box[2] - x0) + 30
+        ops[room]["bbox"] = (x0 + shift, y0, x1 + shift, y1)
+        plan["ops"] = ops
         problems = bot.validate_layout(plan)
-        self.assertTrue(any("panel:empty_bg" in p and "zone" in p
-                            for p in problems), problems)
-        self.assertTrue(any("ghost" in p and "bbox" in p
-                            for p in problems), problems)
+        self.assertTrue(problems, "валидатор обязан заметить выход за карточку")
+        self.assertTrue(any("card:0" in p for p in problems))
 
-    def test_long_subject_truncated_not_overflowed(self):
-        schedule = bot.Schedule(
-            date=date(2026, 9, 24), group=bot.GROUP_NAME,
-            lessons=[
-                lesson("I", None,
-                       "Очень длинное название предмета, которое точно "
-                       "не помещается в одну строку карточки целиком "
-                       "даже после уменьшения размера шрифта",
-                       "УК103", "Степанов Сергей Владимирович",
-                       "08:30", "09:50"),
-            ],
-        )
-        bot.render_schedule_image(schedule)
-        self.assertEqual(bot._LAST_RENDER["problems"], [])
-        self.assertIn(
-            "card:0:subject", bot._LAST_RENDER["truncated"],
-            "длинное название должно сокращаться ellipsis",
-        )
+    def test_every_card_is_a_separate_zone_and_cards_do_not_overlap(self):
+        bot.render_schedule_image(self.schedule_with_subgroups())
+        plan = bot._LAST_RENDER["plan"]
+        boxes = [c["box"] for c in plan["cards"]]
+        self.assertEqual(len(boxes), 3)     # I, II, III (отмена — внутри II)
+        for (ax0, ay0, ax1, ay1) in boxes:
+            self.assertGreaterEqual(ax0, bot.SAFE_AREA - 1)
+            self.assertLessEqual(ax1, plan["W"] - bot.SAFE_AREA + 1)
+            self.assertGreater(ay1, ay0)
+        for i in range(len(boxes) - 1):
+            self.assertLessEqual(boxes[i][3], boxes[i + 1][1],
+                                 "карточки пересеклись по вертикали")
+        # каждый блок карточки лежит внутри её зоны
+        for card in plan["cards"]:
+            owner = card["owner"]
+            zone = plan["owners"][owner]
+            for op in plan["ops"]:
+                if op.get("owner") != owner:
+                    continue
+                bbox = op_box(op)
+                self.assertGreaterEqual(bbox[0], zone[0] - 1)
+                self.assertGreaterEqual(bbox[1], zone[1] - 1)
+                self.assertLessEqual(bbox[2], zone[2] + 1)
+                self.assertLessEqual(bbox[3], zone[3] + 1)
 
-    def test_right_column_stays_within_bounds(self):
-        old = bot.Schedule(date=date(2026, 9, 24), group=bot.GROUP_NAME,
-                           lessons=[lesson("II", "1")])
-        new = self.schedule_with_subgroups()
-        changes = bot.compare_schedules(old, new)
-        path = bot.render_schedule_image(new, changes=changes)
-        with Image.open(path) as img:
-            px = img.convert("RGB").load()
-            # Правее правой колонки (x > 1044) — только фон.
-            dirty = [
-                (x, y) for y in range(150, 900, 2)
-                for x in range(1046, 1078, 2)
-                if px[x, y] != self.BG
-            ]
-        self.assertEqual(dirty, [])
+    def test_hierarchy_time_subject_room_teacher(self):
+        """Порядок и иерархия: время > аудитория > предмет > преподаватель."""
+        bot.render_schedule_image(self.schedule_with_subgroups())
+        plan = bot._LAST_RENDER["plan"]
+        card = plan["cards"][0]["box"]
 
-    def test_cancelled_subgroup_red_added_green(self):
-        old = bot.Schedule(date=date(2026, 9, 24), group=bot.GROUP_NAME,
-                           lessons=[
-                               lesson("I", None, "Пром безопас", "СК201",
-                                      "Гайзуллин И.Т.", "08:30", "09:50"),
-                           ])
-        new = self.schedule_with_subgroups()
-        changes = bot.compare_schedules(old, new)
-        path = bot.render_schedule_image(new, changes=changes)
-        with Image.open(path) as img:
-            px = img.convert("RGB").load()
-        def close(c, target, tol=6):
-            return (abs(c[0] - target[0]) <= tol
-                    and abs(c[1] - target[1]) <= tol
-                    and abs(c[2] - target[2]) <= tol)
+        def first_in_card(role):
+            ops = [op for op in plan["ops"] if op.get("role") == role
+                   and op["bbox"][1] >= card[1] - 1
+                   and op["bbox"][3] <= card[3] + 1]
+            self.assertTrue(ops, f"блок «{role}» не найден в карточке")
+            return min(ops, key=lambda op: op["bbox"][1])
 
-        red_rows = [
-            y for y in range(150, 900)
-            if any(close(px[x, y], self.RED) for x in range(100, 640, 2))
-        ]
-        green_rows = [
-            y for y in range(150, 900)
-            if any(close(px[x, y], self.GREEN) for x in range(100, 640, 2))
-        ]
-        self.assertTrue(red_rows, "отменённая подгруппа не красная")
-        self.assertTrue(green_rows, "добавленная подгруппа не подсвечена")
+        time_op = first_in_card("time")
+        subject_op = first_in_card("subject")
+        room_op = first_in_card("room")
+        teacher_op = first_in_card("teacher")
+        self.assertLess(time_op["bbox"][1], subject_op["bbox"][1])
+        self.assertLess(subject_op["bbox"][1], room_op["bbox"][1])
+        # преподаватель — ниже предмета: строкой под чипом либо в одной
+        # строке справа от чипа (чип из-за этого не сжимается)
+        self.assertLessEqual(room_op["bbox"][1] - teacher_op["bbox"][1],
+                             room_op["bbox"][3] - room_op["bbox"][1])
+        self.assertGreater(teacher_op["bbox"][3], subject_op["bbox"][3])
+        self.assertGreaterEqual(time_op["size"], room_op["size"])
+        self.assertGreaterEqual(room_op["size"], subject_op["size"])
+        self.assertGreater(subject_op["size"], teacher_op["size"])
+        self.assertGreaterEqual(room_op["size"], bot.ROOM_FONT_MIN)
+        # аудитория — в отдельном залитом чипе, а не мелкий текст в углу
+        chip = [op for op in plan["ops"] if op.get("kind") == "chip"
+                and op_box(op)[0] <= room_op["bbox"][0] + 1
+                and op_box(op)[2] >= room_op["bbox"][2] - 1]
+        self.assertTrue(chip, "под аудиторией нет плашки-чипа")
 
     def test_gothic_accent_present_but_subtle(self):
         path = bot.render_schedule_image(self.schedule_with_subgroups())
+        plan = bot._LAST_RENDER["plan"]
+        arch = [op for op in plan["ops"] if "arch" in str(op.get("id"))]
+        self.assertTrue(arch, "готическая арка не нарисована")
+        rows = self.rows_of(path, hex_rgb(bot.S_GOTHIC), tol=3)
+        drawn = len(self.drawn_rows(path))
+        self.assertLess(len(rows) / max(1, drawn), 0.06,
+                        "декоративный акцент занимает слишком много места")
+
+    @staticmethod
+    def drawn_rows(path):
+        with Image.open(path) as img:
+            im = img.convert("RGB")
+            px = im.load()
+            return [y for y in range(im.height)
+                    if any(px[x, y] != hex_rgb(bot.S_BG)
+                           for x in range(20, im.width - 20, 4))]
+
+    @staticmethod
+    def rows_of(path, color, tol=6):
         with Image.open(path) as img:
             px = img.convert("RGB").load()
-            header_gothic = [
-                (x, y) for y in range(0, 148)
-                for x in range(0, 1080)
-                if px[x, y] == self.GOTHIC
-            ]
-            footer_gothic = [
-                (x, y) for y in range(780, 920)
-                for x in range(0, 1080)
-                if px[x, y] == self.GOTHIC
-            ]
-        self.assertTrue(
-            header_gothic, "гоготический акцент в шапке не найден"
-        )
-        self.assertTrue(
-            footer_gothic, "гоготический акцент в подвале не найден"
-        )
-        # Акцент почти незаметный: совсем немного пикселей.
-        self.assertLess(len(header_gothic), 400)
-        self.assertLess(len(footer_gothic), 1600)
+            return [y for y in range(img.height)
+                    if any(close(px[x, y], color, tol)
+                           for x in range(60, img.width - 60, 2))]
 
 
 class TestTotalStudyBadge(DBTestCase):
-    """Бейдж «Изучено: X ч / Y ч» в шапке картинки и подсчёт минут истории."""
+    """Прогресс: «Изучено: X / Y акад. ч» в шапке и в карточках занятий."""
 
-    PURPLE = (89, 73, 216)          # S_PURPLE — шкала прогресса в шапке
-    GREEN = (35, 149, 102)           # S_GREEN
-    MUTED = (120, 128, 148)          # S_MUTED
+    PURPLE = hex_rgb(bot.S_PURPLE)          # шкала прогресса в шапке
+    GREEN_TEXT = hex_rgb(bot.S_GREEN_D)     # строка «Изучено: N акад. ч»
+    MUTED = hex_rgb(bot.S_MUTED)
 
     def setUp(self):
         super().setUp()
@@ -1849,46 +2044,25 @@ class TestTotalStudyBadge(DBTestCase):
             conn.execute("DELETE FROM lesson_history")
             conn.execute("DELETE FROM subjects")
 
-    def badge_rows(self, path, y0=100, y1=140, x0=744):
-        """Строки фиолетовой шкалы прогресса в шапке."""
-        with Image.open(path) as img:
-            im = img.convert("RGB")
-            px = im.load()
-            return [
-                y for y in range(y0, y1)
-                if any(px[x, y] == self.PURPLE
-                       for x in range(x0, im.width - 40, 2))
-            ]
+    @staticmethod
+    def ops_by_id(*ids):
+        plan = bot._LAST_RENDER["plan"]
+        return [op for op in plan["ops"] if str(op.get("id")) in ids]
 
-    def color_rows(self, path, color, y0=150):
-        """Цветовые строки в зоне карточек (ниже шапки), точность ±6."""
-        with Image.open(path) as img:
-            im = img.convert("RGB")
-            px = im.load()
-            return [
-                y for y in range(y0, im.height)
-                if any(abs(px[x, y][0] - color[0]) <= 6
-                       and abs(px[x, y][1] - color[1]) <= 6
-                       and abs(px[x, y][2] - color[2]) <= 6
-                       for x in range(100, im.width - 40))
-            ]
+    def header_progress_ops(self):
+        return self.ops_by_id("header:progress", "header:bar", "header:bar:bg")
 
-    def green_right_rows(self, path):
-        """Зелёные строки в правой части карточек (прогресс, не бейдж).
-
-        Сканируется правая половина карточки пары: бейдж аудитории
-        стоит слева, а правее карточки — колонка «Изменения».
-        """
-        card_x0, card_x1 = lesson_card_span()
-        scan_x0 = (card_x0 + card_x1) // 2
+    def card_rows_of(self, color, tol=6):
+        """Строки с этим цветом в зоне карточек (ниже шапки)."""
+        path = bot._LAST_RENDER["path"]
+        plan = bot._LAST_RENDER["plan"]
+        top = int(max(plan["owners"]["header"][3], plan["content_top"])) - 10
         with Image.open(path) as img:
             px = img.convert("RGB").load()
             return [
-                y for y in range(150, 600)
-                if any(abs(px[x, y][0] - self.GREEN[0]) <= 6
-                       and abs(px[x, y][1] - self.GREEN[1]) <= 6
-                       and abs(px[x, y][2] - self.GREEN[2]) <= 6
-                       for x in range(scan_x0, card_x1, 2))
+                y for y in range(top, img.height)
+                if any(close(px[x, y], color, tol)
+                       for x in range(80, img.width - 80, 2))
             ]
 
     def color_clusters(self, rows):
@@ -1900,6 +2074,14 @@ class TestTotalStudyBadge(DBTestCase):
                 clusters[-1].append(row)
         return clusters
 
+    def progress_lines(self):
+        """Строки прогресса внутри карточек (роль small)."""
+        plan = bot._LAST_RENDER["plan"]
+        return [op for op in plan["ops"] if op["op"] == "text"
+                and op.get("role") == "small"
+                and "Изучено" in " ".join(op["lines"])]
+
+    # --- прогресс в карточках ---
     def test_subject_progress_shown_on_group_image(self):
         bot.record_completed_lesson(
             bot.GROUP_NAME, date(2026, 9, 1), "I", "08:30", "09:50",
@@ -1907,26 +2089,37 @@ class TestTotalStudyBadge(DBTestCase):
         )
         schedule = bot.Schedule(
             date=date(2026, 9, 7), group=bot.GROUP_NAME,
-            lessons=[lesson("I", None, "Математика")],
+            lessons=[lesson("I", None, "Математика", "УК307",
+                            "Иванова А.А.", "08:30", "09:50")],
         )
-        path = bot.render_schedule_image(schedule)
-        # «Изучено: 4 акад. ч» — зелёным, справа в карточке (зелёный
-        # бейдж аудитории слева не попадает в зону проверки).
-        self.assertTrue(
-            self.green_right_rows(path), "зелёный прогресс справа не найден"
-        )
+        bot.render_schedule_image(schedule)
+        lines = self.progress_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("4 акад. ч", " ".join(lines[0]["lines"]))
+        # зелёным, и внутри карточки, а не где-то сбоку
+        self.assertEqual(lines[0]["fill"], bot.S_GREEN_D)
+        card = bot._LAST_RENDER["plan"]["cards"][0]["box"]
+        self.assertLessEqual(lines[0]["bbox"][0], card[2])
+        self.assertLessEqual(lines[0]["bbox"][2], card[2])
+        # аудитория всё равно крупнее строки прогресса
+        self.assertGreater(min(text_sizes("room")), lines[0]["size"])
+        self.assertTrue(self.card_rows_of(self.GREEN_TEXT),
+                        "зелёная строка прогресса не нарисована")
 
     def test_subject_progress_without_history_is_muted_first_lesson(self):
         schedule = bot.Schedule(
             date=date(2026, 9, 7), group=bot.GROUP_NAME,
-            lessons=[lesson("I", None, "Новый предмет")],
+            lessons=[lesson("I", None, "Новый предмет", "УК307",
+                            "Иванова А.А.", "08:30", "09:50")],
         )
         path = bot.render_schedule_image(schedule)
-        self.assertTrue(self.color_rows(path, self.MUTED))
-        self.assertEqual(
-            bot.get_subject_progress("Новый предмет"),
-            "Первое занятие по предмету",
-        )
+        self.assertIn("Первое занятие по предмету", rendered_text())
+        self.assertEqual(bot.get_subject_progress("Новый предмет"),
+                         "Первое занятие по предмету")
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        with Image.open(path) as img:
+            self.assertEqual(img.size,
+                             (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
 
     def test_subject_progress_is_absent_on_staff_image(self):
         bot.record_completed_lesson(
@@ -1937,29 +2130,41 @@ class TestTotalStudyBadge(DBTestCase):
             date=date(2026, 9, 8), group="Степанов Сергей Владимирович",
             schedule_type="staff", staff_id=321,
             staff_name="Степанов Сергей Владимирович",
-            lessons=[lesson("I", None, "Математика")],
+            lessons=[lesson("I", None, "Математика", "УК307",
+                            "Степанов С.В.", "08:30", "09:50")],
         )
-        path = bot.render_schedule_image(staff)
-        self.assertEqual(self.green_right_rows(path), [])
+        bot.render_schedule_image(staff)
+        self.assertEqual(self.progress_lines(), [])
+        self.assertEqual(self.header_progress_ops(), [])
 
-    def test_progress_does_not_reduce_card_height(self):
-        without_history = bot.Schedule(
-            date=date(2026, 9, 7), group=bot.GROUP_NAME,
-            lessons=[lesson("I", None, "Предмет без истории")],
-        )
-        with_history = bot.Schedule(
-            date=date(2026, 9, 8), group=bot.GROUP_NAME,
-            lessons=[lesson("I", None, "Математика")],
-        )
+    def test_progress_does_not_shrink_the_room(self):
+        """Строка прогресса не съедает место аудитории: чип не меньше пола."""
+        def one(day):
+            return bot.Schedule(
+                date=day, group=bot.GROUP_NAME,
+                lessons=[lesson("I", None, "Математика", "УК307",
+                                "Иванова Анна Сергеевна", "08:30", "09:50")])
+
+        bot.render_schedule_image(one(date(2026, 9, 7)))
+        plan_without = bot._LAST_RENDER["plan"]
+        self.assertEqual(self.progress_lines(), [])
         bot.record_completed_lesson(
             bot.GROUP_NAME, date(2026, 9, 1), "I", "08:30", "09:50",
             "Математика", duration=80,
         )
-        without_path = bot.render_schedule_image(without_history)
-        with_path = bot.render_schedule_image(with_history)
-        with Image.open(without_path) as without_img, \
-                Image.open(with_path) as with_img:
-            self.assertGreaterEqual(with_img.size[1], without_img.size[1])
+        bot.render_schedule_image(one(date(2026, 9, 8)))
+        plan_with = bot._LAST_RENDER["plan"]
+        self.assertTrue(self.progress_lines())
+        for plan in (plan_without, plan_with):
+            for op in plan["ops"]:
+                if op.get("role") == "room":
+                    self.assertGreaterEqual(op["size"], bot.ROOM_FONT_MIN)
+            self.assertEqual(bot.validate_layout(plan), [])
+        # карточка с прогрессом не стала теснее
+        self.assertGreaterEqual(
+            plan_with["cards"][0]["box"][3] - plan_with["cards"][0]["box"][1],
+            plan_without["cards"][0]["box"][3] -
+            plan_without["cards"][0]["box"][1] - 1)
 
     def test_progress_is_rendered_for_each_subgroup_and_pair(self):
         bot.record_completed_lesson(
@@ -1969,16 +2174,19 @@ class TestTotalStudyBadge(DBTestCase):
         schedule = bot.Schedule(
             date=date(2026, 9, 7), group=bot.GROUP_NAME,
             lessons=[
-                lesson("I", "1", "Информатика"),
-                lesson("I", "2", "Информатика", room="ПК303"),
-                lesson("II", None, "Информатика"),
+                lesson("I", "1", "Информатика", "УК307", "Иванова А.А.",
+                       "08:30", "09:50"),
+                lesson("I", "2", "Информатика", "ПК303", "Петров П.П.",
+                       "08:30", "09:50"),
+                lesson("II", None, "Информатика", "УК307", "Иванова А.А.",
+                       "10:00", "11:20"),
             ],
         )
-        path = bot.render_schedule_image(schedule)
-        # У каждого из трёх блоков есть отдельная зелёная строка прогресса.
-        self.assertGreaterEqual(
-            len(self.color_clusters(self.color_rows(path, self.GREEN))), 3
-        )
+        bot.render_schedule_image(schedule)
+        # У каждого из трёх блоков своя строка прогресса и своя аудитория
+        self.assertGreaterEqual(len(self.progress_lines()), 2)
+        self.assertEqual(len(ops_with("room")), 3)
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
 
     def test_total_minutes_sums_only_main_group(self):
         bot.record_completed_lesson(
@@ -1997,6 +2205,7 @@ class TestTotalStudyBadge(DBTestCase):
         self.assertEqual(bot.load_total_study_minutes(), 175)
         self.assertEqual(bot.format_duration(175), "2 ч 55 мин")
 
+    # --- бейдж шапки ---
     def test_badge_shown_on_group_image(self):
         bot.record_completed_lesson(
             bot.GROUP_NAME, date(2026, 9, 1), "I", "08:30", "09:50",
@@ -2008,10 +2217,29 @@ class TestTotalStudyBadge(DBTestCase):
                             "Арнаутова А.В.", "08:30", "09:50")],
         )
         path = bot.render_schedule_image(schedule)
-        rows = self.badge_rows(path)
-        self.assertTrue(rows, "бейдж суммарного времени не найден в шапке")
-        # Бейдж лежит внутри белой шапки, не выходит за неё.
-        self.assertLess(rows[-1], 250)
+        ops = self.header_progress_ops()
+        self.assertIn("header:progress", [str(op["id"]) for op in ops])
+        self.assertIn("header:bar", [str(op["id"]) for op in ops])
+        plan = bot._LAST_RENDER["plan"]
+        badge = next(op for op in ops if op["id"] == "header:progress")
+        self.assertIn("Изучено", " ".join(badge["lines"]))
+        zone = plan["owners"]["header"]
+        for op in ops:
+            box = op_box(op)
+            self.assertGreaterEqual(box[0], zone[0])
+            self.assertLessEqual(box[2], zone[2])
+            self.assertLessEqual(box[3], zone[3])
+            # в safe area
+            self.assertLessEqual(box[2], plan["W"] - bot.SAFE_AREA + 1)
+        # бейдж в шапке, а не наехал на карточки
+        self.assertLess(badge["bbox"][3], plan["content_top"])
+        with Image.open(path) as img:
+            bar = next(op for op in ops if op["id"] == "header:bar")
+            y = int((op_box(bar)[1] + op_box(bar)[3]) / 2)
+            x = int((op_box(bar)[0] + op_box(bar)[2]) / 2)
+            px = img.convert("RGB").load()
+            self.assertTrue(close(px[x, y], self.PURPLE, 24),
+                            "шкала прогресса не нарисована")
 
     def test_no_badge_without_history(self):
         schedule = bot.Schedule(
@@ -2019,8 +2247,10 @@ class TestTotalStudyBadge(DBTestCase):
             lessons=[lesson("I", None, "Химия Н и Г", "УК307",
                             "Арнаутова А.В.", "08:30", "09:50")],
         )
-        path = bot.render_schedule_image(schedule)
-        self.assertEqual(self.badge_rows(path), [])
+        bot.render_schedule_image(schedule)
+        self.assertEqual(self.header_progress_ops(), [])
+        # счётчик занятий при этом остаётся
+        self.assertIn("1", rendered_text())
 
     def test_no_badge_on_staff_image(self):
         # История копится только для основной группы; на staff-картинке
@@ -2035,8 +2265,9 @@ class TestTotalStudyBadge(DBTestCase):
             staff_name="Степанов Сергей Владимирович",
             lessons=[lesson("I", None, "Математика", "УК307", "—")],
         )
-        path = bot.render_schedule_image(staff)
-        self.assertEqual(self.badge_rows(path), [])
+        bot.render_schedule_image(staff)
+        self.assertEqual(self.header_progress_ops(), [])
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
 
 
 class StudyDBTestCase(DBTestCase):
@@ -2474,105 +2705,81 @@ class TestAcademicHours(StudyDBTestCase):
             bot.get_subject_progress("НГПО"), "Изучено: 4 акад. ч"
         )
 
+    def footer_note_ops(self):
+        """Строки сноски подвала из последнего рендера."""
+        plan = bot._LAST_RENDER["plan"]
+        return [op for op in plan["ops"]
+                if str(op.get("id")).startswith("footer:note")]
+
     def test_note_rendered_on_schedule_image(self):
-        """Серая курсивная сноска — последний элемент под карточками."""
+        """Серая сноска — последний элемент под карточками, по центру."""
         bot.record_completed_lesson(
             bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
             "НГПО", duration=320,
         )
         schedule = bot.Schedule(
             date=date(2026, 9, 7), group=bot.GROUP_NAME,
-            lessons=[lesson("I", None, "НГПО", "ПК217", "Степанов С.В.")],
+            lessons=[lesson("I", None, "НГПО", "ПК217", "Степанов С.В.",
+                            "08:30", "09:50")],
         )
         path = bot.render_schedule_image(schedule)
+        notes = self.footer_note_ops()
+        self.assertGreaterEqual(len(notes), 2)
+        self.assertIn("40 мин", " ".join(notes[0]["lines"]))
+        plan = bot._LAST_RENDER["plan"]
+        last_card = max(c["box"][3] for c in plan["cards"])
+        for op in notes:
+            self.assertGreater(op["bbox"][1], last_card,
+                               "сноска наехалa на карточки")
+            self.assertLessEqual(op["bbox"][3], plan["H"] - bot.SAFE_AREA + 1)
+            self.assertGreaterEqual(op["bbox"][0], bot.SAFE_AREA - 1)
+            self.assertLessEqual(op["bbox"][2], plan["W"] - bot.SAFE_AREA + 1)
+            self.assertEqual(op["fill"], bot.S_MUTED)
         with Image.open(path) as img:
-            im = img.convert("RGB")
-            px = im.load()
-            card_rows = [
-                y for y in range(im.height)
-                if any(px[x, y] == (255, 255, 255)
-                       for x in range(150, im.width - 150, 6))
-            ]
-            last_card = max(card_rows)
-            muted = [
-                y for y in range(last_card + 6, im.height)
-                if any(px[x, y] == (120, 128, 148)
-                       for x in range(60, im.width - 60, 2))
-            ]
-        self.assertTrue(muted, "сноска про академический час не найдена")
-        clusters = []
-        for y in muted:
-            if not clusters or y > clusters[-1][-1] + 4:
-                clusters.append([y])
-            else:
-                clusters[-1].append(y)
-        # Две строки: пояснение + обыкновенное время.
-        self.assertGreaterEqual(len(clusters), 2)
+            px = img.convert("RGB").load()
+            y = int(notes[0]["bbox"][1] + 1)
+            self.assertTrue(any(close(px[x, y], hex_rgb(bot.S_MUTED), 6)
+                               for x in range(60, img.width - 60, 2)),
+                            "сноска про академический час не найдена")
 
     def test_note_appears_in_footer_with_history(self):
         """Сноска появляется в подвале только при наличии истории.
 
-        Формат картинки фиксированный (1080×920): история не меняет
-        высоту холста, а добавляет сноску в подвал.
+        Формат картинки фиксированный: история не меняет высоту холста,
+        а добавляет сноску в подвал.
         """
+        lessons = [
+            lesson("I", None, "НГПО", "ПК217", "Степанов С.В.",
+                   "08:30", "09:50"),
+            lesson("II", None, "Физ-ра", "бол зал 2", "Кинзябаев А.И.",
+                   "10:00", "11:20"),
+        ]
         bot.record_completed_lesson(
             bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
             "НГПО", duration=320,
         )
-        lessons = [
-            lesson("I", None, "НГПО", "ПК217", "Степанов С.В."),
-            lesson("II", None, "Физ-ра", "бол зал 2", "Кинзябаев А.И.",
-                   "10:00", "11:20"),
-        ]
-        with_history = bot.render_schedule_image(bot.Schedule(
-            date=date(2026, 9, 7), group=bot.GROUP_NAME, lessons=lessons))
-        # Убираем историю — второй рендер без бейджа и сноски.
+        bot.render_schedule_image(bot.Schedule(date=date(2026, 9, 7),
+                                              group=bot.GROUP_NAME,
+                                              lessons=lessons))
+        plan_history = bot._LAST_RENDER["plan"]
         with bot.db_connect() as conn:
             conn.execute("DELETE FROM lesson_history")
-        without_history = bot.render_schedule_image(bot.Schedule(
-            date=date(2026, 9, 8), group=bot.GROUP_NAME, lessons=lessons))
+        bot.render_schedule_image(bot.Schedule(date=date(2026, 9, 8),
+                                              group=bot.GROUP_NAME,
+                                              lessons=lessons))
+        plan_empty = bot._LAST_RENDER["plan"]
 
-        def footer_note_rows(img):
-            px = img.convert("RGB").load()
-            card_rows = [
-                y for y in range(img.size[1])
-                if any(px[x, y] == (255, 255, 255)
-                       for x in range(150, img.size[0] - 150, 6))
-            ]
-            last_card = max(card_rows)
-            return [
-                y for y in range(last_card + 6, img.size[1])
-                if any(abs(px[x, y][0] - 120) <= 6
-                       and abs(px[x, y][1] - 128) <= 6
-                       and abs(px[x, y][2] - 148) <= 6
-                       for x in range(60, img.size[0] - 60, 2))
-            ]
-
-        with Image.open(with_history) as a, \
-                Image.open(without_history) as b:
-            self.assertEqual(a.size, (1080, 920))
-            self.assertEqual(b.size, (1080, 920))
-            self.assertTrue(footer_note_rows(a), "сноска с историей не найдена")
-            self.assertEqual(
-                footer_note_rows(b), [],
-                "сноска без истории не должна отображаться",
-            )
-            # Обе карточки (пары) остались вертикальным списком.
-            for img in (a, b):
-                px = img.convert("RGB").load()
-                card_rows = [
-                    y for y in range(150, img.size[1])
-                    if any(px[x, y] == (255, 255, 255)
-                           for x in range(150, img.size[0] - 150, 6))
-                ]
-                clusters = []
-                for y in card_rows:
-                    if not clusters or y > clusters[-1][-1] + 12:
-                        clusters.append([y])
-                    else:
-                        clusters[-1].append(y)
-                # Две карточки пар — вертикальный список.
-                self.assertGreaterEqual(len(clusters), 2)
+        self.assertEqual(plan_history["H"], plan_empty["H"])
+        self.assertGreaterEqual(len(self.footer_note_ops()), 0)
+        self.assertEqual(self.footer_note_ops(), [],
+                        "сноска без истории не должна отображаться")
+        self.assertEqual(len(plan_history["cards"]), 2)
+        self.assertEqual(len(plan_empty["cards"]), 2)
+        self.assertEqual(bot.validate_layout(plan_history), [])
+        self.assertEqual(bot.validate_layout(plan_empty), [])
+        # карточки — вертикальный список: вторая начинается ниже первой
+        boxes = [c["box"] for c in plan_empty["cards"]]
+        self.assertLessEqual(boxes[0][3], boxes[1][1])
 
     def test_note_absent_on_staff_image(self):
         bot.record_completed_lesson(
@@ -2585,22 +2792,9 @@ class TestAcademicHours(StudyDBTestCase):
             staff_name="Степанов Сергей Владимирович",
             lessons=[lesson("I", None, "НГПО", "ПК217", "—")],
         )
-        path = bot.render_schedule_image(staff)
-        with Image.open(path) as img:
-            im = img.convert("RGB")
-            px = im.load()
-            card_rows = [
-                y for y in range(im.height)
-                if any(px[x, y] == (255, 255, 255)
-                       for x in range(150, im.width - 150, 6))
-            ]
-            last_card = max(card_rows)
-            muted = [
-                y for y in range(last_card + 6, im.height)
-                if any(px[x, y] == (120, 128, 148)
-                       for x in range(60, im.width - 60, 2))
-            ]
-        self.assertEqual(muted, [])
+        bot.render_schedule_image(staff)
+        self.assertEqual(self.footer_note_ops(), [])
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
 
 
 class TestFooterSignatureRemoved(StudyDBTestCase):
@@ -2611,8 +2805,8 @@ class TestFooterSignatureRemoved(StudyDBTestCase):
     """
 
     FOOTER_GRAY = (152, 161, 176)   # бывший COL_FOOTER («#98A1B0»)
-    MUTED = (120, 128, 148)         # S_MUTED — сноска в подвале
-    BG = (247, 247, 250)            # S_BG (картинка расписания)
+    MUTED = hex_rgb(bot.S_MUTED)    # сноска в подвале
+    BG = hex_rgb(bot.S_BG)          # фон картинки расписания
     STATUS_BG = (243, 245, 250)     # COL_BG (картинка /status)
 
     def setUp(self):
@@ -2669,7 +2863,8 @@ class TestFooterSignatureRemoved(StudyDBTestCase):
     def test_schedule_image_has_no_footer_signature(self):
         schedule = bot.Schedule(
             date=date(2026, 9, 7), group=bot.GROUP_NAME,
-            lessons=[lesson("I", None, "НГПО", "ПК217", "Степанов С.В.")],
+            lessons=[lesson("I", None, "НГПО", "ПК217", "Степанов С.В.",
+                            "08:30", "09:50")],
         )
         path = bot.render_schedule_image(schedule)
         self.assertEqual(
@@ -2680,11 +2875,26 @@ class TestFooterSignatureRemoved(StudyDBTestCase):
         # нарисованным элементом: снизу остаётся нижний padding.
         note = self.note_rows(path)
         self.assertTrue(note, "сноска про академический час исчезла")
-        self.assertEqual(max(self.drawn_rows(path)), max(note))
+        # нижняя строка сноски = последний нарисованный ряд (±2 пикселя
+        # на антиалиасинг скруглённых вниз штрихов)
+        self.assertLessEqual(max(self.drawn_rows(path)) - max(note), 3,
+                             "под сноской нарисовано что-то ещё")
+        self.assertGreaterEqual(max(note) - min(note), 1)
         with Image.open(path) as img:
-            height = img.height
-        self.assertGreaterEqual(height - 1 - max(note), 20)
-        self.assertLessEqual(height - 1 - max(note), 60)
+            height, width = img.height, img.width
+        self.assertGreaterEqual(height - 1 - max(note), bot.SAFE_AREA - 10,
+                                "сноска прижата к нижнему краю")
+        self.assertLessEqual(height - 1 - max(note), bot.SAFE_AREA + 12)
+        # сноска отцентрована и не выходит в боковые поля
+        notes = [op for op in bot._LAST_RENDER["plan"]["ops"]
+                 if str(op.get("id")).startswith("footer:note")]
+        self.assertTrue(notes)
+        for op in notes:
+            self.assertGreaterEqual(op["bbox"][0], bot.SAFE_AREA - 1)
+            self.assertLessEqual(op["bbox"][2], width - bot.SAFE_AREA + 1)
+            self.assertLess(abs((op["bbox"][0] + op["bbox"][2]) / 2 - width / 2),
+                            40, "сноска не отцентрована")
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
 
     def test_status_image_has_no_footer_signature(self):
         path = bot.render_status_image(chat_id=987654)
