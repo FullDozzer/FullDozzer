@@ -1303,43 +1303,56 @@ class TestPillowRendering(unittest.TestCase):
             self.assertEqual(bot._LAST_RENDER["problems"], [])
             self.assertGreater(bot._LAST_RENDER["elements"], 10)
 
-    # --- аудитория: зелёная плашка, аккуратная, но заметная ---
+    # --- аудитория: лавандовая колонка, код комнаты крупно ---
     def test_room_is_rendered_as_a_green_panel(self):
         path = bot.render_schedule_image(self.four_pairs())
         plan = bot._LAST_RENDER["plan"]
         panels = [op for op in plan["ops"] if op.get("kind") == "panel"
-                  and op.get("fill") == bot.S_GREEN_L]
-        self.assertEqual(len(panels), 4, "нет зелёных плашек аудиторий")
+                  and op.get("fill") == bot.S_ROOM_BG]
+        self.assertEqual(len(panels), 4, "нет лавандовых колонок аудиторий")
+        # колонка одной ширины и одного правого края — её можно сканировать
+        rights = {round(p["box"][2], 1) for p in panels}
+        widths = {round(p["box"][2] - p["box"][0], 1) for p in panels}
+        self.assertEqual(len(rights), 1, "правый край аудиторий не совпал")
+        self.assertEqual(len(widths), 1, "ширина колонки аудитории плавает")
         rooms = ops_with("room")
         room_sizes = text_sizes("room")
         self.assertEqual(len(room_sizes), 4)
+        labels = ops_with("room_label")
+        self.assertEqual(len(labels), 4)
+        for op in labels:
+            self.assertEqual(op["lines"], ["Ауд."])
         for op in rooms:
-            self.assertIn("Ауд.", op["lines"][0])
+            self.assertNotIn("Ауд.", op["lines"][0])
             box = op["bbox"]
             self.assertTrue(
                 any(p["box"][0] <= box[0] + 1 and p["box"][2] >= box[2] - 1
                     and p["box"][1] <= box[1] + 1 and p["box"][3] >= box[3] - 1
                     for p in panels),
-                "аудитория нарисована вне зелёной плашки",
+                "код аудитории нарисован вне лавандовой колонки",
             )
-        # аудитория заметнее преподавателя…
-        self.assertGreaterEqual(min(room_sizes), max(text_sizes("teacher")))
-        if ops_with("hours"):
-            self.assertGreater(min(text_sizes("hours")),
-                               max(text_sizes("teacher")))
-        # …но не «кричат»: кегль в одном диапазоне с предметом
-        self.assertLessEqual(max(room_sizes), max(text_sizes("subject")) + 1)
+            self.assertEqual(op["weight"], "bold")
+            self.assertEqual(op["fill"], bot.S_INK)
+        # код комнаты заметнее преподавателя и не мельче предмета
+        self.assertGreater(min(room_sizes), max(text_sizes("teacher")))
+        self.assertGreaterEqual(min(room_sizes), max(text_sizes("subject")))
         self.assertGreaterEqual(min(room_sizes), bot.ROOM_FONT_MIN)
         for op in ops_with("hours"):
-            self.assertEqual(op["fill"], bot.S_GREEN_D)
+            self.assertEqual(op["fill"], bot.S_MUTED)
+            self.assertLess(op["size"], min(room_sizes))
+        # иконки — настоящие Lucide SVG, не рукописные полигоны
+        icons = [op for op in plan["ops"] if op.get("op") == "icon"]
+        self.assertTrue(icons, "нет векторных иконок")
+        self.assertTrue(all(op["name"] in bot.schedule_icons.ICON_FILES
+                            for op in icons))
+        self.assertTrue((bot.schedule_icons.ICON_DIR / "calendar.svg").exists())
         with Image.open(path) as img:
             px = img.convert("RGB").load()
-            # зелёная плашка аудитории реально нарисована
-            green = hex_rgb(bot.S_GREEN_L)
+            room_bg = hex_rgb(bot.S_ROOM_BG)
             self.assertTrue(any(
-                close(px[x, y], green, 5)
+                close(px[x, y], room_bg, 5)
                 for y in range(0, img.height, 3) for x in range(0, img.width, 3)
-            ), "зелёная плашка аудитории не найдена")
+            ), "лавандовая колонка аудитории не найдена")
 
     def test_room_font_never_drops_below_floor_with_many_lessons(self):
         """Много занятий — компактнее всё, КРОМЕ аудитории и её часов."""
@@ -1352,8 +1365,8 @@ class TestPillowRendering(unittest.TestCase):
                          lessons=lessons))
         plan = bot._LAST_RENDER["plan"]
         self.assertEqual(bot._LAST_RENDER["problems"], [])
-        self.assertLessEqual(plan["scale"], 0.80,
-                             "плотный день должен уплотниться")
+        self.assertLess(plan["scale"], bot.S_SCALE_MAX,
+                        "плотный день должен уплотниться")
         for op in ops_with("room"):
             self.assertGreaterEqual(op["size"], bot.ROOM_FONT_MIN)
         # второстепенные строки не крупнее аудитории — но и не «в пол»
@@ -1383,7 +1396,8 @@ class TestPillowRendering(unittest.TestCase):
         text = rendered_text()
         # и старая, и новая аудитория — внутри карточки
         self.assertIn("Аудитория: УК105 → УК103", text)
-        self.assertIn("Ауд. УК103", text)
+        self.assertIn("Ауд.", text)
+        self.assertIn("УК103", text)
         self.assertIn("ИЗМЕНЕНО", text)
         # колонки «Изменения» больше нет ни в layout, ни на картинке
         plan = bot._LAST_RENDER["plan"]
@@ -1416,7 +1430,8 @@ class TestPillowRendering(unittest.TestCase):
         bot.render_schedule_image(schedule, changes=changes)
         text = rendered_text()
         self.assertIn("Занятие отменено", text)
-        self.assertIn("Ауд. УК307", text)   # аудиторию не выбрасываем
+        self.assertIn("Ауд.", text)
+        self.assertIn("УК307", text)   # аудиторию не выбрасываем
         plan = bot._LAST_RENDER["plan"]
         self.assertEqual(len(plan["cards"]), 2)
         cancelled = plan["specs"][1]
@@ -1611,16 +1626,14 @@ class TestLessonCount(unittest.TestCase):
 class TestCancelledLessonRendering(unittest.TestCase):
     """Отмена занятия («~..............») на картинке расписания.
 
-    Отменённая пара — обычная карточка в той же колонке: мягкая розовая
-    плашка внутри карточки, пилюля «Занятие отменено», красный бейдж
-    «ОТМЕНА»; аудитория остаётся, если она есть в данных.
+    Отменённая пара — та же белая карточка: маленькая пилюля
+    «Занятие отменено» рядом со временем, тонкий красный акцент.
+    Красного блока и бейджа «ОТМЕНА» нет. Аудитория остаётся.
     """
 
-    RED = hex_rgb(bot.S_RED)          # бейдж «ОТМЕНА»
-    RED_BG = hex_rgb(bot.S_RED_L)     # фон отменённой карточки
-    GREEN_TEXT = hex_rgb(bot.S_GREEN_D)
-    GREEN_MUTED = hex_rgb(bot.S_GREEN_M)
-    GREEN_BG = hex_rgb(bot.S_GREEN_L)
+    RED = hex_rgb(bot.S_RED)
+    RED_PILL = hex_rgb(bot.S_RED_PILL)
+    ROOM_BG = hex_rgb(bot.S_ROOM_BG)
 
     def cancelled_schedule(self, room="—"):
         return bot.Schedule(
@@ -1635,39 +1648,44 @@ class TestCancelledLessonRendering(unittest.TestCase):
     def test_cancelled_card_is_red_and_has_no_right_panel(self):
         path = bot.render_schedule_image(self.cancelled_schedule())
         plan = bot._LAST_RENDER["plan"]
-        # мягкая розовая плашка отмены внутри карточки
-        pink = [op for op in plan["ops"] if op.get("kind") == "panel"
-                and op.get("fill") == bot.S_RED_L]
-        self.assertTrue(pink, "нет розовой плашки отмены")
+        card = plan["cards"][0]
+        box = card["box"]
+        # карточка остаётся белой — без розового блока на всю ширину
+        self.assertEqual(
+            next(op for op in plan["ops"] if op.get("id") == card["owner"] + ":bg")["fill"],
+            bot.S_CARD,
+        )
+        wide_pink = [op for op in plan["ops"] if op.get("kind") == "panel"
+                     and op.get("fill") in (bot.S_RED_L, bot.S_RED_PILL)
+                     and (op["box"][2] - op["box"][0]) > (box[2] - box[0]) * 0.6]
+        self.assertFalse(wide_pink, "отмена снова рисуется красным блоком")
+        pill = [op for op in plan["ops"] if op["op"] == "text"
+                and "Занятие отменено" in " ".join(op["lines"])]
+        self.assertEqual(len(pill), 1)
+        self.assertEqual(pill[0]["fill"], bot.S_RED_D)
+        time_ops = [op for op in plan["ops"] if op.get("role") == "time"
+                    and op.get("owner") == card["owner"]]
+        self.assertTrue(time_ops)
+        # пилюля рядом со временем, внутри карточки, и сама небольшая
+        self.assertLess(abs(pill[0]["bbox"][1] - time_ops[0]["bbox"][1]), 40)
+        self.assertLess(pill[0]["bbox"][2] - pill[0]["bbox"][0],
+                        (box[2] - box[0]) * 0.45)
+        self.assertTrue(box[0] <= pill[0]["bbox"][0]
+                        and pill[0]["bbox"][2] <= box[2])
+        accent = [op for op in plan["ops"] if str(op.get("id")).endswith(":accent")]
+        self.assertTrue(accent, "нет тонкого красного акцента отмены")
+        self.assertLess(accent[0]["box"][2] - accent[0]["box"][0], 8)
+        chip = next(op for op in plan["ops"] if op.get("kind") == "chip"
+                    and op.get("fill") == bot.S_RED_PILL)
         with Image.open(path) as img:
-            box = tuple(int(v) for v in plan["cards"][0]["box"])
-            panel_box = tuple(int(v) for v in pink[0]["box"])
             px = img.convert("RGB").load()
+            mid_y = int((chip["box"][1] + chip["box"][3]) / 2)
             self.assertTrue(any(
-                close(px[x, panel_box[1] + 3], self.RED_BG, 6)
-                for x in range(panel_box[0] + 20, panel_box[2] - 20, 7)
-            ), "плашка отмены не красно-розовая")
-            self.assertTrue(panel_box[0] >= box[0] and panel_box[2] <= box[2],
-                            "плашка отмены вышла за карточку")
-            # пилюля «Занятие отменено» — внутри карточки, красным текстом
-            pill = [op for op in plan["ops"] if op["op"] == "text"
-                    and "Занятие отменено" in " ".join(op["lines"])]
-            self.assertEqual(len(pill), 1)
-            self.assertEqual(pill[0]["fill"], bot.S_RED_D)
-            self.assertTrue(box[0] <= pill[0]["bbox"][0]
-                            and pill[0]["bbox"][2] <= box[2],
-                            "пилюля отмены вышла за карточку")
-            # красный бейдж «ОТМЕНА» справа
-            badge = [op for op in plan["ops"] if op.get("kind") == "chip"
-                     and op.get("fill") == bot.S_RED]
-            self.assertTrue(badge, "нет красного бейджа ОТМЕНА")
-            badge_op = badge[0]
-            self.assertTrue(any(
-                close(px[x, int((badge_op["box"][1] + badge_op["box"][3]) / 2)],
-                      self.RED, 8)
-                for x in range(int(badge_op["box"][0]),
-                               int(badge_op["box"][2]), 5)
-            ), "бейдж ОТМЕНА не нарисован красным")
+                close(px[x, mid_y], self.RED_PILL, 8)
+                for x in range(int(chip["box"][0]) + 2,
+                               int(chip["box"][2]) - 2, 3)
+            ), "пилюля отмены не нарисована")
+        self.assertNotIn("ОТМЕНА", rendered_text())
         self.assertNotIn("panel", plan["owners"])
 
     def test_cancelled_card_keeps_room_when_data_has_a_room(self):
@@ -1675,22 +1693,23 @@ class TestCancelledLessonRendering(unittest.TestCase):
         path = bot.render_schedule_image(self.cancelled_schedule(room="УК307"))
         text = rendered_text()
         self.assertIn("Занятие отменено", text)
-        self.assertIn("Ауд. УК307", text)
+        self.assertIn("Ауд.", text)
+        self.assertIn("УК307", text)
         rooms = ops_with("room")
         self.assertEqual(len(rooms), 1)
         self.assertGreaterEqual(rooms[0]["size"], bot.ROOM_FONT_MIN)
+        self.assertEqual(rooms[0]["fill"], bot.S_INK)
         # статус отмены всё равно заметнее второстепенных строк
         small = [op for op in plan_small_ops()]
         if small:
             self.assertGreater(rooms[0]["size"], max(op["size"] for op in small))
         with Image.open(path) as img:
             px = img.convert("RGB").load()
-            # под аудиторию нарисована зелёная плашка (а не «серая строка»)
-            chip_y = int(rooms[0]["bbox"][3]) + 2
+            chip_y = int((rooms[0]["bbox"][1] + rooms[0]["bbox"][3]) / 2)
             self.assertTrue(any(
-                close(px[x, chip_y], self.GREEN_BG, 6)
+                close(px[x, chip_y], self.ROOM_BG, 8)
                 for x in range(0, img.width, 3)
-            ), "аудитория отменённой пары не подсвечена зелёным")
+            ), "аудитория отменённой пары не в лавандовой колонке")
 
     def test_cancelled_card_without_room_says_so_quietly(self):
         bot.render_schedule_image(self.cancelled_schedule())
@@ -2034,10 +2053,11 @@ class TestScheduleCardDesign(unittest.TestCase):
         self.assertGreater(subject_op["size"], teacher_op["size"])
         self.assertGreaterEqual(room_op["size"], bot.ROOM_FONT_MIN)
         self.assertGreater(room_op["size"], teacher_op["size"])
-        # аудитория — в зелёной плашке справа, а не мелкий текст в углу
+        # аудитория — в лавандовой колонке справа, код крупнее преподавателя
         panels = [op for op in plan["ops"] if op.get("kind") == "panel"
-                  and op.get("fill") == bot.S_GREEN_L]
-        self.assertTrue(panels, "нет зелёной плашки аудитории")
+                  and op.get("fill") == bot.S_ROOM_BG]
+        self.assertTrue(panels, "нет лавандовой колонки аудитории")
+        self.assertGreaterEqual(room_op["size"], subject_op["size"])
         self.assertTrue(any(p["box"][0] <= room_op["bbox"][0] + 1
                             and p["box"][2] >= room_op["bbox"][2] - 1
                             for p in panels),
@@ -2152,17 +2172,15 @@ class TestTotalStudyBadge(DBTestCase):
         lines = self.progress_lines()
         self.assertEqual(len(lines), 1)
         self.assertIn("4 акад. ч", " ".join(lines[0]["lines"]))
-        # зелёным, и внутри карточки, а не где-то сбоку
-        self.assertEqual(lines[0]["fill"], bot.S_GREEN_D)
+        # часы — тихая строка под кодом аудитории, не зелёный акцент
+        self.assertEqual(lines[0]["fill"], bot.S_MUTED)
         card = bot._LAST_RENDER["plan"]["cards"][0]["box"]
         self.assertLessEqual(lines[0]["bbox"][0], card[2])
         self.assertLessEqual(lines[0]["bbox"][2], card[2])
-        # аудитория и часы заметнее преподавателя, но мельче времени
         self.assertGreater(min(text_sizes("room")), max(text_sizes("teacher")))
-        self.assertGreater(lines[0]["size"], max(text_sizes("teacher")))
-        self.assertLessEqual(lines[0]["size"], max(text_sizes("subject")) + 2)
-        self.assertTrue(self.card_rows_of(self.GREEN_TEXT),
-                        "зелёная строка прогресса не нарисована")
+        self.assertLess(lines[0]["size"], min(text_sizes("room")))
+        self.assertTrue(self.card_rows_of(hex_rgb(bot.S_ROOM_BG)),
+                        "колонка аудитории не нарисована")
 
     def test_subject_progress_without_history_is_not_shown(self):
         """Нет истории — нет и шумной строки: карточка остаётся спокойной."""
