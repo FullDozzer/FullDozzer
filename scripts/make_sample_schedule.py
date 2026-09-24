@@ -14,7 +14,7 @@
 
 Изменения — внутри карточек (отдельной колонки «Изменения» больше нет):
   II  изменена аудитория УК105 → УК103;
-  IV  1 п/гр. — занятие отменено (ОТМЕНА), розовая плашка в карточке;
+  IV  1 п/гр. — маленькая пилюля «Занятие отменено»;
   IV  2 п/гр. — Химия Н и Г, УК312 · добавлено.
 
 Формат выбирается по плотности дня: 1080×1620 (2:3) — базовый, при
@@ -25,7 +25,8 @@
   - формат вертикальный, ширина 1080, высота из лестницы форматов;
   - validate_layout() не нашёл проблем: текст в границах карточек и safe area,
     без пересечений, аудитория не мельче ROOM_FONT_MIN;
-  - у каждой аудитории — зелёная плашка «Ауд. …» с иконкой, часы зелёным;
+  - у каждой аудитории — лавандовая колонка: «Ауд.» + крупный код, часы тише;
+  - иконки — Lucide SVG, не рукописные;
   - мелкие пометки (перемена, подгруппы, ИЗМЕНЕНО) — в строке времени;
   - кромка холста (20 px) — только фон и декоративные подложки;
   - дополнительно сохраняется preview на 390 px — ширина превью чата.
@@ -168,42 +169,53 @@ def main():
     else:
         print("Эллипсис не понадобился (всё влезло полностью)")
 
-    # --- проверка 3: аудитория — зелёная плашка с иконкой в каждой карточке ---
+    # --- проверка 3: аудитория — лавандовая колонка, код крупнее часов ---
     rooms = [op for op in plan["ops"] if op.get("role") == "room"]
+    labels = [op for op in plan["ops"] if op.get("role") == "room_label"]
     assert rooms, "на картинке нет ни одного блока аудитории"
     drawn = " ".join(" ".join(op["lines"]) for op in rooms)
-    for label in ("Ауд. СК201", "Ауд. УК103", "Ауд. УК307", "Ауд. УК312"):
-        assert label in drawn, f"аудитория {label} не отрисована"
+    for code in ("СК201", "УК103", "УК307", "УК312", "бол зал 2"):
+        assert code in drawn, f"аудитория {code} не отрисована"
+    assert labels and all(op["lines"] == ["Ауд."] for op in labels), \
+        "нет подписи «Ауд.»"
     assert min(op["size"] for op in rooms) >= bot.ROOM_FONT_MIN, \
         "шрифт аудитории мельче пола читаемости"
     panels = [op for op in plan["ops"] if op.get("kind") == "panel"
-              and op.get("fill") == bot.S_GREEN_L]
-    assert len(panels) == len(rooms), "не у каждой аудитории своя плашка"
+              and op.get("fill") == bot.S_ROOM_BG]
+    assert len(panels) == len(rooms), "не у каждой аудитории своя колонка"
+    rights = {round(p["box"][2], 1) for p in panels}
+    assert len(rights) == 1, "правый край колонок аудитории не совпал"
     hours = [op for op in plan["ops"] if op.get("role") == "hours"]
     teachers = [op for op in plan["ops"] if op.get("role") == "teacher"]
     if teachers:
-        assert min(op["size"] for op in rooms) >= \
+        assert min(op["size"] for op in rooms) > \
             max(op["size"] for op in teachers), "аудитория мельче преподавателя"
     assert hours, "нигде не показано изученное время"
-    assert min(op["size"] for op in hours) > max(op["size"] for op in rooms), \
-        "строка изученных часов не акцент"
-    icons = [op for op in plan["ops"] if ":panel:icon" in str(op.get("id"))]
-    assert icons, "у плашек аудитории нет иконки"
-    print(f"Аудиторий: {len(rooms)} (плашек {len(panels)}, иконок "
+    assert max(op["size"] for op in hours) < min(op["size"] for op in rooms), \
+        "часы не должны быть крупнее кода аудитории"
+    assert all(op["fill"] == bot.S_MUTED for op in hours)
+    icons = [op for op in plan["ops"] if op.get("op") == "icon"]
+    assert icons, "нет векторных иконок"
+    assert all(op["name"] in bot.schedule_icons.ICON_FILES for op in icons)
+    print(f"Аудиторий: {len(rooms)} (колонок {len(panels)}, иконок "
           f"{len(icons)}), кегль аудитории "
           f"{min(op['size'] for op in rooms)}, часов "
           f"{min(op['size'] for op in hours)} (пол {bot.ROOM_FONT_MIN}) ✓")
 
-    # --- проверка 4: плашка отмены и инлайн-изменения ---
+    # --- проверка 4: пилюля отмены и инлайн-изменения ---
     texts = [op for op in plan["ops"] if op["op"] == "text"]
     all_text = "\n".join(" ".join(op["lines"]) for op in texts)
-    assert "Занятие отменено" in all_text, "нет плашки отмены в карточке"
+    assert "Занятие отменено" in all_text, "нет пилюли отмены в карточке"
+    assert "ОТМЕНА" not in all_text, "вернулся баннер ОТМЕНА"
     assert "Аудитория: УК105 → УК103" in all_text, \
         "изменение аудитории не показано внутри карточки"
     assert "panel" not in plan["owners"], "колонка «Изменения» вернулась"
-    pink = [op for op in plan["ops"] if op.get("kind") == "panel"
-            and op.get("fill") == bot.S_RED_L]
-    assert pink, "нет розовой плашки отмены"
+    pills = [op for op in plan["ops"] if op.get("kind") == "chip"
+             and op.get("fill") == bot.S_RED_PILL]
+    assert pills, "нет пилюли «Занятие отменено»"
+    card_w = max(c["box"][2] - c["box"][0] for c in plan["cards"])
+    assert all((op["box"][2] - op["box"][0]) < card_w * 0.5 for op in pills), \
+        "пилюля отмены растянулась на карточку"
     print("Отмена и правки — внутри карточек, колонки «Изменения» нет ✓")
 
     # --- проверка 5: тихие пометки в строке времени карточек ---

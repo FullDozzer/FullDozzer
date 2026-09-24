@@ -8,8 +8,8 @@ Telegram-бот расписания группы ЭС7-24 (Институт н�
 - Генерирует современную PNG-картинку через Pillow: одна дата = одна
   вертикальная карточка (1080×1620, 2:3; при плотном дне холст растёт по
   лестнице форматов). Карточка пары: номер, время, предмет, преподаватель
-  и аккуратная зелёная плашка аудитории; изменения и отмены показываются
-  внутри карточки пары.
+  и лавандовая колонка аудитории («Ауд.» + крупный код комнаты);
+  изменения и отмены показываются внутри карточки пары.
 - Поддержка подписок (SQLite), фоновый мониторинг изменений.
 - Работает в Docker, кодировка UTF-8.
 - Все даты считаются в часовом поясе Asia/Yekaterinburg (UTC+5),
@@ -47,6 +47,8 @@ import aiohttp
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+import schedule_icons
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -2900,20 +2902,22 @@ def _change_summary_lines(changes: list) -> list:
 # РЕНДЕР КАРТОЧКИ РАСПИСАНИЯ (Telegram-first: один день — одна картинка)
 # ============================================================
 #
-# Дизайн (референс — «легкая лавандовая карточка дня»):
-#   - фон — светлая лаванда с едва заметными диагональными подложками;
-#   - шапка: иконка календаря, «РАСПИСАНИЕ», группа крупно, дата;
-#     справа — счётчик занятий, шкала прогресса и «Изучено: … акад. ч»;
-#   - карточка пары: круг с номером + время (начало тёмное, конец
-#     приглушённое) + тихая пометка справа (перемена / подгруппы),
-#     затем предмет, преподаватель и зелёная плашка аудитории;
-#   - плашка аудитории: «Ауд. ПК108» и изученное время — зелёный
-#     акцент, но сдержанного кегля: аудитория заметна цветом и
-#     подложкой, а не «режимом для слабовидящих»;
-#   - отмена: розовая плашка внутри карточки с пилюлей «Занятие
-#     отменено» и красным бейджем «ОТМЕНА»;
-#   - подвал: светлая плашка со сноской про академический час и
-#     обыкновенным временем в две колонки;
+# Дизайн (референс — спокойная лавандовая карточка дня, доведённая
+# до плотности настоящего мобильного расписания):
+#   - фон — тёплый почти-белый с очень лёгкой лавандой;
+#   - шапка компактная: «РАСПИСАНИЕ», группа, дата, бейдж «Сегодня»,
+#     счётчик занятий и прогресс — без лишней высоты;
+#   - карточка: номер в лавандовом круге, время (начало жирное, конец
+#     серое), предмет, преподаватель; справа — колонка аудитории;
+#   - аудитория — самый быстрый ориентир: мелкая подпись «Ауд.»,
+#     код комнаты крупно и жирно, часы ниже приглушённо. Колонка
+#     одной ширины на всех карточках, лавандовая подложка, не зелёная;
+#   - перемена — тихая пометка справа в строке времени;
+#   - отмена: та же карточка, без красного блока. Мягкая пилюля
+#     «Занятие отменено» рядом со временем и тонкий красный акцент;
+#   - подвал тихий: академический час и обыкновенное время;
+#   - иконки — Lucide SVG (schedule_icons), не нарисованные от руки;
+#   - карточки не растягиваются, если занятий мало;
 #   - ОДНА КАРТИНКА = ОДИН ДЕНЬ, всё важное — в safe area.
 #
 # Архитектура (layout → render; позиции нигде не хардкодятся):
@@ -2938,34 +2942,36 @@ def _change_summary_lines(changes: list) -> list:
 import math as _math
 
 # ------------------------------------------------------------
-# ПАЛИТРА: лавандовый холст, белые карточки, зелёные аудитории
+# ПАЛИТРА: тёплый светлый холст, белые карточки, лавандовый акцент
 # ------------------------------------------------------------
 
-S_BG         = "#F2F1FA"   # фон холста
-S_BG_LIGHT   = "#F7F6FC"   # диагональная подложка (светлее фона)
-S_BG_DEEP    = "#ECEAF7"   # диагональная подложка (темнее фона)
+S_BG         = "#F7F5F8"   # тёплый почти-белый с лёгкой лавандой
+S_BG_LIGHT   = "#F9F8FB"   # диагональная подложка (светлее фона)
+S_BG_DEEP    = "#EFEAF4"   # диагональная подложка (чуть глубже)
 S_CARD       = "#FFFFFF"   # карточка пары
-S_INK        = "#191826"   # основной текст
-S_MUTED      = "#8A88A0"   # второстепенный текст
-S_FAINT      = "#A9A7BD"   # самый тихий текст
-S_PURPLE     = "#6C5CE7"   # акцент: метка, номер пары, шкала прогресса
-S_PURPLE_D   = "#5B49D6"   # текст изменений
-S_PURPLE_L   = "#EFEDFD"   # светлая лаванда: круг номера, статусные пилюли
-S_PURPLE_B   = "#E2DDFA"   # граница лавандовых плашек
-S_GREEN      = "#17A15E"   # иконка аудитории
-S_GREEN_D    = "#128A4E"   # «6 акад. ч»
-S_GREEN_M    = "#5F9179"   # «Ауд. ПК108» — спокойный зелёно-серый
-S_GREEN_L    = "#E9F7EF"   # плашка аудитории
-S_GREEN_B    = "#D6EFE1"   # граница плашки аудитории
-S_RED        = "#E8556D"   # бейдж «ОТМЕНА»
-S_RED_D      = "#D9455F"   # текст «Занятие отменено»
-S_RED_L      = "#FDECEF"   # розовая плашка отмены
-S_RED_PILL   = "#FBE0E6"   # фон пилюли «Занятие отменено»
-S_RED_B      = "#F8D6DD"   # граница розовой плашки
-S_BORDER     = "#EEECF7"   # граница карточки
-S_SHADOW     = "#B7AFDC"   # мягкая тень карточки (прозрачность — в маске)
-S_TRACK      = "#E9E7F6"   # дорожка шкалы прогресса
-S_DIVIDER    = "#E0DDF1"   # разделитель колонок подвала
+S_INK        = "#1A1A2E"   # основной текст — тёмный navy
+S_MUTED      = "#8B8AA0"   # второстепенный текст
+S_FAINT      = "#A6A4B8"   # самый тихий текст
+S_PURPLE     = "#6E5CE6"   # мягкий лавандовый акцент
+S_PURPLE_D   = "#5C4AD0"   # текст статусов
+S_PURPLE_L   = "#F1EFFB"   # светлая лаванда: круг номера, пилюли
+S_PURPLE_B   = "#E4E0F4"   # граница лавандовых плашек
+S_ROOM_BG    = "#F3F1FB"   # подложка колонки аудитории
+S_ROOM_LINE  = "#E6E2F4"   # тонкая граница колонки аудитории
+S_GREEN      = "#1C9A58"   # только статус «добавлено»
+S_GREEN_D    = "#17864C"
+S_GREEN_M    = "#5F9179"
+S_GREEN_L    = "#E8F6EE"
+S_GREEN_B    = "#D5EFE0"
+S_RED        = "#E15B70"   # тонкий акцент отмены
+S_RED_D      = "#D14E64"   # текст «Занятие отменено»
+S_RED_L      = "#FDECEF"
+S_RED_PILL   = "#FBE7EB"   # фон пилюли «Занятие отменено»
+S_RED_B      = "#F4D5DB"
+S_BORDER     = "#E8E6F0"   # граница карточки
+S_SHADOW     = "#C9C4DC"   # очень мягкая тень
+S_TRACK      = "#E8E6F3"   # дорожка шкалы прогресса
+S_DIVIDER    = "#E3E0EE"   # разделитель колонок подвала
 
 # ------------------------------------------------------------
 # ХОЛСТ
@@ -2992,77 +2998,83 @@ SCHEDULE_HEIGHT_MAX = SCHEDULE_RATIO_LADDER[-1][0]
 SAFE_AREA = 52            # единый безопасный отступ со всех четырёх сторон
 SUPER_SAMPLE = 2          # рендер в 2x + LANCZOS -> чёткий текст
 
-# --- Текстовая шкала (дизайн-пиксели при масштабе 1.0) ---
+# --- Текстовая шкала (дизайн-пиксели холста 1080 при масштабе 1.0) ---
+# Холст ≈ 2.8× превью 390 px, поэтому 32 px здесь — это ~12 px на телефоне.
 S_TYPE = {
-    "header_label": 20,     # «РАСПИСАНИЕ» с разрядкой
-    "header_title": 58,     # группа / ФИО
-    "header_date": 27,      # «Четверг, 24 сентября 2026»
-    "header_pill": 30,      # число в счётчике занятий
-    "header_pill_word": 23,  # «занятий» в счётчике
-    "header_progress": 22,  # «Изучено: … акад. ч»
-    "roman": 26,            # номер пары в круге
-    "time": 34,             # время пары
-    "subject": 33,          # предмет
-    "teacher": 23,          # преподаватель
-    "room": 24,             # «Ауд. ПК108»
-    "hours": 27,            # «6 акад. ч»
-    "small": 21,            # перемена / «2 подгруппы» / изменения
-    "subgroup": 19,         # «1 П/ГР.»
-    "cancel": 21,           # «Занятие отменено»
-    "tag": 21,              # «ОТМЕНА»
-    "note": 20,             # сноска подвала
+    "header_label": 16,     # «РАСПИСАНИЕ»
+    "header_title": 50,     # группа / ФИО
+    "header_date": 22,      # «Четверг, 24 сентября 2026»
+    "header_pill": 26,      # число в счётчике занятий
+    "header_pill_word": 18,  # «занятий»
+    "header_progress": 16,  # «Изучено: … акад. ч»
+    "roman": 18,            # номер пары в круге
+    "time": 32,             # начало пары
+    "subject": 28,          # предмет
+    "teacher": 19,          # преподаватель
+    "room_label": 14,       # «Ауд.»
+    "room": 32,             # код аудитории — главный ориентир справа
+    "hours": 15,            # «8 акад. ч» — тихо, под кодом
+    "small": 15,            # перемена / изменения
+    "subgroup": 14,         # «2 П/ГР.»
+    "cancel": 15,           # «Занятие отменено»
+    "tag": 14,              # «Сегодня» / «ИЗМЕНЕНО»
+    "note": 15,             # сноска подвала
 }
-# Полы: при плотном дне всё уплотняется, но читаемость не пробивается.
+# Полы: плотный день уплотняется, код аудитории не проседает.
 S_TYPE_MIN = {
-    "header_label": 15,
-    "header_title": 38,
-    "header_date": 19,
-    "header_pill": 22,
-    "header_pill_word": 16,
-    "header_progress": 16,
-    "roman": 18,
-    "time": 24,
-    "subject": 23,
-    "teacher": 16,
-    "room": 17,
-    "hours": 19,
-    "small": 15,
-    "subgroup": 14,
-    "cancel": 15,
-    "tag": 15,
-    "note": 15,
+    "header_label": 13,
+    "header_title": 34,
+    "header_date": 16,
+    "header_pill": 18,
+    "header_pill_word": 14,
+    "header_progress": 13,
+    "roman": 14,
+    "time": 22,
+    "subject": 20,
+    "teacher": 14,
+    "room_label": 11,
+    "room": 20,
+    "hours": 12,
+    "small": 12,
+    "subgroup": 12,
+    "cancel": 12,
+    "tag": 12,
+    "note": 12,
 }
 ROOM_FONT_MIN = S_TYPE_MIN["room"]
 
 # --- Отступы и зазоры: база и пол (умножаются на тот же масштаб) ---
+# radius 32 на холсте 1080 ≈ 12 px в превью телефона — мягко, без «пузырей».
 S_SPACE = {
-    "pad_x": 34, "pad_t": 28, "pad_b": 30,          # карточка
-    "gap_badge": 26,                                # круг номера → время
-    "gap_row": 22,                                  # строка времени → предмет
-    "gap_subject": 14,                              # предмет → преподаватель
-    "gap_items": 20,                                # между блоками подгрупп
-    "gap_panel": 28,                                # левая колонка ↔ плашка
-    "gap_icon": 9,                                  # иконка → текст
-    "card_gap": 14,                                 # между карточками
-    "gap_header": 34,                               # шапка → карточки
-    "panel_pad_x": 20, "panel_pad_y": 14,           # плашка аудитории
-    "panel_line_gap": 6,                            # строки в плашке
-    "pill_pad_x": 16, "pill_pad_y": 9,              # пилюли (отмена, статусы)
-    "band_pad_x": 14, "band_pad_y": 9,              # плашка изменений
-    "badge": 66,                                    # диаметр круга с номером
-    "icon": 22,                                     # размер иконок в строке
-    "radius": 32, "row_radius": 22,                 # радиусы карточек и плашек
+    "pad_x": 28, "pad_t": 20, "pad_b": 20,          # карточка
+    "gap_badge": 14,                                # круг номера → время
+    "gap_row": 14,                                  # строка времени → предмет
+    "gap_subject": 6,                               # предмет → преподаватель
+    "gap_items": 14,                                # между блоками подгрупп
+    "gap_panel": 20,                                # левая колонка ↔ аудитория
+    "gap_icon": 8,                                  # иконка → текст
+    "card_gap": 12,                                 # между карточками
+    "gap_header": 18,                               # шапка → карточки
+    "panel_pad_x": 14, "panel_pad_y": 10,           # колонка аудитории
+    "panel_line_gap": 2,                            # строки в колонке
+    "pill_pad_x": 10, "pill_pad_y": 5,              # пилюли
+    "band_pad_x": 12, "band_pad_y": 7,              # плашка изменений
+    "badge": 44,                                    # диаметр круга с номером
+    "icon": 18,                                     # иконки в строке
+    "radius": 28, "row_radius": 14,                 # карточка / колонка аудитории
+    "room_col": 196,                                # фиксированная ширина колонки
 }
 S_SPACE_MIN = {
-    "pad_x": 22, "pad_t": 17, "pad_b": 18,
-    "gap_badge": 15, "gap_row": 13, "gap_subject": 8, "gap_items": 11,
-    "gap_panel": 16, "gap_icon": 5,
-    "card_gap": 8, "gap_header": 20,
-    "panel_pad_x": 12, "panel_pad_y": 8, "panel_line_gap": 3,
-    "pill_pad_x": 9, "pill_pad_y": 5,
-    "band_pad_x": 8, "band_pad_y": 5,
-    "badge": 42, "icon": 15,
-    "radius": 18, "row_radius": 13,
+    "pad_x": 18, "pad_t": 14, "pad_b": 14,
+    "gap_badge": 10, "gap_row": 10, "gap_subject": 4, "gap_items": 10,
+    "gap_panel": 12, "gap_icon": 5,
+    "card_gap": 8, "gap_header": 12,
+    "panel_pad_x": 10, "panel_pad_y": 7, "panel_line_gap": 1,
+    "pill_pad_x": 8, "pill_pad_y": 4,
+    "band_pad_x": 8, "band_pad_y": 4,
+    "badge": 34, "icon": 14,
+    "radius": 18, "row_radius": 10,
+    "room_col": 148,
 }
 S_LINE_GAP_BASE = 4             # межстрочный зазор внутри блока текста
 PILL_RADIUS_RATIO = 0.5         # пилюли — «капсулы»
@@ -3070,13 +3082,14 @@ CHANGE_LINES_MAX = 3            # сколько строк изменений �
 
 # Вес начертаний для ролей текста
 _ROLE_WEIGHT = {
-    "header_label": "bold", "header_title": "bold", "header_date": "regular",
+    "header_label": "semibold", "header_title": "bold", "header_date": "regular",
     "header_pill": "bold", "header_pill_word": "regular",
     "header_progress": "regular",
-    "roman": "bold", "time": "bold", "time_end": "medium",
-    "subject": "semibold", "teacher": "regular", "room": "medium",
-    "hours": "bold", "small": "regular", "subgroup": "bold",
-    "cancel": "medium", "tag": "bold", "note": "regular",
+    "roman": "semibold", "time": "bold", "time_end": "regular",
+    "subject": "semibold", "teacher": "regular",
+    "room_label": "medium", "room": "bold",
+    "hours": "regular", "small": "regular", "subgroup": "medium",
+    "cancel": "medium", "tag": "medium", "note": "regular",
 }
 
 
@@ -3255,10 +3268,11 @@ def _metrics_for(scale: float) -> dict:
     for key, base in S_SPACE.items():
         m[key] = max(S_SPACE_MIN[key], int(round(base * scale)))
     m["line_gap"] = max(1, int(round(S_LINE_GAP_BASE * scale)))
-    m["subject_lines"] = 3 if scale >= 0.96 else 2
-    m["shadow"] = max(8, int(round(18 * scale)))          # радиус размытия
-    m["shadow_y"] = max(3, int(round(8 * scale)))         # смещение вниз
-    m["shadow_alpha"] = 70                                # плотность тени (0…255)
+    m["subject_lines"] = 3 if scale >= 0.92 else 2
+    # Тень едва читается: карточку держит тонкая граница, не «подушка».
+    m["shadow"] = max(6, int(round(10 * scale)))
+    m["shadow_y"] = max(2, int(round(3 * scale)))
+    m["shadow_alpha"] = 36
     return m
 
 
@@ -3457,115 +3471,28 @@ def _fade(color: str, t: float) -> str:
 
 
 # ------------------------------------------------------------
-# ИКОНКИ: простые векторные глифы (без внешних ассетов)
+# ИКОНКИ: Lucide SVG (assets/icons), не рукописные глифы
 # ------------------------------------------------------------
 
-def _circle_points(cx: float, cy: float, r: float, n: int = 28) -> list:
-    return [(cx + r * _math.cos(2 * _math.pi * i / n),
-             cy + r * _math.sin(2 * _math.pi * i / n)) for i in range(n)]
-
-
-def _arc_points(cx: float, cy: float, r: float, a0: float, a1: float,
-                n: int = 20) -> list:
-    """Точки дуги от угла a0 до a1 (радианы) — для «плеч» человечков."""
-    return [(cx + r * _math.cos(a0 + (a1 - a0) * i / n),
-             cy + r * _math.sin(a0 + (a1 - a0) * i / n)) for i in range(n + 1)]
-
-
-def _person_ops(x: float, y: float, s: float, color: str, *,
-                uid: str, owner=None) -> list:
-    """Человечек: голова + плечи (сплошные заливки)."""
-    cx = x + s / 2
-    head_r = s * 0.185
-    head = _circle_points(cx, y + s * 0.22, head_r)
-    body_r = s * 0.315
-    base = y + s * 0.94
-    body = (_arc_points(cx, base, body_r, _math.pi, 2 * _math.pi)
-            + [(cx + body_r, base), (cx - body_r, base)])
-    return [
-        _poly_op(head, color, kind="icon", uid=uid + ":head", owner=owner),
-        _poly_op(body, color, kind="icon", uid=uid + ":body", owner=owner),
-    ]
-
-
-# Иконки, которые умеет рисовать _icon_ops (всё остальное — без иконки).
-_KNOWN_ICONS = frozenset({"person", "people", "clock", "cap", "calendar",
-                          "cross"})
+# Имена, которые layout может попросить. Растр — в schedule_icons.
+_KNOWN_ICONS = frozenset(schedule_icons.ICON_FILES)
 
 
 def _icon_ops(name: str, x: float, y: float, s: float, color: str, *,
               uid: str, owner=None, ink: str = S_CARD) -> list:
-    """Иконка в квадрате (x, y, s, s). Возвращает список ops.
+    """Иконка Lucide в квадрате (x, y, s, s).
 
-    ink — цвет деталей поверх плашки (иконки рисуются цветом карточки,
-    когда стоят на насыщенном фоне).
+    Рендер подставит вектор из SVG. ``ink`` оставлен для совместимости
+    вызовов и не используется: цвет штриха — ``color``.
     """
-    if name == "person":
-        return _person_ops(x, y + s * 0.02, s * 0.96, color, uid=uid,
-                           owner=owner)
-    if name == "people":
-        # Двое: за спиной — приглушённый напарник, впереди — основной.
-        back = _person_ops(x + s * 0.40, y - s * 0.02, s * 0.62,
-                           _fade(color, 0.36), uid=uid + ":b", owner=owner)
-        front = _person_ops(x - s * 0.04, y + s * 0.16, s * 0.70, color,
-                            uid=uid + ":f", owner=owner)
-        return back + front
-    if name == "clock":
-        w = max(1.2, s * 0.085)
-        cx, cy = x + s / 2, y + s / 2
-        r = s / 2 - w / 2
-        return [
-            _ellipse_op((cx - r, cy - r, cx + r, cy + r), outline=color,
-                        width=w, kind="icon", uid=uid + ":ring", owner=owner),
-            _line_op(cx, cy, cx, cy - r * 0.50, color, w, uid=uid + ":h1",
-                     owner=owner),
-            _line_op(cx, cy, cx + r * 0.40, cy, color, w, uid=uid + ":h2",
-                     owner=owner),
-        ]
-    if name == "cap":
-        top = [(x, y + s * 0.42), (x + s * 0.5, y + s * 0.12),
-               (x + s, y + s * 0.42), (x + s * 0.5, y + s * 0.72)]
-        base = [(x + s * 0.24, y + s * 0.50), (x + s * 0.76, y + s * 0.50),
-                (x + s * 0.71, y + s * 0.88), (x + s * 0.29, y + s * 0.88)]
-        return [
-            _poly_op(top, color, kind="icon", uid=uid + ":top", owner=owner),
-            _poly_op(base, _fade(color, 0.30), kind="icon", uid=uid + ":base",
-                     owner=owner),
-        ]
-    if name == "calendar":
-        # Плотная плитка календаря с «дырочками» — только заливки, без
-        # тонких обводок (после даунскейла линии «звенят»).
-        left, right = x + s * 0.22, x + s * 0.78
-        top, bottom = y + s * 0.20, y + s * 0.84
-        bar = y + s * 0.40
-        dot = s * 0.06
-        ops = [
-            _rect_op((left, y + s * 0.10, left + s * 0.10, bar), s * 0.045,
-                     fill=ink, kind="icon", uid=uid + ":t1", owner=owner),
-            _rect_op((right - s * 0.10, y + s * 0.10, right, bar), s * 0.045,
-                     fill=ink, kind="icon", uid=uid + ":t2", owner=owner),
-            _rect_op((left, bar, right, bottom), s * 0.10, fill=ink,
-                     kind="icon", uid=uid + ":body", owner=owner),
-        ]
-        for index, (dx, dy) in enumerate(((0.30, 0.52), (0.50, 0.52),
-                                          (0.70, 0.52), (0.30, 0.70),
-                                          (0.50, 0.70), (0.70, 0.70))):
-            left_x = x + s * dx - dot / 2
-            top_y = y + s * dy - dot / 2
-            ops.append(_ellipse_op((left_x, top_y, left_x + dot, top_y + dot),
-                                   fill=color, kind="icon",
-                                   uid=f"{uid}:dot{index}", owner=owner))
-        return ops
-    if name == "cross":
-        w = max(1.4, s * 0.14)
-        pad = s * 0.26
-        return [
-            _line_op(x + pad, y + pad, x + s - pad, y + s - pad, color, w,
-                     uid=uid + ":d1", owner=owner),
-            _line_op(x + s - pad, y + pad, x + pad, y + s - pad, color, w,
-                     uid=uid + ":d2", owner=owner),
-        ]
-    return []
+    del ink
+    if name not in _KNOWN_ICONS or s < 2:
+        return []
+    return [{
+        "op": "icon", "name": name,
+        "box": (float(x), float(y), float(x) + float(s), float(y) + float(s)),
+        "color": color, "kind": "icon", "id": uid, "owner": owner,
+    }]
 
 
 def _decor_ops(W: int, H: int) -> list:
@@ -3633,7 +3560,7 @@ def _meta_slot_ops(m: dict, right_x: float, y_center: float, label: str,
     pen = _pen(m["small"], _ROLE_WEIGHT["small"])
     if icon not in _KNOWN_ICONS:
         icon = None
-    icon_size = m["icon"] * 0.62 if icon else 0.0
+    icon_size = m["icon"] * 0.78 if icon else 0.0
     gap = m["gap_icon"] if icon else 0.0
     text_w = pen.width(label)
     width = (icon_size + gap if icon else 0) + text_w
@@ -3686,7 +3613,7 @@ def _time_ops(m: dict, start: str, end: str, x: float, y: float, max_w: float,
     while True:
         p_start = _pen(size, "bold")
         p_sep = _pen(size, "regular")
-        p_end = _pen(size, "medium")
+        p_end = _pen(size, "regular")
         gap = size * 0.26
         need = p_start.width(start_text) + (gap * 2 + p_sep.width("—")
                                            + p_end.width(end_text)
@@ -3702,7 +3629,7 @@ def _time_ops(m: dict, start: str, end: str, x: float, y: float, max_w: float,
     cursor = x
     start_w = p_start.width(start_text)
     ops.append(_text_op(p_start, (cursor, y, cursor + start_w + 1, y + line_h),
-                        start_text, S_RED_D if cancelled else S_INK,
+                        start_text, S_INK,
                         valign="middle", max_lines=1, min_size=size,
                         uid=uid + ":start", owner=owner, role="time"))
     cursor += start_w
@@ -3725,9 +3652,9 @@ def _time_ops(m: dict, start: str, end: str, x: float, y: float, max_w: float,
 
 def _subgroup_caption(m: dict, x: float, y: float, w: float, text: str, *,
                       uid: str, owner=None, fill=S_PURPLE_D) -> tuple:
-    """Подпись подгруппы «1 П/ГР.» с лёгкой разрядкой."""
-    pen = _pen(m["subgroup"], "bold")
-    spacing = max(0.6, m["subgroup"] * 0.06)
+    """Подпись подгруппы «2 П/ГР.» — тихо, сразу над названием."""
+    pen = _pen(m["subgroup"], "medium")
+    spacing = 0.35
     label = clean_text(text).upper()
     if pen.spaced_width(label, spacing) > w:
         label = pen.shorten(label, w)
@@ -3742,58 +3669,75 @@ def _subgroup_caption(m: dict, x: float, y: float, w: float, text: str, *,
 
 
 # ------------------------------------------------------------
-# LAYOUT: плашка аудитории (зелёный акцент карточки)
+# LAYOUT: колонка аудитории (лавандовая, код комнаты крупно)
 # ------------------------------------------------------------
+
+def _fit_room_code(text: str, max_w: float, size: int) -> tuple:
+    """Код аудитории в одну строку. Ужимаем кегль, перенос — только крайний случай."""
+    floor = ROOM_FONT_MIN
+    size = max(floor, int(size))
+    while size >= floor:
+        pen = _pen(size, "bold")
+        if pen.width(text) <= max_w:
+            return size, [text]
+        size -= 1
+    pen = _pen(floor, "bold")
+    lines = pen.wrap(text, max_w)[:2]
+    if len(lines) == 2 and pen.width(lines[1]) > max_w:
+        lines[1] = pen.shorten(lines[1], max_w)
+    elif len(lines) == 1 and pen.width(lines[0]) > max_w:
+        lines = [pen.shorten(lines[0], max_w)]
+    return floor, lines or [text]
+
 
 def _room_panel_ops(m: dict, item: dict, right_x: float, y: float,
                     max_w: float, *, uid: str, owner=None) -> tuple:
-    """Зелёная плашка: «👥 Ауд. ПК108» и ниже «6 акад. ч».
+    """Лавандовая колонка: «Ауд.» мелко, код комнаты крупно, часы тихо.
 
-    Аудитория остаётся главным цветовым акцентом карточки, но кегль
-    спокойный: «Ауд. …» — приглушённый зелёно-серый, изученные часы —
-    зелёный полужирный. Плашка выравнивается по правому краю карточки.
+    Ширина фиксирована (room_col), правый край общий — колонка
+    аудиторий совпадает на всех карточках дня.
     """
-    room_text = f"Ауд. {item['room']}"
+    room = clean_text(item["room"])
     hours = clean_text(item.get("hours") or "")
     pad_x, pad_y = m["panel_pad_x"], m["panel_pad_y"]
-    room_pen = _pen(m["room"], _ROLE_WEIGHT["room"])
+    width = min(float(m["room_col"]), float(max_w))
+    inner_w = max(36.0, width - 2 * pad_x)
+    label_pen = _pen(m["room_label"], _ROLE_WEIGHT["room_label"])
     hours_pen = _pen(m["hours"], _ROLE_WEIGHT["hours"])
-    icon_size = m["icon"] * 0.66
-    gap = m["gap_icon"]
-    inner_max = max(48.0, max_w - 2 * pad_x)
-    room_w_max = max(30.0, inner_max - icon_size - gap)
-    if room_pen.width(room_text) > room_w_max:
-        room_text = room_pen.shorten(room_text, room_w_max)
-    room_w = icon_size + gap + room_pen.width(room_text)
-    hours_w = hours_pen.width(hours) if hours else 0.0
-    width = min(max_w, max(room_w, hours_w) + 2 * pad_x)
-    line_gap = m["panel_line_gap"]
-    content_h = room_pen.line_h() + (line_gap + hours_pen.line_h()
-                                    if hours else 0)
+    code_size, code_lines = _fit_room_code(room, inner_w, m["room"])
+    code_pen = _pen(code_size, "bold")
+    gap = max(1, m["panel_line_gap"])
+    label_h = label_pen.line_h() * 0.86
+    code_h = (code_pen.line_h() * len(code_lines)
+              + m["line_gap"] * max(0, len(code_lines) - 1))
+    hours_h = hours_pen.line_h() * 0.92 if hours else 0.0
+    if hours and hours_pen.width(hours) > inner_w:
+        hours = hours_pen.shorten(hours, inner_w)
+    content_h = label_h + 1 + code_h + ((gap + hours_h) if hours else 0)
     height = pad_y * 2 + content_h
     x = right_x - width
     ops: list = [_rect_op((x, y, x + width, y + height), m["row_radius"],
-                          fill=S_GREEN_L, outline=S_GREEN_B, width=1.1,
+                          fill=S_ROOM_BG, outline=S_ROOM_LINE, width=1.0,
                           kind="panel", uid=uid + ":bg", owner=owner)]
     cursor = y + pad_y
-    room_line_h = room_pen.line_h()
-    ops += _icon_ops("people", x + pad_x, cursor + (room_line_h - icon_size) / 2,
-                     icon_size, S_GREEN, uid=uid + ":icon", owner=owner)
-    ops.append(_text_op(room_pen,
-                        (x + pad_x + icon_size + gap, cursor,
-                         x + width - pad_x, cursor + room_line_h), room_text,
-                        S_GREEN_M, valign="middle", max_lines=1,
-                        min_size=ROOM_FONT_MIN, uid=uid + ":room", owner=owner,
-                        role="room"))
+    ops.append(_text_op(label_pen, (x + pad_x, cursor, x + width - pad_x,
+                                    cursor + label_h), "Ауд.", S_FAINT,
+                        valign="middle", max_lines=1,
+                        min_size=_type_floor("room_label"),
+                        uid=uid + ":label", owner=owner, role="room_label"))
+    cursor += label_h + 1
+    ops.append(_text_op(code_pen, (x + pad_x, cursor, x + width - pad_x,
+                                   cursor + code_h), room, S_INK,
+                        valign="top", max_lines=len(code_lines),
+                        min_size=code_size, line_gap=m["line_gap"],
+                        uid=uid + ":room", owner=owner, role="room"))
     if hours:
-        cursor += room_line_h + line_gap
-        hours_line_h = hours_pen.line_h()
-        ops.append(_text_op(hours_pen,
-                            (x + pad_x, cursor, x + width - pad_x,
-                             cursor + hours_line_h), hours, S_GREEN_D,
+        cursor += code_h + gap
+        ops.append(_text_op(hours_pen, (x + pad_x, cursor, x + width - pad_x,
+                                        cursor + hours_h), hours, S_MUTED,
                             valign="middle", max_lines=1,
-                            min_size=_type_floor("hours"), uid=uid + ":hours",
-                            owner=owner, role="hours"))
+                            min_size=_type_floor("hours"),
+                            uid=uid + ":hours", owner=owner, role="hours"))
     return ops, width, height
 
 
@@ -3855,18 +3799,18 @@ def layout_item_body(m: dict, item: dict, x: float, w: float, *,
     panel_h = 0.0
     if item["room"]:
         panel_ops, panel_w, panel_h = _room_panel_ops(
-            m, item, x + w, 0.0, min(w * 0.60, 470.0),
+            m, item, x + w, 0.0, min(w * 0.46, float(m["room_col"])),
             uid=item["uid"] + ":panel", owner=item["owner"],
         )
     left_w = w if panel_w <= 0 else max(140.0, w - panel_w - m["gap_panel"])
     ops: list = []
     y = 0.0
 
-    # 1. ПРЕДМЕТ (у «плейсхолдера»-отмены его заменяет пилюля отмены)
-    if not (item["cancelled"] and item["placeholder"]):
+    # 1. ПРЕДМЕТ. Плейсхолдер отмены не дублируем — его заменяет пилюля.
+    subject = "" if (item["cancelled"] and item["placeholder"]) else item["subject"]
+    if subject:
         subj_ops, subj_h = _flow_text(
-            m, x, y, left_w, item["subject"], "subject",
-            S_RED_D if item["cancelled"] else S_INK,
+            m, x, y, left_w, subject, "subject", S_INK,
             max_lines=m["subject_lines"], min_size=_type_floor("subject"),
             uid=item["uid"] + ":subject", owner=item["owner"],
         )
@@ -3949,13 +3893,22 @@ def _meta_label_for(spec: dict, has_next: bool) -> tuple:
     return "", None
 
 
+def _cancel_pill(m: dict, uid: str, owner) -> tuple:
+    """Маленькая пилюля «Занятие отменено» — не плашка на всю карточку."""
+    return _pill_ops(
+        m, 0.0, 0.0, "Занятие отменено", role="cancel",
+        fill=S_RED_PILL, text_fill=S_RED_D, border=S_RED_B,
+        uid=uid, owner=owner,
+    )
+
+
 def layout_card(m: dict, spec: dict, w: float, *, has_next: bool = False,
                 index: int = 0) -> tuple:
     """Карточка одной пары: номер + время, затем занятия/подгруппы.
 
     Возвращает (ops, высота) в относительных координатах (0,0) — левый
     верх карточки. Рамку, фон и тень добавляет build_plan, когда знает
-    итоговую высоту.
+    итоговую высоту. Отмена не меняет конструкцию карточки.
     """
     ops: list = []
     owner = spec["owner"]
@@ -3963,17 +3916,18 @@ def layout_card(m: dict, spec: dict, w: float, *, has_next: bool = False,
     pad_x, pad_t, pad_b = m["pad_x"], m["pad_t"], m["pad_b"]
     inner_x = pad_x
     inner_w = w - 2 * pad_x
+    inner_right = inner_x + inner_w
     cancelled_all = bool(spec["cancelled_all"])
     y = float(pad_t)
 
-    # --- ряд 1: круг с номером пары, время, тихая пометка справа
+    # --- ряд 1: круг с номером, время, пилюля отмены, перемена справа
     diameter = m["badge"]
-    accent = S_RED_D if cancelled_all else S_PURPLE_D
-    accent_bg = S_RED_L if cancelled_all else S_PURPLE_L
+    accent = S_RED_D if cancelled_all else S_PURPLE
+    accent_bg = S_RED_PILL if cancelled_all else S_PURPLE_L
     ops.append(_ellipse_op((inner_x, y, inner_x + diameter,
                             y + diameter), fill=accent_bg, kind="icon",
                            uid=f"{uid}:num:bg", owner=owner))
-    ops.append(_text_op(_pen(m["roman"], "bold"),
+    ops.append(_text_op(_pen(m["roman"], "semibold"),
                         (inner_x, y, inner_x + diameter, y + diameter),
                         clean_text(spec.get("number")) or "—", accent,
                         align="center", valign="middle",
@@ -3981,83 +3935,107 @@ def layout_card(m: dict, spec: dict, w: float, *, has_next: bool = False,
                         owner=owner, role="roman"))
 
     meta_text, meta_icon = _meta_label_for(spec, has_next)
+    # «ОТМЕНА» не дублируем: статус несёт пилюля «Занятие отменено».
     meta_tag = ""
-    if not meta_text and not cancelled_all \
-            and spec.get("tag") in ("ИЗМЕНЕНО", "ДОБАВЛЕНО"):
+    if not meta_text and spec.get("tag") in ("ИЗМЕНЕНО", "ДОБАВЛЕНО"):
         meta_tag = spec["tag"]
     meta_w = 0.0
     if meta_text:
         meta_pen = _pen(m["small"], _ROLE_WEIGHT["small"])
         meta_w = meta_pen.width(meta_text)
         if meta_icon in _KNOWN_ICONS:
-            meta_w += m["icon"] * 0.62 + m["gap_icon"]
+            meta_w += m["icon"] * 0.78 + m["gap_icon"]
     elif meta_tag:
-        tag_pen = _pen(m["tag"], "bold")
+        tag_pen = _pen(m["tag"], "medium")
         meta_w = tag_pen.width(meta_tag) + 2 * m["pill_pad_x"]
+
+    cancel_ops, cancel_w, cancel_h = ([], 0.0, 0.0)
+    if cancelled_all or not spec["items"]:
+        cancel_ops, cancel_w, cancel_h = _cancel_pill(
+            m, f"{uid}:cancel", owner,
+        )
     time_x = inner_x + diameter + m["gap_badge"]
-    time_max = max(120.0, inner_w - diameter - 2 * m["gap_badge"] - meta_w
-                   - m["gap_panel"])
+    reserved = meta_w + (cancel_w + m["gap_icon"] if cancel_w else 0)
+    time_max = max(120.0, inner_w - diameter - 2 * m["gap_badge"] - reserved
+                   - 8)
     time_ops, time_w, time_h = _time_ops(
         m, clean_text(spec.get("start")) or _first_clock(spec.get("time")),
         _second_clock(spec.get("time")), time_x, 0.0, time_max,
-        cancelled=cancelled_all, uid=f"{uid}:time", owner=owner,
+        cancelled=False, uid=f"{uid}:time", owner=owner,
     )
-    row_h = max(diameter, time_h)
+    row_h = max(diameter, time_h, cancel_h)
     time_y = y + (row_h - time_h) / 2
     ops += _shift_ops(time_ops, 0, time_y)
+    badge_inline = False
+    if cancel_ops:
+        badge_x = time_x + time_w + m["gap_icon"]
+        meta_left = inner_right - meta_w - (8 if meta_w else 0)
+        if badge_x + cancel_w <= meta_left + 0.5:
+            ops += _shift_ops(cancel_ops, badge_x,
+                              y + (row_h - cancel_h) / 2)
+            badge_inline = True
     if meta_text:
         meta_ops, _meta_used = _meta_slot_ops(
-            m, inner_x + inner_w, y + row_h / 2, meta_text, meta_icon,
+            m, inner_right, y + row_h / 2, meta_text, meta_icon,
             uid=f"{uid}:meta", owner=owner,
         )
         ops += meta_ops
     elif meta_tag:
         tag_ops, tag_w, tag_h = _pill_ops(
             m, 0.0, 0.0, meta_tag, role="tag", fill=spec["tag_bg"],
-            text_fill=spec["tag_fill"], weight="bold", uid=f"{uid}:tag",
+            text_fill=spec["tag_fill"], weight="medium", uid=f"{uid}:tag",
             owner=owner,
         )
-        ops += _shift_ops(tag_ops, inner_x + inner_w - tag_w,
+        ops += _shift_ops(tag_ops, inner_right - tag_w,
                           y + (row_h - tag_h) / 2)
     y += row_h
+    if cancel_ops and not badge_inline:
+        y += m["gap_subject"]
+        ops += _shift_ops(cancel_ops, time_x, y)
+        y += cancel_h
 
     items = spec["items"]
     multi = len(items) > 1 or any(item["subgroup"] for item in items)
-    if not items:
-        # Синтетическая карточка удалённой пары без подгрупп: только плашка
+    if items:
         y += m["gap_row"]
-        pill_ops, pill_w, pill_h = _pill_ops(
-            m, inner_x, y, "Занятие отменено", role="cancel",
-            fill=S_RED_PILL, text_fill=S_RED_D, uid=f"{uid}:cancel",
-            owner=owner,
-        )
-        ops += pill_ops
-        y += pill_h
-    else:
         for position, item in enumerate(items):
             if position:
                 y += m["gap_items"]
             label = _subgroup_label(item["subgroup"]) or ""
-            if multi and label and not item["cancelled"]:
+            if multi and label:
                 caption_ops, caption_h = _subgroup_caption(
                     m, inner_x, y, inner_w, label,
                     uid=f"{uid}:i{position}:caption", owner=owner,
                 )
                 ops += caption_ops
-                y += caption_h + max(2, m["gap_subject"] * 0.25)
-            if item["cancelled"]:
-                block_ops, block_h = layout_cancelled_item(
-                    m, item, inner_x, inner_w, uid=f"{uid}:i{position}",
-                    owner=owner,
+                y += caption_h + max(2, m["gap_subject"] * 0.35)
+            # Частичная отмена: пилюля у этого занятия, карточка остаётся белой.
+            if item["cancelled"] and not cancelled_all:
+                pill_ops, _pill_w, pill_h = _cancel_pill(
+                    m, f"{uid}:i{position}:cancel", owner,
                 )
-            else:
-                block_ops, block_h = layout_item_body(
-                    m, item, inner_x, inner_w,
-                )
-            ops += _shift_ops(block_ops, 0, y)
-            y += block_h
+                ops += _shift_ops(pill_ops, inner_x, y)
+                y += pill_h + m["gap_subject"]
+            block_ops, block_h = layout_item_body(m, item, inner_x, inner_w)
+            if block_h:
+                ops += _shift_ops(block_ops, 0, y)
+                y += block_h
+    elif not cancel_ops:
+        y += m["gap_row"]
+        pill_ops, _pill_w, pill_h = _cancel_pill(m, f"{uid}:cancel", owner)
+        ops += _shift_ops(pill_ops, inner_x, y)
+        y += pill_h
 
-    return ops, y + pad_b
+    height = y + pad_b
+    if cancelled_all:
+        # Тонкая красная метка слева — заметно, но не блок.
+        inset = m["radius"] * 0.42
+        bar = 3.0
+        if height - 2 * inset > 12:
+            ops.append(_rect_op((0, inset, bar, height - inset), 1.5,
+                                fill=S_RED, kind="accent",
+                                uid=f"{uid}:accent", owner=owner))
+    return ops, height
 
 
 def _first_clock(value) -> str:
@@ -4081,14 +4059,21 @@ def layout_empty_card(m: dict, w: float, h: float) -> tuple:
     ops.append(_rect_op((0, 0, w, h), m["radius"], fill=S_CARD,
                         outline=S_BORDER, width=1.1, kind="card",
                         uid="empty:bg"))
-    icon_size = max(30, int(round(44 * m["scale"])))
+    icon_size = max(28, int(round(34 * m["scale"])))
+    tile = icon_size + 20
     title_pen = _pen(m["subject"], "semibold")
     note_pen = _pen(m["small"], "regular")
-    block = icon_size + 20 + title_pen.line_h() + 12 + note_pen.line_h()
+    block = tile + 16 + title_pen.line_h() + 8 + note_pen.line_h()
     top = max(24.0, (h - block) / 2)
-    ops += _icon_ops("calendar", (w - icon_size) / 2, top, icon_size,
-                     S_CARD, uid="empty:icon", ink=S_PURPLE)
-    cursor = top + icon_size + 20
+    tile_x = (w - tile) / 2
+    ops.append(_rect_op((tile_x, top, tile_x + tile, top + tile),
+                        tile * 0.28, fill=S_PURPLE_L, kind="icon",
+                        uid="empty:icon:bg"))
+    glyph = icon_size * 0.72
+    ops += _icon_ops("calendar", tile_x + (tile - glyph) / 2,
+                     top + (tile - glyph) / 2, glyph, S_PURPLE,
+                     uid="empty:icon")
+    cursor = top + tile + 16
     for index, (text, pen, fill, role) in enumerate((
             ("Занятий нет", title_pen, S_INK, "subject"),
             ("Расписание на этот день не опубликовано", note_pen, S_MUTED,
@@ -4125,7 +4110,7 @@ def layout_header(m: dict, schedule, ctx: dict, title: Optional[str],
     x = float(SAFE_AREA)
     y = float(SAFE_AREA)
     right_edge = float(W - SAFE_AREA)
-    icon_size = float(max(42, int(round(64 * m["scale"]))))
+    icon_size = float(max(40, int(round(48 * m["scale"]))))
 
     # --- правая колонка: счётчик занятий, шкала прогресса, «Изучено»
     lesson_count = count_lessons(schedule.lessons)
@@ -4133,8 +4118,7 @@ def layout_header(m: dict, schedule, ctx: dict, title: Optional[str],
     num_pen = _pen(m["header_pill"], "bold")
     word_pen = _pen(m["header_pill_word"], "regular")
     num_txt = str(lesson_count)
-    pill_h = max(int(num_pen.line_h() + 2 * m["pill_pad_y"]),
-                 int(icon_size * 0.86))
+    pill_h = num_pen.line_h() + 2 * max(6, int(m["pill_pad_y"]))
     pill_w = float(int(m["pill_pad_x"] * 2 + num_pen.width(num_txt) + 7
                       + word_pen.width(count_word)))
     forecast = ctx.get("forecast")
@@ -4143,28 +4127,30 @@ def layout_header(m: dict, schedule, ctx: dict, title: Optional[str],
     progress_txt = study_badge_text(forecast) if progress_on else ""
     prog_pen = _pen(m["header_progress"], "regular")
     progress_w = prog_pen.width(progress_txt) if progress_txt else 0.0
-    bar_w = max(210.0, min(progress_w, 330.0))
-    bar_h = float(max(7, int(round(12 * m["scale"]))))
+    bar_w = max(pill_w, min(progress_w or pill_w, 280.0))
+    bar_h = float(max(5, int(round(6 * m["scale"]))))
     right_w = max(pill_w, progress_w, bar_w)
     right_x = right_edge - right_w
 
     text_x = x + icon_size + m["gap_badge"]
     left_w = max(200.0, right_x - 30 - text_x)
 
-    # --- иконка календаря на лавандовом квадрате
+    # --- иконка календаря (Lucide) на лавандовом скруглении
     ops.append(_rect_op((x, y, x + icon_size, y + icon_size),
-                        icon_size * 0.30, fill=S_PURPLE, kind="icon",
+                        icon_size * 0.28, fill=S_PURPLE, kind="icon",
                         uid="header:icon:bg", owner="header"))
-    ops += _icon_ops("calendar", x, y, icon_size, S_PURPLE, uid="header:icon",
-                     owner="header", ink=S_CARD)
+    glyph = icon_size * 0.52
+    ops += _icon_ops("calendar", x + (icon_size - glyph) / 2,
+                     y + (icon_size - glyph) / 2, glyph, "#FFFFFF",
+                     uid="header:icon", owner="header")
 
     # --- метка, название группы/ФИО, дата
-    label_pen = _pen(m["header_label"], "bold")
+    label_pen = _pen(m["header_label"], "semibold")
     label = clean_text(title or "РАСПИСАНИЕ").upper()
-    spacing = max(1.6, m["header_label"] * 0.14)
+    spacing = max(0.8, m["header_label"] * 0.08)
     if label_pen.spaced_width(label, spacing) > left_w:
         label = label_pen.shorten(label, left_w)
-    label_y = y + icon_size * 0.06
+    label_y = y + 1
     ops.append(_text_op(label_pen, (text_x, label_y, text_x + left_w,
                                     label_y + label_pen.line_h()), label,
                         S_PURPLE, valign="middle", spacing=spacing,
@@ -4189,7 +4175,7 @@ def layout_header(m: dict, schedule, ctx: dict, title: Optional[str],
     title_bottom = title_y + title_h
 
     date_pen = _pen(m["header_date"], "regular")
-    date_y = title_bottom + 10
+    date_y = title_bottom + 4
     date_h = date_pen.line_h()
     date_op = _text_op(date_pen, (text_x, date_y, text_x + left_w,
                                   date_y + date_h), _day_caption(schedule),
@@ -4202,7 +4188,7 @@ def layout_header(m: dict, schedule, ctx: dict, title: Optional[str],
     if day_label in ("Сегодня", "Завтра"):
         day_ops, day_w, day_h = _pill_ops(
             m, 0.0, 0.0, day_label, role="tag", fill=S_PURPLE_L,
-            text_fill=S_PURPLE_D, weight="bold", uid="header:day",
+            text_fill=S_PURPLE_D, weight="medium", uid="header:day",
             owner="header",
         )
         day_x = date_op["bbox"][2] + m["gap_icon"] * 1.8
@@ -4213,12 +4199,9 @@ def layout_header(m: dict, schedule, ctx: dict, title: Optional[str],
 
     # --- счётчик занятий, шкала прогресса, «Изучено»
     pill_y = y + 4
-    ops.append(_shadow_op((right_x, pill_y + 2, right_x + pill_w,
-                           pill_y + pill_h + 2), pill_h / 2, uid="header:pill:shadow",
-                          blur=12, dy=4, alpha=58))
     ops.append(_rect_op((right_x, pill_y, right_x + pill_w, pill_y + pill_h),
-                        pill_h / 2.0, fill=S_CARD, kind="chip",
-                        uid="header:pill:bg", owner="header"))
+                        pill_h / 2.0, fill=S_CARD, outline=S_BORDER, width=1.0,
+                        kind="chip", uid="header:pill:bg", owner="header"))
     cursor = right_x + m["pill_pad_x"]
     ops.append(_text_op(num_pen, (cursor, pill_y, cursor + num_pen.width(num_txt) + 1,
                                   pill_y + pill_h), num_txt, S_PURPLE,
@@ -4233,7 +4216,7 @@ def layout_header(m: dict, schedule, ctx: dict, title: Optional[str],
                         uid="header:pill:word", owner="header"))
     right_bottom = pill_y + pill_h
     if progress_txt:
-        bar_y = right_bottom + m["gap_row"] * 0.7
+        bar_y = right_bottom + 8
         ops.append(_rect_op((right_edge - bar_w, bar_y, right_edge,
                              bar_y + bar_h), bar_h / 2.0, fill=S_TRACK,
                             kind="shape", uid="header:bar:bg", owner="header"))
@@ -4348,7 +4331,7 @@ def layout_footer(m: dict, W: int, H: int, note_lines: list) -> tuple:
     height = content_h + 2 * pad_y
     top = H - SAFE_AREA - height
     ops: list = [_rect_op((panel_x0, top, panel_x1, top + height),
-                          m["row_radius"], fill=_fade(S_PURPLE_L, 0.42),
+                          m["row_radius"], fill=_fade(S_PURPLE_L, 0.55),
                           kind="panel", uid="footer:panel")]
     icon_y = top + (height - icon_size) / 2
     ops += _icon_ops("cap", panel_x0 + pad_x, icon_y, icon_size, S_PURPLE,
@@ -4596,44 +4579,15 @@ def build_plan(schedule, changes: list, title: Optional[str], scale: float,
             stack.append({"kind": "card", "ops": card_ops, "height": card_h,
                           "spec": spec})
         gap = metrics["card_gap"]
-        if widen_gaps and len(stack) > 1:
-            gap += min(slack_for_gaps / max(1, len(stack) - 1), gap * 0.9)
         total = (sum(item["height"] for item in stack)
                  + gap * max(0, len(stack) - 1))
         return stack, total, gap
 
-    slack_for_gaps = 0.0
-    widen_gaps = False
+    # Карточки не растягиваем под высоту холста: 1–2 занятия остаются
+    # компактными, лишний воздух — под списком, подвал прижат к низу.
     stack, total, gap = measure(m)
     fits = total <= available
-    if fits and available - total > 4:
-        # Остаток воздуха — в зазоры между карточками (не более +90%),
-        # чтобы не было «карточки вверху, пустота внизу».
-        slack_for_gaps = available - total
-        widen_gaps = len(stack) > 1
-        wide = measure(m)
-        if wide[1] <= available:
-            stack, total, gap = wide
-            fits = True
-        else:
-            slack_for_gaps, widen_gaps = 0.0, False
-    # Занятий мало: воздух добавляем ВНУТРЬ карточек (отступы и зазоры
-    # блоков), кегли не трогаем.
     shift_top = 0.0
-    if fits and stack:
-        slack = available - total
-        n_cards = sum(1 for item in stack if item["kind"] == "card")
-        if slack > m["card_gap"] * 2 and n_cards:
-            breath = min(220.0, slack * 0.85 / n_cards)
-            while breath > 6:
-                breathed = measure(_breath_metrics(m, breath))
-                if breathed[1] <= available:
-                    stack, total, gap = breathed
-                    fits = True
-                    break
-                breath /= 2.0
-            if available - total > m["card_gap"] * 2:
-                shift_top = min(120.0, (available - total) * 0.40)
 
     # --- расстановка ---
     cards: list = []
@@ -4773,6 +4727,17 @@ def _draw_shadow(canvas: SupersampleCanvas, op: dict) -> None:
                                  op.get("fill") or S_SHADOW), (0, 0), mask)
 
 
+def _draw_svg_icon(canvas: SupersampleCanvas, op: dict) -> None:
+    """Вклеить Lucide-иконку. Размер — в пикселях суперсэмпла, чтобы штрих был резким."""
+    x0, y0, x1, y1 = op["box"]
+    ss = canvas.ss
+    side = max(1, int(round(max(x1 - x0, y1 - y0) * ss)))
+    glyph = schedule_icons.icon_image(op["name"], side, op["color"])
+    canvas.image.paste(
+        glyph, (int(round(x0 * ss)), int(round(y0 * ss))), glyph,
+    )
+
+
 def draw_ops(canvas: SupersampleCanvas, ops: list) -> None:
     """Единственное место, которое что-то рисует: только исполняет ops."""
     draw = canvas.draw
@@ -4815,6 +4780,8 @@ def draw_ops(canvas: SupersampleCanvas, ops: list) -> None:
                         cursor += font.getlength(ch) + spacing
                 else:
                     draw.text((ox * ss, oy * ss), line, font=font, fill=fill)
+        elif kind == "icon":
+            _draw_svg_icon(canvas, op)
         elif kind == "poly":
             draw.polygon([(px * ss, py * ss) for px, py in op["points"]],
                          fill=op["fill"])
@@ -4966,9 +4933,9 @@ def render_schedule_image(
       лестнице форматов; кропа не бывает никогда.
     - Одна картинка = одна дата. Никаких «сегодня + завтра» вместе.
     - Карточка пары: номер, время, предмет, преподаватель и аудитория —
-      мягкой зелёной плашкой, а не «кричащим» чипом.
-    - Отдельной колонки «Изменения» нет: ИЗМЕНЕНО/ДОБАВЛЕНО/ОТМЕНА и
-      сами правки показываются внутри карточки соответствующей пары.
+      лавандовая колонка с крупным кодом комнаты, не зелёная плашка.
+    - Отдельной колонки «Изменения» нет: ИЗМЕНЕНО/ДОБАВЛЕНО и пилюля
+      «Занятие отменено» показываются внутри карточки соответствующей пары.
     - `changes=None` -> обычный день; `changes=[...]` -> карточки с
       инлайн-изменениями. `title` -> метка в шапке.
     - Перед сохранением layout проходит validate_layout(): ни один
@@ -7054,3 +7021,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
