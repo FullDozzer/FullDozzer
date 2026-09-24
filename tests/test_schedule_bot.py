@@ -57,6 +57,11 @@ def hex_rgb(value: str) -> tuple:
     return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
 
 
+def plan_pad(plan) -> float:
+    """Внутренний горизонтальный отступ карточки из метрик плана."""
+    return float(plan["metrics"]["pad_x"])
+
+
 def rendered_text() -> str:
     """Весь текст, реально нарисованный на последней картинке."""
     plan = bot._LAST_RENDER["plan"]
@@ -1254,18 +1259,18 @@ class TestPillowRendering(unittest.TestCase):
         ])
 
     # --- формат ---
-    def test_image_is_portrait_4_to_5(self):
-        """Один день = одна вертикальная картинка 4:5 (1080×1350)."""
+    def test_image_is_portrait_2_to_3(self):
+        """Один день = одна вертикальная картинка 2:3 (1080×1620)."""
         self.assertEqual((bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT),
-                         (1080, 1350))
+                         (1080, 1620))
         path = bot.render_schedule_image(self.four_pairs())
         with Image.open(path) as img:
             w, h = img.size
-        self.assertEqual((w, h), (1080, 1350))
+        self.assertEqual((w, h), (1080, 1620))
         self.assertGreater(h, w, "картинка должна быть вертикальной")
-        self.assertEqual(round(h / w, 2), 1.25, "соотношение ~4:5")
+        self.assertEqual(round(h / w, 2), 1.5, "соотношение ~2:3")
         # длинная сторона в разумных пределах: без «чрезмерно высокого» холста
-        self.assertLessEqual(h, 1740)
+        self.assertLessEqual(h, 1980)
 
     def test_text_is_supersampled_and_sharp(self):
         """Рендер идёт в 2x и даунскейлится — иначе текст в превью мыльный."""
@@ -1298,32 +1303,46 @@ class TestPillowRendering(unittest.TestCase):
             self.assertEqual(bot._LAST_RENDER["problems"], [])
             self.assertGreater(bot._LAST_RENDER["elements"], 10)
 
-    # --- аудитория как главный акцент ---
-    def test_room_is_rendered_big_and_bold(self):
+    # --- аудитория: зелёная плашка, аккуратная, но заметная ---
+    def test_room_is_rendered_as_a_green_panel(self):
         path = bot.render_schedule_image(self.four_pairs())
+        plan = bot._LAST_RENDER["plan"]
+        panels = [op for op in plan["ops"] if op.get("kind") == "panel"
+                  and op.get("fill") == bot.S_GREEN_L]
+        self.assertEqual(len(panels), 4, "нет зелёных плашек аудиторий")
+        rooms = ops_with("room")
         room_sizes = text_sizes("room")
         self.assertEqual(len(room_sizes), 4)
-        for op in ops_with("room"):
-            self.assertIn("АУД.", op["lines"][0])
-        room = min(room_sizes)
-        self.assertGreaterEqual(room, bot.ROOM_FONT_MIN)
-        # крупнее преподавателя и любой второстепенной строки
-        self.assertGreater(room, max(text_sizes("teacher")))
-        self.assertGreater(room, max(text_sizes("small")))
-        # и сопоставимо со временем/предметом, а не мелкий текст в углу
-        self.assertGreaterEqual(room, max(text_sizes("subject")))
-        self.assertGreater(room, 0.9 * max(text_sizes("time")))
+        for op in rooms:
+            self.assertIn("Ауд.", op["lines"][0])
+            box = op["bbox"]
+            self.assertTrue(
+                any(p["box"][0] <= box[0] + 1 and p["box"][2] >= box[2] - 1
+                    and p["box"][1] <= box[1] + 1 and p["box"][3] >= box[3] - 1
+                    for p in panels),
+                "аудитория нарисована вне зелёной плашки",
+            )
+        # аудитория заметнее преподавателя…
+        self.assertGreaterEqual(min(room_sizes), max(text_sizes("teacher")))
+        if ops_with("hours"):
+            self.assertGreater(min(text_sizes("hours")),
+                               max(text_sizes("teacher")))
+        # …но не «кричат»: кегль в одном диапазоне с предметом
+        self.assertLessEqual(max(room_sizes), max(text_sizes("subject")) + 1)
+        self.assertGreaterEqual(min(room_sizes), bot.ROOM_FONT_MIN)
+        for op in ops_with("hours"):
+            self.assertEqual(op["fill"], bot.S_GREEN_D)
         with Image.open(path) as img:
             px = img.convert("RGB").load()
-            # зелёный чип аудитории реально нарисован
-            green = hex_rgb(bot.S_GREEN_D)
+            # зелёная плашка аудитории реально нарисована
+            green = hex_rgb(bot.S_GREEN_L)
             self.assertTrue(any(
-                close(px[x, y], green, 10)
-                for y in range(0, img.height, 2) for x in range(0, img.width, 2)
-            ), "зелёный текст аудитории не найден")
+                close(px[x, y], green, 5)
+                for y in range(0, img.height, 3) for x in range(0, img.width, 3)
+            ), "зелёная плашка аудитории не найдена")
 
     def test_room_font_never_drops_below_floor_with_many_lessons(self):
-        """Много занятий — компакте Everything, КРОМЕ текста аудитории."""
+        """Много занятий — компактнее всё, КРОМЕ аудитории и её часов."""
         lessons = [lesson(chr(ord("I") + i), None, f"Предмет {i}",
                           f"ПК{i:03d}", "Иванова А.А.",
                           f"{8 + i:02d}:00", f"{9 + i:02d}:00")
@@ -1333,14 +1352,17 @@ class TestPillowRendering(unittest.TestCase):
                          lessons=lessons))
         plan = bot._LAST_RENDER["plan"]
         self.assertEqual(bot._LAST_RENDER["problems"], [])
-        self.assertLess(plan["scale"], 0.75, "плотный день должен уплотниться")
+        self.assertLessEqual(plan["scale"], 0.80,
+                             "плотный день должен уплотниться")
         for op in ops_with("room"):
             self.assertGreaterEqual(op["size"], bot.ROOM_FONT_MIN)
-        self.assertLess(max(text_sizes("teacher")), bot.ROOM_FONT_MIN)
+        # второстепенные строки не крупнее аудитории — но и не «в пол»
+        self.assertLessEqual(max(text_sizes("teacher")),
+                             min(text_sizes("room")))
         with Image.open(path) as img:
             self.assertEqual(img.size[0], bot.SCHEDULE_WIDTH)
-            self.assertGreater(img.size[1], bot.SCHEDULE_HEIGHT,
-                               "если не влезает — растёт холст, а не кроп")
+            self.assertGreaterEqual(img.size[1], bot.SCHEDULE_HEIGHT,
+                                    "если не влезает — растёт холст, а не кроп")
             self.assertEqual(outside_safe_area(img, bot.SAFE_AREA - 6), [])
 
     # --- изменения внутри карточки, без правой колонки ---
@@ -1361,7 +1383,7 @@ class TestPillowRendering(unittest.TestCase):
         text = rendered_text()
         # и старая, и новая аудитория — внутри карточки
         self.assertIn("Аудитория: УК105 → УК103", text)
-        self.assertIn("АУД. УК103", text)
+        self.assertIn("Ауд. УК103", text)
         self.assertIn("ИЗМЕНЕНО", text)
         # колонки «Изменения» больше нет ни в layout, ни на картинке
         plan = bot._LAST_RENDER["plan"]
@@ -1393,8 +1415,8 @@ class TestPillowRendering(unittest.TestCase):
         )]
         bot.render_schedule_image(schedule, changes=changes)
         text = rendered_text()
-        self.assertIn("ЗАНЯТИЕ ОТМЕНЕНО", text)
-        self.assertIn("АУД. УК307", text)   # аудитию не выбрасываем
+        self.assertIn("Занятие отменено", text)
+        self.assertIn("Ауд. УК307", text)   # аудиторию не выбрасываем
         plan = bot._LAST_RENDER["plan"]
         self.assertEqual(len(plan["cards"]), 2)
         cancelled = plan["specs"][1]
@@ -1438,8 +1460,8 @@ class TestPillowRendering(unittest.TestCase):
         )]
         path = bot.render_schedule_image(schedule, changes=changes)
         text = rendered_text()
-        self.assertIn("1 п/гр.", text)
-        self.assertIn("2 п/гр.", text)
+        self.assertIn("1 П/ГР.", text)
+        self.assertIn("2 П/ГР.", text)
         self.assertTrue(Path(path).exists())
         self.assertEqual(bot._LAST_RENDER["problems"], [])
 
@@ -1474,7 +1496,8 @@ class TestPillowRendering(unittest.TestCase):
         self.assertIn("Занятий нет", text)
         self.assertEqual(bot._LAST_RENDER["problems"], [])
         with Image.open(path) as img:
-            self.assertEqual(img.size, (1080, 1350))
+            self.assertEqual(img.size, (bot.SCHEDULE_WIDTH,
+                                        bot.SCHEDULE_HEIGHT))
 
     def test_two_days_never_share_one_image(self):
         """Сегодня и завтра — две отдельные картинки, каждая про свой день."""
@@ -1588,14 +1611,15 @@ class TestLessonCount(unittest.TestCase):
 class TestCancelledLessonRendering(unittest.TestCase):
     """Отмена занятия («~..............») на картинке расписания.
 
-    Отменённая пара — это обычная карточка в той же колонке: мягкий
-    красно-розовый фон, крупная плашка «ЗАНЯТИЕ ОТМЕНЕНО», аудитория
-    остаётся, если она есть в данных.
+    Отменённая пара — обычная карточка в той же колонке: мягкая розовая
+    плашка внутри карточки, пилюля «Занятие отменено», красный бейдж
+    «ОТМЕНА»; аудитория остаётся, если она есть в данных.
     """
 
-    RED = hex_rgb(bot.S_RED)          # плашка отмены
+    RED = hex_rgb(bot.S_RED)          # бейдж «ОТМЕНА»
     RED_BG = hex_rgb(bot.S_RED_L)     # фон отменённой карточки
     GREEN_TEXT = hex_rgb(bot.S_GREEN_D)
+    GREEN_MUTED = hex_rgb(bot.S_GREEN_M)
     GREEN_BG = hex_rgb(bot.S_GREEN_L)
 
     def cancelled_schedule(self, room="—"):
@@ -1611,34 +1635,47 @@ class TestCancelledLessonRendering(unittest.TestCase):
     def test_cancelled_card_is_red_and_has_no_right_panel(self):
         path = bot.render_schedule_image(self.cancelled_schedule())
         plan = bot._LAST_RENDER["plan"]
+        # мягкая розовая плашка отмены внутри карточки
+        pink = [op for op in plan["ops"] if op.get("kind") == "panel"
+                and op.get("fill") == bot.S_RED_L]
+        self.assertTrue(pink, "нет розовой плашки отмены")
         with Image.open(path) as img:
             box = tuple(int(v) for v in plan["cards"][0]["box"])
+            panel_box = tuple(int(v) for v in pink[0]["box"])
             px = img.convert("RGB").load()
-            # мягкий красно-розовый фон карточки
             self.assertTrue(any(
-                close(px[x, box[1] + 4], self.RED_BG, 6)
-                for x in range(box[0] + 30, box[2] - 30, 7)
-            ), "фон отменённой карточки не красно-розовый")
-            # крупная плашка «ЗАНЯТИЕ ОТМЕНЕНО» внутри карточки
-            banner = [op for op in plan["ops"] if op["op"] == "text"
-                      and "ЗАНЯТИЕ ОТМЕНЕНО" in " ".join(op["lines"])]
-            self.assertEqual(len(banner), 1)
-            self.assertTrue(box[0] <= banner[0]["bbox"][0]
-                            and banner[0]["bbox"][2] <= box[2],
+                close(px[x, panel_box[1] + 3], self.RED_BG, 6)
+                for x in range(panel_box[0] + 20, panel_box[2] - 20, 7)
+            ), "плашка отмены не красно-розовая")
+            self.assertTrue(panel_box[0] >= box[0] and panel_box[2] <= box[2],
                             "плашка отмены вышла за карточку")
+            # пилюля «Занятие отменено» — внутри карточки, красным текстом
+            pill = [op for op in plan["ops"] if op["op"] == "text"
+                    and "Занятие отменено" in " ".join(op["lines"])]
+            self.assertEqual(len(pill), 1)
+            self.assertEqual(pill[0]["fill"], bot.S_RED_D)
+            self.assertTrue(box[0] <= pill[0]["bbox"][0]
+                            and pill[0]["bbox"][2] <= box[2],
+                            "пилюля отмены вышла за карточку")
+            # красный бейдж «ОТМЕНА» справа
+            badge = [op for op in plan["ops"] if op.get("kind") == "chip"
+                     and op.get("fill") == bot.S_RED]
+            self.assertTrue(badge, "нет красного бейджа ОТМЕНА")
+            badge_op = badge[0]
             self.assertTrue(any(
-                close(px[x, int(banner[0]["bbox"][1]) + 2], self.RED, 8)
-                for x in range(int(banner[0]["bbox"][0]),
-                               int(banner[0]["bbox"][2]), 5)
-            ), "плашка отмены не нарисована красным")
+                close(px[x, int((badge_op["box"][1] + badge_op["box"][3]) / 2)],
+                      self.RED, 8)
+                for x in range(int(badge_op["box"][0]),
+                               int(badge_op["box"][2]), 5)
+            ), "бейдж ОТМЕНА не нарисован красным")
         self.assertNotIn("panel", plan["owners"])
 
     def test_cancelled_card_keeps_room_when_data_has_a_room(self):
-        """Отменённое занятие без аудитории ≠ отмена с аудиторией: чип нужен."""
+        """Отменённое занятие без аудитории ≠ отмена с аудиторией: плашка нужна."""
         path = bot.render_schedule_image(self.cancelled_schedule(room="УК307"))
         text = rendered_text()
-        self.assertIn("ЗАНЯТИЕ ОТМЕНЕНО", text)
-        self.assertIn("АУД. УК307", text)
+        self.assertIn("Занятие отменено", text)
+        self.assertIn("Ауд. УК307", text)
         rooms = ops_with("room")
         self.assertEqual(len(rooms), 1)
         self.assertGreaterEqual(rooms[0]["size"], bot.ROOM_FONT_MIN)
@@ -1648,17 +1685,18 @@ class TestCancelledLessonRendering(unittest.TestCase):
             self.assertGreater(rooms[0]["size"], max(op["size"] for op in small))
         with Image.open(path) as img:
             px = img.convert("RGB").load()
-            chip_y = int(rooms[0]["bbox"][1] + 1)
+            # под аудиторию нарисована зелёная плашка (а не «серая строка»)
+            chip_y = int(rooms[0]["bbox"][3]) + 2
             self.assertTrue(any(
-                close(px[x, chip_y], self.GREEN_TEXT, 10)
+                close(px[x, chip_y], self.GREEN_BG, 6)
                 for x in range(0, img.width, 3)
             ), "аудитория отменённой пары не подсвечена зелёным")
 
     def test_cancelled_card_without_room_says_so_quietly(self):
         bot.render_schedule_image(self.cancelled_schedule())
         text = rendered_text()
-        self.assertIn("ЗАНЯТИЕ ОТМЕНЕНО", text)
-        self.assertNotIn("АУД.", text)
+        self.assertIn("Занятие отменено", text)
+        self.assertNotIn("Ауд.", text)
         self.assertEqual(bot._LAST_RENDER["problems"], [])
 
     def test_cancellation_is_shorter_than_a_full_card(self):
@@ -1702,7 +1740,6 @@ class TestImageLayoutFixes(unittest.TestCase):
 
     BG = hex_rgb(bot.S_BG)
     MUTED = hex_rgb(bot.S_MUTED)
-    GOTHIC = hex_rgb(bot.S_GOTHIC)
 
     def make(self, break_duration="", day=None):
         item = lesson("I", None, "Химия Н и Г", "УК307", "Арнаутова А.В.",
@@ -1711,14 +1748,34 @@ class TestImageLayoutFixes(unittest.TestCase):
         return bot.Schedule(date=day or date(2026, 9, 9),
                             group=bot.GROUP_NAME, lessons=[item])
 
+    DECOR = (hex_rgb(bot.S_BG_LIGHT), hex_rgb(bot.S_BG_DEEP))
+    SHADOW = hex_rgb(bot.S_SHADOW)
+
+    def is_filler(self, pixel) -> bool:
+        """Фон, подложка или мягкая тень карточки — не нарисованный контент."""
+        bases = (self.BG,) + self.DECOR
+        for base in bases:
+            if close(pixel, base, 2):
+                return True
+            # тень — смесь подложки и S_SHADOW: пиксель лежит на отрезке
+            vec = [self.SHADOW[i] - base[i] for i in range(3)]
+            norm = sum(v * v for v in vec) or 1
+            t = sum((pixel[i] - base[i]) * vec[i] for i in range(3)) / norm
+            if not (0.0 <= t <= 1.05):
+                continue
+            if sum((pixel[i] - (base[i] + t * vec[i])) ** 2
+                   for i in range(3)) <= 144:
+                return True
+        return False
+
     def drawn_rows(self, path):
-        """Строки, где есть хоть один пиксель не цвета фона."""
+        """Строки с нарисованным контентом (без фона, подложек и теней)."""
         with Image.open(path) as img:
             im = img.convert("RGB")
             px = im.load()
             return [
                 y for y in range(im.height)
-                if any(px[x, y] != self.BG
+                if any(not self.is_filler(px[x, y])
                        for x in range(20, im.width - 20, 4))
             ]
 
@@ -1737,8 +1794,8 @@ class TestImageLayoutFixes(unittest.TestCase):
                        for x in range(60, img.width - 60, 2))
             ]
 
-    def test_break_row_is_compact_line_between_cards(self):
-        """«перемена N мин» — отдельная тихая строка НАД карточкой пары."""
+    def test_break_label_sits_in_the_time_row_of_its_card(self):
+        """«перемена N мин» — тихая пометка справа в строке времени пары."""
         first = lesson("I", None, "Химия", "УК307", "Арнаутова А.В.",
                        "08:30", "09:50")
         first.break_duration = "30 мин"
@@ -1749,41 +1806,28 @@ class TestImageLayoutFixes(unittest.TestCase):
                                            "Мурзабулатова Ф.Ф.", "10:00",
                                            "11:20"),
                                 ])
-        path = bot.render_schedule_image(schedule)
+        bot.render_schedule_image(schedule)
         plan = bot._LAST_RENDER["plan"]
         breaks = [op for op in plan["ops"] if op["op"] == "text"
                   and "перемена" in " ".join(op["lines"]).lower()]
         self.assertEqual(len(breaks), 1)
-        b = breaks[0]
+        label = breaks[0]
         first_card = plan["cards"][0]["box"]
-        second_card = plan["cards"][1]["box"]
-        # пауза объявлена у пары I -> строка между карточкой I и карточкой II
-        self.assertGreaterEqual(b["bbox"][1], first_card[3],
-                                "строка перемены залезла в свою карточку")
-        self.assertLessEqual(b["bbox"][3], second_card[1] + 1,
-                             "строка перемены залезла в следующую карточку")
-        # компактная: не больше высоты служебной строки
-        self.assertLess(b["bbox"][3] - b["bbox"][1],
-                        plan["cards"][1]["box"][3] -
-                        plan["cards"][1]["box"][1])
-        # текст перемены тихий (S_MUTED), а не основной
-        self.assertLess(b["size"], min(text_sizes("room")))
+        # пометка — внутри СВОЕЙ карточки, в строке времени
+        self.assertGreaterEqual(label["bbox"][1], first_card[1])
+        self.assertLessEqual(label["bbox"][3], first_card[3])
+        self.assertEqual(label["fill"], bot.S_MUTED)
+        # тише аудитории и времени, но заметнее «шума»
+        self.assertLess(label["size"], min(text_sizes("room")))
+        self.assertGreaterEqual(label["size"], bot.S_TYPE_MIN["small"])
+        # у пары с паузой есть иконка часов рядом с пометкой
+        clock = [op for op in plan["ops"]
+                 if ":meta:icon" in str(op.get("id"))]
+        self.assertTrue(clock, "нет иконки часов у пометки про перемену")
         self.assertEqual(bot._LAST_RENDER["problems"], [])
-        # рядом с текстом — тонкие разделительные линии (hairline)
-        with Image.open(path) as img:
-            px = img.convert("RGB").load()
-            bg = hex_rgb(bot.S_BG)
-            band = range(int(b["bbox"][1]) - 6, int(b["bbox"][3]) + 6)
-            hair_rows = []
-            for y in band:
-                left = [x for x in range(0, int(b["bbox"][0]) - 12)
-                        if sum(abs(px[x, y][i] - bg[i]) for i in range(3)) >= 6]
-                right = [x for x in range(int(b["bbox"][2]) + 12, img.width)
-                         if sum(abs(px[x, y][i] - bg[i]) for i in range(3)) >= 6]
-                if len(left) > 150 and len(right) > 150:
-                    hair_rows.append(y)
-        self.assertTrue(hair_rows,
-                        "вокруг текста перемены нет разделительных линий")
+        # тихая пометка выровнена по правому краю карточки
+        self.assertAlmostEqual(label["bbox"][2], first_card[2] - plan_pad(plan),
+                               delta=plan_pad(plan) + 2)
 
     def test_break_line_does_not_move_room_or_subject(self):
         """Наличие перемены не сдвигает левый край контента карточки."""
@@ -1804,7 +1848,7 @@ class TestImageLayoutFixes(unittest.TestCase):
         self.assertAlmostEqual(left_with_break, left_without, delta=1.0)
 
     def test_nothing_below_last_card_except_footer(self):
-        """Под последней карточкой — только подвал (арка + сноска)."""
+        """Под последней карточкой — только плашка подвала со сноской."""
         schedule = bot.parse_schedule(PROVIDED_HTML, date(2026, 9, 7))
         path = bot.render_schedule_image(schedule)
         rows = self.drawn_rows(path)
@@ -1812,14 +1856,16 @@ class TestImageLayoutFixes(unittest.TestCase):
             plan = bot._LAST_RENDER["plan"]
             height = img.height
             last_card_bottom = int(max(c["box"][3] for c in plan["cards"]))
-            footer_rows = (set(self.rows_of(path, self.GOTHIC))
-                           | set(self.rows_of(path, self.MUTED)))
-        below = [y for y in rows if y > last_card_bottom + 20]
         notes = self.footer_note_rows(plan)
-        self.assertEqual(set(below) - footer_rows, set(),
-                         "под последней карточкой есть лишние элементы")
-        self.assertEqual(bool(below), bool(notes),
-                         "подвал рисуется только когда есть сноска")
+        panels = [op for op in plan["ops"] if op.get("id") == "footer:panel"]
+        below = [y for y in rows if y > last_card_bottom + 20]
+        if notes:
+            self.assertTrue(panels, "нет плашки подвала со сносками")
+            panel_box = panels[0]["box"]
+            self.assertGreaterEqual(min(below), int(panel_box[1]) - 2)
+            self.assertLessEqual(max(below), int(panel_box[3]) + 1)
+        else:
+            self.assertEqual(below, [], "под карточкой есть лишние элементы")
         # нижний контент не прижат к краю холста (safe area минус
         # антиалиасинг нижних выносных элементов)
         self.assertGreaterEqual(height - 1 - max(rows), bot.SAFE_AREA - 20)
@@ -1875,8 +1921,8 @@ class TestImageLayoutFixes(unittest.TestCase):
                            1)
         self.assertGreater(box_two[3] - box_two[1], box_one[3] - box_one[1])
         text = rendered_text()
-        self.assertIn("1 п/гр.", text)
-        self.assertIn("2 п/гр.", text)
+        self.assertIn("1 П/ГР.", text)
+        self.assertIn("2 П/ГР.", text)
         # у каждой подгруппы своя аудитория
         self.assertEqual(len(ops_with("room")), 2)
 
@@ -1901,13 +1947,13 @@ class TestScheduleCardDesign(unittest.TestCase):
 
     def test_format_is_vertical_and_ratio_ladder_is_consistent(self):
         self.assertEqual((bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT),
-                         (1080, 1350))
+                         (1080, 1620))
         heights = [h for h, _ in bot.SCHEDULE_RATIO_LADDER]
         self.assertEqual(heights[0], bot.SCHEDULE_HEIGHT)
         self.assertEqual(heights, sorted(heights), "лестница форматов по росту")
         self.assertTrue(all(h > bot.SCHEDULE_WIDTH for h in heights),
                         "все форматы вертикальные")
-        self.assertLessEqual(max(heights), 1740)
+        self.assertLessEqual(max(heights), 1980)
         path = bot.render_schedule_image(self.schedule_with_subgroups())
         with Image.open(path) as img:
             self.assertEqual(img.size, (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
@@ -1964,8 +2010,8 @@ class TestScheduleCardDesign(unittest.TestCase):
                 self.assertLessEqual(bbox[2], zone[2] + 1)
                 self.assertLessEqual(bbox[3], zone[3] + 1)
 
-    def test_hierarchy_time_subject_room_teacher(self):
-        """Порядок и иерархия: время > аудитория > предмет > преподаватель."""
+    def test_hierarchy_time_subject_teacher_room(self):
+        """Иерархия: время → предмет → преподаватель, аудитория — справа."""
         bot.render_schedule_image(self.schedule_with_subgroups())
         plan = bot._LAST_RENDER["plan"]
         card = plan["cards"][0]["box"]
@@ -1979,34 +2025,45 @@ class TestScheduleCardDesign(unittest.TestCase):
 
         time_op = first_in_card("time")
         subject_op = first_in_card("subject")
-        room_op = first_in_card("room")
         teacher_op = first_in_card("teacher")
+        room_op = first_in_card("room")
         self.assertLess(time_op["bbox"][1], subject_op["bbox"][1])
-        self.assertLess(subject_op["bbox"][1], room_op["bbox"][1])
-        # преподаватель — ниже предмета: строкой под чипом либо в одной
-        # строке справа от чипа (чип из-за этого не сжимается)
-        self.assertLessEqual(room_op["bbox"][1] - teacher_op["bbox"][1],
-                             room_op["bbox"][3] - room_op["bbox"][1])
-        self.assertGreater(teacher_op["bbox"][3], subject_op["bbox"][3])
-        self.assertGreaterEqual(time_op["size"], room_op["size"])
-        self.assertGreaterEqual(room_op["size"], subject_op["size"])
+        self.assertLess(subject_op["bbox"][1], teacher_op["bbox"][1])
+        # кегли: время крупнее предмета, предмет — крупнее мелочей
+        self.assertGreater(time_op["size"], subject_op["size"])
         self.assertGreater(subject_op["size"], teacher_op["size"])
         self.assertGreaterEqual(room_op["size"], bot.ROOM_FONT_MIN)
-        # аудитория — в отдельном залитом чипе, а не мелкий текст в углу
-        chip = [op for op in plan["ops"] if op.get("kind") == "chip"
-                and op_box(op)[0] <= room_op["bbox"][0] + 1
-                and op_box(op)[2] >= room_op["bbox"][2] - 1]
-        self.assertTrue(chip, "под аудиторией нет плашки-чипа")
+        self.assertGreater(room_op["size"], teacher_op["size"])
+        # аудитория — в зелёной плашке справа, а не мелкий текст в углу
+        panels = [op for op in plan["ops"] if op.get("kind") == "panel"
+                  and op.get("fill") == bot.S_GREEN_L]
+        self.assertTrue(panels, "нет зелёной плашки аудитории")
+        self.assertTrue(any(p["box"][0] <= room_op["bbox"][0] + 1
+                            and p["box"][2] >= room_op["bbox"][2] - 1
+                            for p in panels),
+                        "аудитория нарисована вне плашки")
+        self.assertGreater(room_op["bbox"][0], subject_op["bbox"][0],
+                           "плашка аудитории должна быть справа от текста")
 
-    def test_gothic_accent_present_but_subtle(self):
+    def test_background_is_lavender_with_soft_diagonals(self):
+        """Фон холста — светлая лаванда с едва заметными подложками."""
         path = bot.render_schedule_image(self.schedule_with_subgroups())
         plan = bot._LAST_RENDER["plan"]
-        arch = [op for op in plan["ops"] if "arch" in str(op.get("id"))]
-        self.assertTrue(arch, "готическая арка не нарисована")
-        rows = self.rows_of(path, hex_rgb(bot.S_GOTHIC), tol=3)
-        drawn = len(self.drawn_rows(path))
-        self.assertLess(len(rows) / max(1, drawn), 0.06,
-                        "декоративный акцент занимает слишком много места")
+        decor = [op for op in plan["ops"]
+                 if str(op.get("id")).startswith("deco:bg")]
+        self.assertTrue(decor, "нет декоративных подложек фона")
+        with Image.open(path) as img:
+            px = img.convert("RGB").load()
+            bg = hex_rgb(bot.S_BG)
+            self.assertTrue(close(px[2, 2], bg, 6), "фон холста не лавандовый")
+            self.assertTrue(close(px[img.width - 3, img.height - 3], bg, 6)
+                            or close(px[img.width - 3, img.height - 3],
+                                     hex_rgb(bot.S_BG_LIGHT), 6))
+        # подложки отличаются от фона совсем немного — это фон, не контент
+        for color in (bot.S_BG_LIGHT, bot.S_BG_DEEP):
+            diff = sum(abs(a - b) for a, b in zip(hex_rgb(color), bg))
+            self.assertLessEqual(diff, 30, "подложка слишком контрастная")
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
 
     @staticmethod
     def drawn_rows(path):
@@ -2075,11 +2132,10 @@ class TestTotalStudyBadge(DBTestCase):
         return clusters
 
     def progress_lines(self):
-        """Строки прогресса внутри карточек (роль small)."""
+        """Изученные часы внутри плашки аудитории (роль hours)."""
         plan = bot._LAST_RENDER["plan"]
         return [op for op in plan["ops"] if op["op"] == "text"
-                and op.get("role") == "small"
-                and "Изучено" in " ".join(op["lines"])]
+                and op.get("role") == "hours"]
 
     # --- прогресс в карточках ---
     def test_subject_progress_shown_on_group_image(self):
@@ -2101,19 +2157,23 @@ class TestTotalStudyBadge(DBTestCase):
         card = bot._LAST_RENDER["plan"]["cards"][0]["box"]
         self.assertLessEqual(lines[0]["bbox"][0], card[2])
         self.assertLessEqual(lines[0]["bbox"][2], card[2])
-        # аудитория всё равно крупнее строки прогресса
-        self.assertGreater(min(text_sizes("room")), lines[0]["size"])
+        # аудитория и часы заметнее преподавателя, но мельче времени
+        self.assertGreater(min(text_sizes("room")), max(text_sizes("teacher")))
+        self.assertGreater(lines[0]["size"], max(text_sizes("teacher")))
+        self.assertLessEqual(lines[0]["size"], max(text_sizes("subject")) + 2)
         self.assertTrue(self.card_rows_of(self.GREEN_TEXT),
                         "зелёная строка прогресса не нарисована")
 
-    def test_subject_progress_without_history_is_muted_first_lesson(self):
+    def test_subject_progress_without_history_is_not_shown(self):
+        """Нет истории — нет и шумной строки: карточка остаётся спокойной."""
         schedule = bot.Schedule(
             date=date(2026, 9, 7), group=bot.GROUP_NAME,
             lessons=[lesson("I", None, "Новый предмет", "УК307",
                             "Иванова А.А.", "08:30", "09:50")],
         )
         path = bot.render_schedule_image(schedule)
-        self.assertIn("Первое занятие по предмету", rendered_text())
+        self.assertEqual(self.progress_lines(), [])
+        self.assertNotIn("Первое занятие по предмету", rendered_text())
         self.assertEqual(bot.get_subject_progress("Новый предмет"),
                          "Первое занятие по предмету")
         self.assertEqual(bot._LAST_RENDER["problems"], [])
@@ -2725,7 +2785,8 @@ class TestAcademicHours(StudyDBTestCase):
         path = bot.render_schedule_image(schedule)
         notes = self.footer_note_ops()
         self.assertGreaterEqual(len(notes), 2)
-        self.assertIn("40 мин", " ".join(notes[0]["lines"]))
+        self.assertIn("40 мин", " ".join(" ".join(op["lines"])
+                                        for op in notes))
         plan = bot._LAST_RENDER["plan"]
         last_card = max(c["box"][3] for c in plan["cards"])
         for op in notes:
@@ -2875,25 +2936,32 @@ class TestFooterSignatureRemoved(StudyDBTestCase):
         # нарисованным элементом: снизу остаётся нижний padding.
         note = self.note_rows(path)
         self.assertTrue(note, "сноска про академический час исчезла")
-        # нижняя строка сноски = последний нарисованный ряд (±2 пикселя
-        # на антиалиасинг скруглённых вниз штрихов)
-        self.assertLessEqual(max(self.drawn_rows(path)) - max(note), 3,
+        # ниже сноски — только нижний отступ светлой плашки подвала
+        # (внутренний отступ плашки + safe area до края холста)
+        self.assertLessEqual(max(self.drawn_rows(path)) - max(note),
+                             bot.SAFE_AREA + 34,
                              "под сноской нарисовано что-то ещё")
         self.assertGreaterEqual(max(note) - min(note), 1)
         with Image.open(path) as img:
             height, width = img.height, img.width
         self.assertGreaterEqual(height - 1 - max(note), bot.SAFE_AREA - 10,
                                 "сноска прижата к нижнему краю")
-        self.assertLessEqual(height - 1 - max(note), bot.SAFE_AREA + 12)
-        # сноска отцентрована и не выходит в боковые поля
-        notes = [op for op in bot._LAST_RENDER["plan"]["ops"]
+        self.assertLessEqual(height - 1 - max(note), bot.SAFE_AREA + 46)
+        # сноски — в плашке подвала, внутри safe area
+        plan = bot._LAST_RENDER["plan"]
+        notes = [op for op in plan["ops"]
                  if str(op.get("id")).startswith("footer:note")]
         self.assertTrue(notes)
+        panel = [op for op in plan["ops"] if op.get("id") == "footer:panel"]
+        self.assertTrue(panel, "нет плашки подвала")
+        panel_box = panel[0]["box"]
+        self.assertGreaterEqual(panel_box[0], bot.SAFE_AREA - 1)
+        self.assertLessEqual(panel_box[2], width - bot.SAFE_AREA + 1)
         for op in notes:
-            self.assertGreaterEqual(op["bbox"][0], bot.SAFE_AREA - 1)
-            self.assertLessEqual(op["bbox"][2], width - bot.SAFE_AREA + 1)
-            self.assertLess(abs((op["bbox"][0] + op["bbox"][2]) / 2 - width / 2),
-                            40, "сноска не отцентрована")
+            self.assertGreaterEqual(op["bbox"][0], panel_box[0])
+            self.assertLessEqual(op["bbox"][2], panel_box[2] + 1)
+            self.assertGreater(op["bbox"][1], panel_box[1])
+            self.assertLess(op["bbox"][3], panel_box[3])
         self.assertEqual(bot._LAST_RENDER["problems"], [])
 
     def test_status_image_has_no_footer_signature(self):
