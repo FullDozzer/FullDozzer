@@ -153,6 +153,7 @@ class DBTestCase(unittest.TestCase):
         with bot.db_connect() as conn:
             conn.execute("DELETE FROM schedule_state")
             conn.execute("DELETE FROM schedule_notifications")
+            conn.execute("DELETE FROM schedule_cache")
             conn.execute("DELETE FROM subscribers")
             conn.execute("DELETE FROM user_settings")
             conn.execute("DELETE FROM teacher_subscribers")
@@ -785,7 +786,25 @@ class TestMonitoring(DBTestCase):
     def test_no_subscribers_no_crash(self):
         run(bot._check_date(self.bot, self.day))
         self.assertEqual(self.bot.sent, [])
-        self.assertNotIn(self.day.isoformat(), bot.load_state())
+        self.assertIn(self.day.isoformat(), bot.load_state())
+        self.assertIsNotNone(
+            bot.load_cached_schedule(f"group:{bot.GROUP_ID}", self.day)
+        )
+
+    def test_new_subscriber_does_not_receive_already_published_schedule(self):
+        # 1. Бот уже распарсил расписание без подписчиков (со старта / в фоне).
+        run(bot._check_date(self.bot, self.day))
+        self.assertEqual(self.bot.sent, [])
+        # 2. Новый пользователь подписывается после публикации.
+        bot.subscribe_user(1099, group_id=bot.GROUP_ID)
+        run(bot._check_date(self.bot, self.day))
+        self.assertEqual(self.bot.sent, [])
+        # 3. Последующее реальное изменение расписания доставляется новому подписчику.
+        self.current_schedule[0] = make_schedule(self.day, "Физика")
+        run(bot._check_date(self.bot, self.day))
+        self.assertEqual(len(self.bot.sent), 1)
+        self.assertEqual(self.bot.sent[0][1], 1099)
+        self.assertIn("Расписание изменилось", self.bot.sent[0][2])
 
     def test_recovery_when_state_missing_but_delivered(self):
         # Эмуляция сбоя: записи о доставке есть, а baseline потерян
@@ -817,8 +836,11 @@ class TestMonitoring(DBTestCase):
             if sleep_calls["n"] > 1:
                 raise StopLoop()
 
-        async def fake_get_schedule(day):
-            return make_schedule(day, "Предмет")
+        async def fake_get_schedule(day, group_id=None):
+            sched = make_schedule(day, "Предмет")
+            if group_id is not None:
+                sched.group = bot.get_group(group_id).name
+            return sched
 
         # Фиксируем «сейчас»: даты внутри монитора не должны отличаться
         # от дат в проверках, даже если тест запущен у полуночи.
@@ -833,11 +855,16 @@ class TestMonitoring(DBTestCase):
             with self.assertRaises(StopLoop):
                 run(bot.schedule_monitor(fake_bot))
 
-            # Сегодня (2026-09-11, пятница) и завтра -> оба уведомления.
+            # Сегодня (2026-09-11, пятница) и завтра -> оба уведомления только подписчику 1001.
             self.assertFalse(bot.is_day_off(today))
-            self.assertGreaterEqual(len(fake_bot.sent), 1)
+            self.assertEqual(len(fake_bot.sent), 2)
+            self.assertTrue(all(item[1] == 1001 for item in fake_bot.sent))
             self.assertIn("Завтра", fake_bot.sent[-1][2])
             self.assertIn(tomorrow.isoformat(), bot.load_state())
+            # Остальные группы также закэшированы в schedule_cache и baseline-состоянии.
+            other_group_id = next(gid for gid in bot.GROUPS if gid != bot.GROUP_ID)
+            self.assertIsNotNone(bot.load_cached_schedule(f"group:{other_group_id}", today))
+            self.assertIn(f"group:{other_group_id}:{tomorrow.isoformat()}", bot.load_state())
 
     def test_sunday_skipped(self):
         # Воскресенье 2026-09-06
@@ -3514,6 +3541,295 @@ class TestStatusImage(DBTestCase):
             self.assertTrue(path.exists())
         finally:
             path.unlink(missing_ok=True)
+
+
+REALISTIC_STAFF_69_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head><title>Аглиуллина Фирдаус Хуснулловна — Расписание преподавателя</title></head>
+<body>
+<div class="container">
+<div class="row pb-1">
+  <div class="card myCard">
+    <div class="card-header bg-menu text-white pl-4 pr-2 text-truncate">
+      <span class="h3">II</span> пара
+      <span class="pl-2 h4">10<sup>00</sup> - 11<sup>20</sup></span>
+      <span class="pl-1">перемена 15 мин</span>
+    </div>
+    <div class="card-body p-0">
+      <div class="d-flex flex-column">
+        <div class="d-flex justify-content-between font-italic px-3 pt-1 align-items-baseline text-truncate">
+          <span class="rounded h5"></span>
+          <span class="pl-2 ">ауд.<span class="h5">АК101</span></span>
+          <span class="pl-2">гр.<span class="h5">СТ-26</span></span>
+          <div class="pl-2 py-1 h5 changesPair">
+            <div class="d-md-none text-center text-truncate" title="Русский язык">Рус.яз.</div>
+            <div class="d-none d-md-block text-wrap"><b>Рус.яз.</b> <small>Русский язык</small></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="card myCard">
+    <div class="card-header bg-menu text-white pl-4 pr-2 text-truncate">
+      <span class="h3">III</span> пара
+      <span class="pl-2 h4">11<sup>35</sup> - 12<sup>55</sup></span>
+      <span class="pl-1">перемена 30 мин</span>
+    </div>
+    <div class="card-body p-0">
+      <div class="d-flex flex-column">
+        <div class="d-flex justify-content-between font-italic px-3 pt-1 align-items-baseline text-truncate">
+          <span class="rounded h5"></span>
+          <span class="pl-2 ">ауд.<span class="h5">АК101</span></span>
+          <span class="pl-2">гр.<span class="h5">БС2-26</span></span>
+          <div class="pl-2 py-1 h5 changesPair">
+            <div class="d-md-none text-center text-truncate" title="Русский язык">Рус.яз.</div>
+            <div class="d-none d-md-block text-wrap"><b>Рус.яз.</b> <small>Русский язык</small></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="card myCard">
+  <div class="card-body p-0">
+    <table class="table-bordered w-100">
+      <tr><td>ЭС4-26</td><td>ЭС7-26</td><td>СТ-26</td></tr>
+    </table>
+  </div>
+</div>
+</div>
+</body>
+</html>
+"""
+
+
+class TestStaffGroupVisibility(DBTestCase):
+    """Парсинг и отображение учебных групп на расписании преподавателя."""
+
+    PURPLE_L = hex_rgb(bot.S_PURPLE_L)
+
+    def test_parses_groups_without_digits_before_hyphen_and_with_digits(self):
+        schedule = bot.parse_schedule(
+            REALISTIC_STAFF_69_HTML,
+            date(2026, 11, 11),
+            group="Аглиуллина Фирдаус Хуснулловна",
+            schedule_type="staff",
+            staff_id=69,
+            staff_name="Аглиуллина Фирдаус Хуснулловна",
+        )
+        self.assertEqual(len(schedule.lessons), 2)
+        first, second = schedule.lessons
+        self.assertEqual(first.pair, "II")
+        self.assertEqual(first.subject, "Рус.яз.")
+        self.assertEqual(first.room, "АК101")
+        self.assertEqual(first.teacher, "—")
+        self.assertEqual(first.groups, "СТ-26")
+
+        self.assertEqual(second.pair, "III")
+        self.assertEqual(second.subject, "Рус.яз.")
+        self.assertEqual(second.room, "АК101")
+        self.assertEqual(second.teacher, "—")
+        self.assertEqual(second.groups, "БС2-26")
+
+    def test_parses_various_group_formats_and_ignores_subgroups_and_subjects(self):
+        staff_html = """
+        <div class="card myCard">
+          <div class="card-header"><span class="h3">I</span> пара <span class="h4">08<sup>30</sup> - 09<sup>50</sup></span></div>
+          <div class="card-body p-0"><div class="d-flex flex-column"><div class="d-flex justify-content-between">
+            <span class="pl-2">ауд.<span class="h5">УК101</span></span>
+            <span class="pl-2">гр.<span class="h5">ОМ-26, БСз-26</span></span>
+            <div class="changesPair"><div class="d-md-none text-center text-truncate">МДК-01</div></div>
+          </div></div></div>
+        </div>
+        """
+        staff_sched = bot.parse_schedule(
+            staff_html, date(2026, 11, 11),
+            group="Тестов И.И.", schedule_type="staff", staff_id=1, staff_name="Тестов И.И.",
+        )
+        self.assertEqual(staff_sched.lessons[0].groups, "ОМ-26, БСз-26")
+        self.assertEqual(staff_sched.lessons[0].subject, "МДК-01")
+
+        # В студенческом расписании «1 п/гр.» и предмет «МДК-01» не принимаются за группу.
+        student_html = """
+        <div class="card myCard">
+          <div class="card-header"><span class="h3">II</span> пара <span class="h4">10<sup>00</sup> - 11<sup>20</sup></span></div>
+          <div class="card-body p-0">
+            <div class="d-flex flex-column subGroup1">
+              <span>1</span> п/гр.
+              <span>ауд.<span class="h5">ПК103</span></span>
+              <span class="Staff">Мурзабулатова Ф.Ф.</span>
+              <span class="d-md-none text-center text-truncate">МДК-01</span>
+            </div>
+          </div>
+        </div>
+        """
+        student_sched = bot.parse_schedule(student_html, date(2026, 11, 11), group="ЭС7-24")
+        self.assertEqual(student_sched.lessons[0].groups, "")
+        self.assertEqual(student_sched.lessons[0].subgroup, "1")
+
+    def test_parses_multi_row_staff_card_without_subgroup_classes(self):
+        html_doc = """
+        <div class="card myCard">
+          <div class="card-header"><span class="h3">IV</span> пара <span class="h4">13<sup>25</sup> - 14<sup>45</sup></span></div>
+          <div class="card-body p-0"><div class="d-flex flex-column">
+            <div class="d-flex justify-content-between">
+              <span class="rounded h5"></span>
+              <span class="pl-2">ауд.<span class="h5">АК101</span></span>
+              <span class="pl-2">гр.<span class="h5">СТ-26</span></span>
+              <div class="changesPair"><div class="d-md-none text-center text-truncate">Рус.яз.</div></div>
+            </div>
+            <div class="d-flex justify-content-between">
+              <span class="rounded h5"></span>
+              <span class="pl-2">ауд.<span class="h5">АК101</span></span>
+              <span class="pl-2">гр.<span class="h5">РМ-26</span></span>
+              <div class="changesPair"><div class="d-md-none text-center text-truncate">Рус.яз.</div></div>
+            </div>
+          </div></div>
+        </div>
+        """
+        sched = bot.parse_schedule(
+            html_doc, date(2026, 11, 11),
+            group="Аглиуллина Фирдаус Хуснулловна", schedule_type="staff",
+            staff_id=69, staff_name="Аглиуллина Фирдаус Хуснулловна",
+        )
+        self.assertEqual(len(sched.lessons), 1)
+        self.assertEqual(sched.lessons[0].groups, "СТ-26, РМ-26")
+
+    def test_renders_groups_on_staff_schedule_image(self):
+        schedule = bot.parse_schedule(
+            REALISTIC_STAFF_69_HTML,
+            date(2026, 11, 11),
+            group="Аглиуллина Фирдаус Хуснулловна",
+            schedule_type="staff",
+            staff_id=69,
+            staff_name="Аглиуллина Фирдаус Хуснулловна",
+        )
+        path = bot.render_schedule_image(schedule)
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        self.assertEqual(bot._LAST_RENDER["truncated"], [])
+        plan = bot._LAST_RENDER["plan"]
+        group_ops = ops_with("group")
+        self.assertEqual(len(group_ops), 2)
+        self.assertEqual([" ".join(op["lines"]) for op in group_ops], ["гр. СТ-26", "гр. БС2-26"])
+
+        cap_icons = [
+            op for op in plan["ops"]
+            if op["op"] == "icon" and op.get("name") == "cap"
+            and str(op.get("owner", "")).startswith("card:")
+        ]
+        self.assertEqual(len(cap_icons), 2)
+
+        # Плашка группы лежит внутри карточки под предметом, не налезая на аудиторию.
+        for idx, card in enumerate(plan["cards"]):
+            box = card["box"]
+            g_op = group_ops[idx]
+            subj_op = next(
+                op for op in plan["ops"]
+                if op.get("role") == "subject" and op.get("owner") == card["owner"]
+            )
+            room_op = next(
+                op for op in plan["ops"]
+                if op.get("role") == "room" and op.get("owner") == card["owner"]
+            )
+            self.assertGreaterEqual(g_op["bbox"][0], box[0])
+            self.assertLessEqual(g_op["bbox"][2], box[2])
+            self.assertGreater(g_op["bbox"][1], subj_op["bbox"][3])
+            self.assertLess(g_op["bbox"][2], room_op["bbox"][0])
+
+        with Image.open(path) as img:
+            px = img.convert("RGB").load()
+            chip = next(
+                op for op in plan["ops"]
+                if op.get("kind") == "chip" and str(op.get("id", "")).endswith(":group:bg")
+            )
+            mid_y = int((chip["box"][1] + chip["box"][3]) / 2)
+            self.assertTrue(
+                any(
+                    close(px[x, mid_y], self.PURPLE_L, 8)
+                    for x in range(int(chip["box"][0]) + 4, int(chip["box"][2]) - 4, 4)
+                ),
+                "фон плашки группы не отрисован на PNG",
+            )
+
+    def test_renders_many_groups_and_cancelled_staff_lesson_cleanly(self):
+        schedule = bot.Schedule(
+            date=date(2026, 11, 11),
+            group="Аглиуллина Фирдаус Хуснулловна",
+            schedule_type="staff",
+            staff_id=69,
+            staff_name="Аглиуллина Фирдаус Хуснулловна",
+            lessons=[
+                bot.Lesson(
+                    "I", "08:30 - 09:50", "Русский язык и культура речи", "—", "АК101",
+                    "08:30", "09:50",
+                    groups="СТ-26, БС2-26, ЭС4-26, ЭС5-26, ЭС6-26, ЭС7-26, ОМ-26, РМ-26, ЭП1-26, ЭП2-26",
+                ),
+                bot.Lesson(
+                    "II", "10:00 - 11:20", "~..............", "—", "—",
+                    "10:00", "11:20", groups="РМ-26",
+                ),
+            ],
+        )
+        bot.render_schedule_image(schedule)
+        self.assertEqual(bot._LAST_RENDER["problems"], [])
+        group_texts = [" ".join(op["lines"]) for op in ops_with("group")]
+        self.assertTrue(any("СТ-26" in text and "РМ-26" in text for text in group_texts))
+        self.assertTrue(any("гр. РМ-26" == text for text in group_texts))
+
+    def test_staff_group_changes_in_compare_and_notifications(self):
+        old = bot.Schedule(
+            date=date(2026, 11, 11),
+            group="Аглиуллина Фирдаус Хуснулловна",
+            schedule_type="staff",
+            staff_id=69,
+            staff_name="Аглиуллина Фирдаус Хуснулловна",
+            lessons=[
+                bot.Lesson("II", "10:00 - 11:20", "Рус.яз.", "—", "АК101", "10:00", "11:20", groups="СТ-26"),
+            ],
+        )
+        new = bot.Schedule(
+            date=date(2026, 11, 11),
+            group="Аглиуллина Фирдаус Хуснулловна",
+            schedule_type="staff",
+            staff_id=69,
+            staff_name="Аглиуллина Фирдаус Хуснулловна",
+            lessons=[
+                bot.Lesson("II", "10:00 - 11:20", "Рус.яз.", "—", "АК101", "10:00", "11:20", groups="БС2-26"),
+                bot.Lesson("III", "11:35 - 12:55", "Литература", "—", "АК102", "11:35", "12:55", groups="ОМ-26"),
+            ],
+        )
+        changes = bot.compare_schedules(old, new)
+        self.assertEqual(len(changes), 2)
+        summary = "\n".join(bot._change_summary_lines(changes))
+        self.assertIn("Группы: СТ-26 -> БС2-26", summary)
+        self.assertIn("гр. ОМ-26", summary)
+
+        caption = bot._notification_caption(new, date(2026, 11, 11), first_time=False, changes=changes)
+        self.assertIn("Преподаватель: <b>Аглиуллина Фирдаус Хуснулловна</b>", caption)
+        self.assertNotIn("Группа: <b>Аглиуллина", caption)
+        self.assertIn("СТ-26 → БС2-26", caption)
+        self.assertIn("гр. ОМ-26", caption)
+
+    def test_staff_cache_invalidates_stale_entries_on_init_db(self):
+        sched = bot.Schedule(
+            date=date(2026, 11, 11),
+            group="Аглиуллина Фирдаус Хуснулловна",
+            schedule_type="staff",
+            staff_id=69,
+            staff_name="Аглиуллина Фирдаус Хуснулловна",
+            lessons=[
+                bot.Lesson("III", "11:35 - 12:55", "Рус.яз.", "—", "АК101", "11:35", "12:55", groups="БС2-26"),
+            ],
+        )
+        self.assertEqual(bot.schedule_image_context(sched), "staff:v2")
+        bot.save_schedule_cache(sched, image_context="staff")
+        self.assertIsNone(bot.cached_image_path(sched))
+
+        # Имитируем старую БД до обновления парсера/рендера staff-групп.
+        with bot.db_connect() as conn:
+            conn.execute("DELETE FROM bot_meta WHERE key = 'staff_groups_cache_version'")
+        bot.init_db()
+        self.assertIsNone(bot.load_cached_schedule("staff:69", date(2026, 11, 11)))
 
 
 if __name__ == "__main__":
