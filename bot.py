@@ -45,7 +45,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 import aiohttp
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -148,7 +148,7 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 GROUPS_URL = os.getenv("GROUPS_URL", "http://ishnk.ru/2025/json/groups")
 GROUP_CATALOG_TTL = int(os.getenv("GROUP_CATALOG_TTL", "21600"))
-MONITOR_CONCURRENCY = max(1, int(os.getenv("MONITOR_CONCURRENCY", "4")))
+MONITOR_CONCURRENCY = max(1, int(os.getenv("MONITOR_CONCURRENCY", "8")))
 BROADCAST_PRICE = 50
 BROADCAST_AD_PRICE = 150
 PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "").strip()
@@ -961,31 +961,209 @@ def _find_teacher(node) -> str:
     return ""
 
 
+_GROUP_LABEL_RE = re.compile(
+    r"(?<![A-Za-zА-Яа-яЁё/])(?:гр\.|групп[аы]?(?![A-Za-zА-Яа-яЁё]))",
+    re.IGNORECASE,
+)
 _GROUP_TOKEN_RE = re.compile(
+    r"(?<![A-Za-zА-Яа-яЁё0-9])([A-Za-zА-Яа-яЁё]{1,8}\s*\d{0,3}\s*[-–—]\s*\d{1,3})(?![A-Za-zА-Яа-яЁё0-9])",
+    re.IGNORECASE,
+)
+_GROUP_STRICT_TOKEN_RE = re.compile(
     r"(?<![A-Za-zА-Яа-яЁё0-9])([A-Za-zА-Яа-яЁё]{1,8}\s*\d{1,3}\s*[-–—]\s*\d{1,3})(?![A-Za-zА-Яа-яЁё0-9])",
     re.IGNORECASE,
 )
 
 
-def _find_groups(node) -> str:
-    """Группы на странице преподавателя, без вывода ID из HTML."""
-    values = []
-    text = clean_text(node.get_text(" ", strip=True))
-    for match in _GROUP_TOKEN_RE.finditer(text):
-        value = re.sub(r"\s*[-–—]\s*", "-", clean_text(match.group(1)))
+def _normalize_group_code(raw: str) -> str:
+    value = re.sub(r"\s*[-–—]\s*", "-", clean_text(raw)).strip(" .,:;")
+    if re.fullmatch(
+        r"[A-Za-zА-Яа-яЁё]{1,8}\s*\d{0,3}-\d{1,3}[A-Za-zА-Яа-яЁё]?", value
+    ):
         value = re.sub(r"\s+", "", value)
-        if value.casefold() not in {item.casefold() for item in values}:
+    return value
+
+
+def _append_group_tokens(values: list, seen: set, raw: str) -> bool:
+    added = False
+    for chunk in re.split(r"[,;]+", clean_text(raw)):
+        value = _normalize_group_code(chunk)
+        if not value or value in ("-", "—", "–"):
+            continue
+        key = value.casefold()
+        if key not in seen:
+            seen.add(key)
             values.append(value)
+        added = True
+    return added
+
+
+def _non_subject_text(node, room: str = "", subject: str = "") -> str:
+    """Текст блока без предмета, аудитории и преподавателя для поиска групп."""
+    parts = []
+    excluded_classes = {"changesPair", "d-md-none", "Staff", "teacher", "staff"}
+    for text_node in node.find_all(string=True):
+        if not text_node:
+            continue
+        skip = False
+        for ancestor in text_node.parents:
+            if ancestor is node:
+                break
+            classes = set(ancestor.get("class") or [])
+            if classes & excluded_classes or (
+                "d-none" in classes and "d-md-block" in classes
+            ):
+                skip = True
+                break
+        if not skip:
+            parts.append(str(text_node))
+    text = clean_text(" ".join(parts))
+    if room:
+        text = text.replace(room, " ")
+    if subject:
+        text = text.replace(subject, " ")
+    text = re.sub(r"ауд\.?\s*\S+", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b\d*\s*п/гр\.?", " ", text, flags=re.IGNORECASE)
+    return clean_text(text)
+
+
+def _find_groups(
+    node,
+    *,
+    schedule_type: str = "group",
+    room: str = "",
+    subject: str = "",
+) -> str:
+    """Группы на странице преподавателя, без вывода ID из HTML."""
+    values: list = []
+    seen: set = set()
+    saw_explicit_label = False
+
+    # Способ 1: явная разметка «гр.<span class="h5">СТ-26</span>» / «группа ...»
+    # (не путаем с подгруппой «1 п/гр.»).
+    for text_node in node.find_all(string=True):
+        if not text_node:
+            continue
+        raw_str = str(text_node)
+        match = _GROUP_LABEL_RE.search(raw_str)
+        if not match:
+            continue
+        saw_explicit_label = True
+        parent = text_node.parent
+        found_here = False
+
+        tail = clean_text(raw_str[match.end():]).lstrip(": ").strip()
+        if tail:
+            tail = re.split(
+                r"\b(?:ауд\.|аудитори|\d*\s*п/гр)", tail, maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip()
+        if tail:
+            if (
+                parent is not None
+                and parent.name in ("span", "b", "strong", "small", "em")
+                and "ауд." not in parent.get_text(" ", strip=True).lower()
+            ):
+                found_here = _append_group_tokens(values, seen, tail) or found_here
+            else:
+                for token_match in _GROUP_TOKEN_RE.finditer(tail):
+                    found_here = (
+                        _append_group_tokens(values, seen, token_match.group(1))
+                        or found_here
+                    )
+
+        sib = text_node.next_sibling
+        while isinstance(sib, NavigableString) and not clean_text(str(sib)):
+            sib = sib.next_sibling
+        if isinstance(sib, Tag):
+            sib_classes = set(sib.get("class") or [])
+            sib_text = clean_text(sib.get_text(" ", strip=True))
+            if (
+                sib.name == "h5"
+                or "h5" in sib_classes
+                or (
+                    sib.name in ("span", "b", "strong")
+                    and "changesPair" not in sib_classes
+                )
+            ):
+                if sib_text and "ауд." not in sib_text.lower():
+                    found_here = (
+                        _append_group_tokens(values, seen, sib_text) or found_here
+                    )
+
+        if not found_here and parent is not None:
+            parent_text = clean_text(parent.get_text(" ", strip=True))
+            if (
+                "ауд." not in parent_text.lower()
+                and not parent.select_one(".changesPair")
+            ):
+                h5 = parent.find(class_="h5") or parent.select_one("h5")
+                if h5 is not None:
+                    h5_text = clean_text(h5.get_text(" ", strip=True))
+                    if h5_text:
+                        found_here = (
+                            _append_group_tokens(values, seen, h5_text)
+                            or found_here
+                        )
+            if not found_here and _GROUP_LABEL_RE.fullmatch(
+                parent_text.rstrip(": ")
+            ):
+                parent_sib = parent.next_sibling
+                while isinstance(parent_sib, NavigableString) and not clean_text(
+                    str(parent_sib)
+                ):
+                    parent_sib = parent_sib.next_sibling
+                if isinstance(parent_sib, Tag) and (
+                    parent_sib.name == "h5"
+                    or "h5" in (parent_sib.get("class") or [])
+                ):
+                    _append_group_tokens(
+                        values, seen, parent_sib.get_text(" ", strip=True)
+                    )
+
+    # Способ 2: явные атрибуты/классы группы.
+    for element in node.select("[data-group]"):
+        raw = clean_text(element.get("data-group", ""))
+        if raw:
+            _append_group_tokens(values, seen, raw)
+    for element in node.select(".group, .groups"):
+        raw = clean_text(element.get_text(" ", strip=True))
+        if raw and "ауд." not in raw.lower() and "п/гр" not in raw.lower():
+            _append_group_tokens(values, seen, raw)
+
+    if values or saw_explicit_label:
+        return ", ".join(values)
+
+    # Способ 3: запасной regex для plain-text HTML и title/aria-label без «гр.».
+    text = _non_subject_text(node, room=room, subject=subject)
+    token_re = (
+        _GROUP_TOKEN_RE if schedule_type == "staff" else _GROUP_STRICT_TOKEN_RE
+    )
+    for match in token_re.finditer(text):
+        _append_group_tokens(values, seen, match.group(1))
+
+    if schedule_type != "staff" and not values:
+        known_by_key = {
+            _normalize_group_code(g.name).casefold(): g.name
+            for g in GROUPS.values()
+        }
+        for match in _GROUP_TOKEN_RE.finditer(text):
+            normalized = _normalize_group_code(match.group(1))
+            if normalized.casefold() in known_by_key:
+                _append_group_tokens(values, seen, known_by_key[normalized.casefold()])
 
     # Некоторые варианты страницы помещают группу только в title/aria-label.
-    for attr in ("title", "data-group", "aria-label"):
+    excluded_attr_classes = {"changesPair", "d-md-none", "Staff", "teacher", "staff"}
+    for attr in ("title", "aria-label"):
         for element in node.select(f"[{attr}]"):
+            el_classes = set(element.get("class") or [])
+            if el_classes & excluded_attr_classes or (
+                "d-none" in el_classes and "d-md-block" in el_classes
+            ):
+                continue
             raw = clean_text(element.get(attr, ""))
-            for match in _GROUP_TOKEN_RE.finditer(raw):
-                value = re.sub(r"\s*[-–—]\s*", "-", clean_text(match.group(1)))
-                value = re.sub(r"\s+", "", value)
-                if value.casefold() not in {item.casefold() for item in values}:
-                    values.append(value)
+            for match in token_re.finditer(raw):
+                _append_group_tokens(values, seen, match.group(1))
 
     return ", ".join(values)
 
@@ -1025,11 +1203,13 @@ def _find_subgroup(node, css_class: str = "") -> Optional[str]:
     return None
 
 
-def _extract_fallback_subject(node, room: str, teacher: str, subgroup) -> str:
+def _extract_fallback_subject(
+    node, room: str, teacher: str, subgroup, groups: str = ""
+) -> str:
     """Fallback для предмета, если в блоке нет стандартных классов.
 
     Аккуратно убирает известные служебные части (аудитория, преподаватель,
-    «N п/гр.», «ауд.») и оставляет то, что похоже на предмет.
+    «N п/гр.», «ауд.», «гр.») и оставляет то, что похоже на предмет.
     """
     text = clean_text(node.get_text(" ", strip=True))
     if not text:
@@ -1047,6 +1227,12 @@ def _extract_fallback_subject(node, room: str, teacher: str, subgroup) -> str:
         text = text.replace(room, " ")
     if teacher:
         text = text.replace(teacher, " ")
+    if groups:
+        for grp in groups.split(","):
+            token = clean_text(grp)
+            if token:
+                text = text.replace(token, " ")
+    text = re.sub(r"(?<![A-Za-zА-Яа-яЁё/])гр\.?", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"ауд\.", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"(Перемена[а-яё]*|[1-5]\s*пар[а-яё]*|Пара\s*[IVX]+)", " ", text,
                   flags=re.IGNORECASE)
@@ -1067,8 +1253,13 @@ def _looks_like_teacher(value: str) -> bool:
     return False
 
 
-def _text_fragments(node, room: str, subgroup) -> list:
-    """Строки блока без аудитории / подгруппы (запасной источник данных)."""
+def _text_fragments(node, room: str, subgroup, groups: str = "") -> list:
+    """Строки блока без аудитории / подгруппы / групп (запасной источник данных)."""
+    group_tokens = {
+        clean_text(part).casefold()
+        for part in (groups or "").split(",")
+        if clean_text(part)
+    }
     fragments = []
     for raw in node.get_text("\n", strip=True).split("\n"):
         line = clean_text(raw)
@@ -1076,6 +1267,10 @@ def _text_fragments(node, room: str, subgroup) -> list:
             continue
         lowered = line.lower()
         if "ауд." in lowered:
+            continue
+        if _GROUP_LABEL_RE.fullmatch(line.rstrip(": ")):
+            continue
+        if line.casefold() in group_tokens:
             continue
         if subgroup and re.fullmatch(
             rf"{re.escape(subgroup)}\s*п/гр\.?", line, re.IGNORECASE
@@ -1095,26 +1290,31 @@ def _parse_lesson_from_node(
     time_str: str,
     break_duration: str,
     css_class: str = "",
+    schedule_type: str = "group",
 ) -> Optional[Lesson]:
     subject = _find_subject(node)
     teacher = _find_teacher(node)
     room = _find_room(node)
     subgroup = _find_subgroup(node, css_class=css_class)
-    groups = _find_groups(node)
+    groups = _find_groups(
+        node, schedule_type=schedule_type, room=room, subject=subject
+    )
 
     # Запасная эвристика для plain-text HTML без классов .Staff/.d-md-none:
     # преподавателя ищем по паттерну «Фамилия И.О.».
     if not teacher:
-        fragments = _text_fragments(node, room, subgroup)
+        fragments = _text_fragments(node, room, subgroup, groups=groups)
         for fragment in fragments:
             if _looks_like_teacher(fragment):
                 teacher = clean_text(fragment)
                 break
 
     if not subject:
-        subject = _extract_fallback_subject(node, room, teacher, subgroup)
+        subject = _extract_fallback_subject(
+            node, room, teacher, subgroup, groups=groups
+        )
 
-    if not subject and not teacher and not room:
+    if not subject and not teacher and not room and not groups:
         return None
 
     return Lesson(
@@ -1148,6 +1348,20 @@ def _iter_subgroup_blocks(body):
         candidates.append(el)
 
     return candidates
+
+
+def _iter_lesson_rows(body, *, schedule_type: str = "group"):
+    """Строки занятий внутри card-body, если нет явных блоков .subGroupN."""
+    rows = []
+    for el in body.select("div.d-flex.justify-content-between"):
+        if (
+            _find_subject(el)
+            or _find_room(el)
+            or _find_groups(el, schedule_type=schedule_type)
+            or _find_subgroup(el)
+        ):
+            rows.append(el)
+    return rows
 
 
 def parse_schedule(
@@ -1240,20 +1454,58 @@ def parse_schedule(
                     time_str=time_str,
                     break_duration=break_duration,
                     css_class=css_classes,
+                    schedule_type=schedule_type,
                 )
                 if lesson is not None:
                     lessons.append(lesson)
         else:
-            lesson = _parse_lesson_from_node(
-                body,
-                pair=pair,
-                start=start,
-                end=end,
-                time_str=time_str,
-                break_duration=break_duration,
-            )
-            if lesson is not None:
-                lessons.append(lesson)
+            row_blocks = _iter_lesson_rows(body, schedule_type=schedule_type)
+            if len(row_blocks) > 1:
+                row_lessons = []
+                for row in row_blocks:
+                    parsed = _parse_lesson_from_node(
+                        row,
+                        pair=pair,
+                        start=start,
+                        end=end,
+                        time_str=time_str,
+                        break_duration=break_duration,
+                        schedule_type=schedule_type,
+                    )
+                    if parsed is not None:
+                        row_lessons.append(parsed)
+                merged_rows = []
+                for parsed in row_lessons:
+                    if (
+                        parsed.subgroup is None
+                        and merged_rows
+                        and merged_rows[-1].subgroup is None
+                        and merged_rows[-1].subject == parsed.subject
+                        and merged_rows[-1].room == parsed.room
+                        and merged_rows[-1].teacher == parsed.teacher
+                    ):
+                        combined: list = []
+                        seen_grp: set = set()
+                        _append_group_tokens(
+                            combined, seen_grp, merged_rows[-1].groups
+                        )
+                        _append_group_tokens(combined, seen_grp, parsed.groups)
+                        merged_rows[-1].groups = ", ".join(combined)
+                    else:
+                        merged_rows.append(parsed)
+                lessons.extend(merged_rows)
+            else:
+                lesson = _parse_lesson_from_node(
+                    body,
+                    pair=pair,
+                    start=start,
+                    end=end,
+                    time_str=time_str,
+                    break_duration=break_duration,
+                    schedule_type=schedule_type,
+                )
+                if lesson is not None:
+                    lessons.append(lesson)
 
     logger.info("Найдено подходящих карточек: %s", len(cards))
 
@@ -1292,10 +1544,12 @@ def parse_schedule(
 
     for lesson in unique:
         subgroup_s = f" | {lesson.subgroup} п/гр." if lesson.subgroup else ""
+        groups_s = f" | гр. {lesson.groups}" if lesson.groups else ""
         logger.info(
-            "Пара %s%s | %s | %s | %s | %s",
+            "Пара %s%s%s | %s | %s | %s | %s",
             lesson.pair,
             subgroup_s,
+            groups_s,
             lesson.time,
             lesson.room,
             lesson.teacher,
@@ -2075,6 +2329,17 @@ def init_db() -> None:
             }
             if "image_context" not in cache_columns:
                 conn.execute("ALTER TABLE schedule_cache ADD COLUMN image_context TEXT NOT NULL DEFAULT ''")
+            if _meta_get(conn, "staff_groups_cache_version", "") != "2":
+                stale_rows = conn.execute(
+                    "SELECT image_path FROM schedule_cache WHERE target_key LIKE 'staff:%' AND image_path != ''"
+                ).fetchall()
+                for row in stale_rows:
+                    try:
+                        Path(row["image_path"]).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                conn.execute("DELETE FROM schedule_cache WHERE target_key LIKE 'staff:%'")
+                _meta_set(conn, "staff_groups_cache_version", "2")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_broadcasts_status ON broadcasts(status, id)")
         logger.info("База данных готова: %s", DB_PATH)
     except Exception:
@@ -2089,9 +2354,8 @@ def subscribe_user(
 
     True если добавлен, False если уже был или группа не выбрана.
     """
-    target_group_id = group_id
-    if target_group_id is None:
-        target_group_id = get_user_settings(user_id).get("group_id")
+    previous_group_id = get_user_settings(user_id).get("group_id")
+    target_group_id = group_id if group_id is not None else previous_group_id
     if target_group_id is None:
         return False
     target_group_id = int(target_group_id)
@@ -2112,6 +2376,11 @@ def subscribe_user(
                     (chat_type, title or "", user_id),
                 )
         set_user_group(user_id, target_group_id)
+        if added or (
+            previous_group_id is not None
+            and int(previous_group_id) != target_group_id
+        ):
+            seed_user_seen_schedules(user_id, f"group:{target_group_id}")
         return added
     except Exception:
         logger.exception("Ошибка SQLite (subscribe)")
@@ -2193,6 +2462,8 @@ def save_user_profile(user, chat_id: Optional[int] = None) -> None:
 
 
 def set_user_group(chat_id: int, group_id: int) -> None:
+    previous_group_id = get_user_settings(chat_id).get("group_id")
+    target_group_id = int(group_id)
     stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
     with db_connect() as conn:
         conn.execute("""
@@ -2201,7 +2472,12 @@ def set_user_group(chat_id: int, group_id: int) -> None:
             ON CONFLICT(chat_id) DO UPDATE SET
                 group_id = excluded.group_id, role = 'student',
                 staff_id = NULL, updated_at = excluded.updated_at
-        """, (chat_id, int(group_id), stamp))
+        """, (chat_id, target_group_id, stamp))
+    if (
+        subscriber_info(chat_id) is not None
+        and (previous_group_id is None or int(previous_group_id) != target_group_id)
+    ):
+        seed_user_seen_schedules(chat_id, f"group:{target_group_id}")
 
 
 def set_user_staff(chat_id: int, staff_id: int) -> None:
@@ -2243,6 +2519,7 @@ def active_group_ids() -> list[int]:
 
 
 def subscribe_teacher(chat_id: int, staff_id: int, enabled: bool = True) -> None:
+    was_subscribed = teacher_subscription(chat_id, staff_id) if enabled else False
     with db_connect() as conn:
         if enabled:
             conn.execute(
@@ -2254,6 +2531,8 @@ def subscribe_teacher(chat_id: int, staff_id: int, enabled: bool = True) -> None
                 "DELETE FROM teacher_subscribers WHERE chat_id = ? AND staff_id = ?",
                 (chat_id, staff_id),
             )
+    if enabled and not was_subscribed:
+        seed_user_seen_schedules(chat_id, f"staff:{int(staff_id)}")
 
 
 def teacher_subscription(chat_id: int, staff_id: int) -> bool:
@@ -2364,6 +2643,49 @@ def record_schedule_notification(
     except Exception:
         logger.exception("Ошибка SQLite (record notification)")
         return False
+
+
+def seed_user_seen_schedules(user_id: int, target_key: str) -> None:
+    """Фиксирует уже известные/кэшированные расписания для нового подписчика,
+    чтобы уже опубликованное расписание не отправлялось ему как «новое»."""
+    now = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    known: dict[str, str] = {}
+    prefix = f"{target_key}:"
+    try:
+        with db_connect() as conn:
+            for row in conn.execute(
+                "SELECT date, hash, data FROM schedule_state"
+            ).fetchall():
+                raw_key = row["date"] or ""
+                digest = row["hash"] or ""
+                if not digest or row["data"] == "[]":
+                    continue
+                if target_key == f"group:{GROUP_ID}" and ":" not in raw_key and len(raw_key) == 10:
+                    known[raw_key] = digest
+                elif raw_key.startswith(prefix):
+                    known[raw_key[len(prefix):]] = digest
+
+            for row in conn.execute(
+                "SELECT date, hash, data FROM schedule_cache WHERE target_key = ?",
+                (target_key,),
+            ).fetchall():
+                digest = row["hash"] or ""
+                if not digest or row["data"] in ("", "[]"):
+                    continue
+                known[row["date"]] = digest
+
+            for date_key, digest in known.items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO schedule_notifications"
+                    " (user_id, date, target_key, hash, sent_at) VALUES (?, ?, ?, ?, ?)",
+                    (user_id, date_key, target_key, digest, now),
+                )
+    except Exception:
+        logger.exception(
+            "Ошибка фиксации уже известных расписаний (%s, %s)",
+            user_id,
+            target_key,
+        )
 
 
 # ============================================================
@@ -3283,16 +3605,26 @@ def _change_summary_lines(changes: list) -> list:
 
         if change.kind == "added":
             new = change.new or {}
+            extra = (
+                f", гр. {clean_text(new.get('groups'))}"
+                if clean_text(new.get("groups")) else ""
+            )
             lines.append(
                 f"Добавлено: {label} — {display_subject_text(new.get('subject'))}"
                 + (f", {new.get('room') or '—'}" if new.get("room") else "")
+                + extra
             )
             continue
         if change.kind == "removed":
             old = change.old or {}
+            extra = (
+                f", гр. {clean_text(old.get('groups'))}"
+                if clean_text(old.get("groups")) else ""
+            )
             lines.append(
                 f"Удалено: {label} — {display_subject_text(old.get('subject'))}"
                 + (f", {old.get('room') or '—'}" if old.get("room") else "")
+                + extra
             )
             continue
 
@@ -3429,6 +3761,7 @@ S_TYPE = {
     "roman": 18,            # номер пары в круге
     "time": 32,             # начало пары
     "subject": 28,          # предмет
+    "group": 19,            # группа на расписании преподавателя
     "teacher": 19,          # преподаватель
     "room_label": 14,       # «Ауд.»
     "room": 32,             # код аудитории — главный ориентир справа
@@ -3450,6 +3783,7 @@ S_TYPE_MIN = {
     "roman": 14,
     "time": 22,
     "subject": 20,
+    "group": 14,
     "teacher": 14,
     "room_label": 11,
     "room": 20,
@@ -3505,7 +3839,7 @@ _ROLE_WEIGHT = {
     "header_pill": "bold", "header_pill_word": "regular",
     "header_progress": "regular",
     "roman": "semibold", "time": "bold", "time_end": "regular",
-    "subject": "semibold", "teacher": "regular",
+    "subject": "semibold", "group": "medium", "teacher": "regular",
     "room_label": "medium", "room": "bold",
     "hours": "regular", "small": "regular", "subgroup": "medium",
     "cancel": "medium", "tag": "medium", "note": "regular",
@@ -3997,6 +4331,94 @@ def _meta_slot_ops(m: dict, right_x: float, y_center: float, label: str,
     return ops, width
 
 
+def _group_row_ops(m: dict, x: float, y: float, w: float, groups: str, *,
+                   uid: str, owner=None) -> tuple:
+    """Плашка «🎓 гр. СТ-26» для расписания преподавателя."""
+    raw = clean_text(groups)
+    if not raw or raw in ("—", "-"):
+        return [], 0.0
+    label = raw if re.match(r"^гр\.?\s+", raw, re.IGNORECASE) else f"гр. {raw}"
+    role = "group"
+    weight = _ROLE_WEIGHT[role]
+    pad_x = m["pill_pad_x"]
+    pad_y = max(3, int(round(m["pill_pad_y"] * 0.9)))
+    icon_size = m["icon"] * 0.88
+    gap = m["gap_icon"]
+    avail_w = max(40.0, w - 2 * pad_x - icon_size - gap - 1)
+
+    fit = _pen(m[role], weight).fit(
+        label, avail_w, min_size=_type_floor(role), max_lines=1
+    )
+    if not fit["truncated"]:
+        pen = _pen(fit["size"], weight)
+        text_w = pen.width(fit["lines"][0])
+        line_h = fit["line_h"]
+        height = max(pad_y * 2 + line_h, pad_y * 2 + icon_size)
+        width = min(w, pad_x * 2 + icon_size + gap + text_w + 1)
+        ops: list = [_rect_op(
+            (x, y, x + width, y + height),
+            height * PILL_RADIUS_RATIO,
+            fill=S_PURPLE_L, outline=S_PURPLE_B, width=1.2,
+            kind="chip", uid=uid + ":bg", owner=owner,
+        )]
+        cursor = x + pad_x
+        ops += _icon_ops(
+            "cap", cursor, y + (height - icon_size) / 2,
+            icon_size, S_PURPLE, uid=uid + ":icon", owner=owner,
+        )
+        cursor += icon_size + gap
+        ops.append(_text_op(
+            pen, (cursor, y, cursor + text_w + 1, y + height),
+            fit["lines"][0], S_PURPLE_D, valign="middle",
+            max_lines=1, min_size=fit["size"],
+            uid=uid + ":text", owner=owner, role=role,
+        ))
+        return ops, height
+
+    fit_multi = _pen(m[role], weight).fit(
+        label, avail_w, min_size=_type_floor(role), max_lines=3
+    )
+    pen = _pen(fit_multi["size"], weight)
+    line_h = fit_multi["line_h"]
+    line_gap = m["line_gap"]
+    est_h = (
+        line_h * len(fit_multi["lines"])
+        + line_gap * max(0, len(fit_multi["lines"]) - 1)
+    )
+    cursor = x + pad_x
+    text_op = _text_op(
+        pen, (cursor, y + pad_y, cursor + avail_w + 1, y + pad_y + est_h),
+        label, S_PURPLE_D, valign="top",
+        max_lines=len(fit_multi["lines"]), min_size=fit_multi["size"],
+        line_gap=line_gap, uid=uid + ":text", owner=owner, role=role,
+    )
+    used_pen = _pen(text_op["size"], weight)
+    used_lines = text_op["lines"]
+    actual_w = max((used_pen.width(line) for line in used_lines), default=0.0)
+    actual_h = (
+        used_pen.line_h() * len(used_lines)
+        + line_gap * max(0, len(used_lines) - 1)
+    )
+    text_op["box"] = (
+        cursor, y + pad_y, cursor + actual_w + 1, y + pad_y + actual_h
+    )
+    height = max(pad_y * 2 + actual_h, pad_y * 2 + icon_size)
+    width = min(w, pad_x * 2 + icon_size + gap + actual_w + 1)
+    radius = min(float(m["row_radius"]), height * 0.35)
+    ops = [_rect_op(
+        (x, y, x + width, y + height), radius,
+        fill=S_PURPLE_L, outline=S_PURPLE_B, width=1.2,
+        kind="chip", uid=uid + ":bg", owner=owner,
+    )]
+    ops += _icon_ops(
+        "cap", x + pad_x,
+        y + pad_y + max(0.0, (used_pen.line_h() - icon_size) / 2),
+        icon_size, S_PURPLE, uid=uid + ":icon", owner=owner,
+    )
+    ops.append(text_op)
+    return ops, height
+
+
 def _person_row_ops(m: dict, x: float, y: float, w: float, text: str, *,
                     uid: str, owner=None, fill=S_MUTED,
                     min_size=None) -> tuple:
@@ -4236,7 +4658,18 @@ def layout_item_body(m: dict, item: dict, x: float, w: float, *,
         ops += subj_ops
         y += subj_h
 
-    # 2. ПРЕПОДАВАТЕЛЬ
+    # 2. ГРУППА (для расписания преподавателя)
+    if item.get("groups"):
+        if y > 0:
+            y += m["gap_subject"]
+        group_ops, group_h = _group_row_ops(
+            m, x, y, left_w, item["groups"],
+            uid=item["uid"] + ":group", owner=item["owner"],
+        )
+        ops += group_ops
+        y += group_h
+
+    # 3. ПРЕПОДАВАТЕЛЬ
     if show_teacher and item["teacher"]:
         if y > 0:
             y += m["gap_subject"]
@@ -4834,6 +5267,7 @@ def _item_dict(lesson, kind: str, details: list, ctx: dict, owner: str,
                uid: str) -> dict:
     room = sanitize_text(getattr(lesson, "room", ""))
     teacher = sanitize_text(getattr(lesson, "teacher", ""))
+    groups = clean_text(getattr(lesson, "groups", ""))
     subject_raw = getattr(lesson, "subject", "")
     placeholder = is_placeholder_subject(subject_raw)
     cancelled = placeholder or kind == "removed"
@@ -4848,7 +5282,7 @@ def _item_dict(lesson, kind: str, details: list, ctx: dict, owner: str,
         "subject": sanitize_text(display_subject_text(subject_raw)),
         "room": "" if room in ("", "—", "-") else room,
         "teacher": "" if teacher in ("", "—", "-") else teacher,
-        "groups": clean_text(getattr(lesson, "groups", "")),
+        "groups": "" if groups in ("", "—", "-") else groups,
         "placeholder": placeholder, "cancelled": cancelled,
         "progress": progress, "hours": hours,
         "change_lines": _change_lines(details),
@@ -5481,6 +5915,8 @@ def load_cached_schedule(target_key: str, day: date) -> Optional[Schedule]:
     try:
         kind, owner_id = target_key.split(":", 1)
         data = json.loads(row["data"])
+        if not data:
+            return None
         if kind == "staff":
             member = STAFF_BY_ID.get(int(owner_id))
             if not member:
@@ -5498,7 +5934,7 @@ def load_cached_schedule(target_key: str, day: date) -> Optional[Schedule]:
 
 def schedule_image_context(schedule: Schedule) -> str:
     if schedule.schedule_type != "group":
-        return "staff"
+        return "staff:v2"
     forecast = get_study_forecast(schedule.group)
     payload = {
         "studied": forecast.studied_minutes,
@@ -5604,7 +6040,8 @@ async def get_schedule_cached(day: date, group_id: Optional[int] = None,
             if cached is not None:
                 return cached
         schedule = await get_schedule(day, group.id)
-        save_schedule_cache(schedule)
+        if schedule.lessons:
+            save_schedule_cache(schedule)
         return schedule
 
 
@@ -5621,7 +6058,8 @@ async def get_staff_schedule_cached(staff_id: int, day: date,
             if cached is not None:
                 return cached
         schedule = await get_staff_schedule(staff_id, day)
-        save_schedule_cache(schedule)
+        if schedule.lessons:
+            save_schedule_cache(schedule)
         return schedule
 
 
@@ -6355,6 +6793,14 @@ async def _send_photo(destination, schedule: Schedule, reply_markup=None) -> boo
             await destination.answer_photo(FSInputFile(path), **kwargs)
         else:
             await destination.message.answer_photo(FSInputFile(path), **kwargs)
+        chat_id = _destination_chat_id(destination)
+        if chat_id is not None and schedule.lessons:
+            record_schedule_notification(
+                chat_id,
+                schedule.date.isoformat(),
+                schedule_signature(schedule),
+                schedule_target_key(schedule),
+            )
         return True
     except Exception:
         logger.exception("Ошибка отправки изображения")
@@ -6419,8 +6865,8 @@ async def _edit_or_answer(
 
 
 async def _schedule_for_destination(destination, day: date, group_id: int) -> Schedule:
-    # Не-Telegram объекты оставлены для обратной совместимости интеграционных тестов.
-    if isinstance(destination, (Message, CallbackQuery)):
+    # Не-Telegram объекты без chat_id оставлены для обратной совместимости legacy-тестов.
+    if isinstance(destination, (Message, CallbackQuery)) or _destination_chat_id(destination) is not None:
         return await get_schedule_cached(day, group_id)
     return await (get_schedule(day) if group_id == GROUP_ID else get_schedule(day, group_id))
 
@@ -6607,6 +7053,14 @@ async def _send_staff_schedule(
             else:
                 await destination.message.answer_photo(
                     FSInputFile(path), caption=caption, reply_markup=keyboard
+                )
+            chat_id = _destination_chat_id(destination)
+            if chat_id is not None and schedule.lessons:
+                record_schedule_notification(
+                    chat_id,
+                    target_day.isoformat(),
+                    schedule_signature(schedule),
+                    schedule_target_key(schedule),
                 )
             return True
         except Exception:
@@ -8019,6 +8473,10 @@ def _format_change_text(change) -> str:
     label = _change_title_text(change)
     if change.kind == "added":
         new = change.new or {}
+        extra = (
+            f", гр. {clean_text(new.get('groups'))}"
+            if clean_text(new.get("groups")) else ""
+        )
         return (
             f"🟢 <b>Добавлено:</b> {label}\n"
             f"{display_subject_text(new.get('subject'))}"
@@ -8027,9 +8485,14 @@ def _format_change_text(change) -> str:
                 if new.get("room")
                 else ""
             )
+            + extra
         )
     if change.kind == "removed":
         old = change.old or {}
+        extra = (
+            f", гр. {clean_text(old.get('groups'))}"
+            if clean_text(old.get("groups")) else ""
+        )
         return (
             f"🔴 <b>Удалено:</b> {label}\n"
             f"{display_subject_text(old.get('subject'))}"
@@ -8038,6 +8501,7 @@ def _format_change_text(change) -> str:
                 if old.get("room")
                 else ""
             )
+            + extra
         )
 
     lines = [f"🟡 <b>Изменено:</b> {label}"]
@@ -8099,7 +8563,11 @@ def _notification_caption(
         action,
         "",
         day_str,
-        f"Группа: <b>{html.escape(schedule.group)}</b>",
+        (
+            f"Преподаватель: <b>{html.escape(schedule.staff_name or schedule.group)}</b>"
+            if getattr(schedule, "schedule_type", "group") == "staff"
+            else f"Группа: <b>{html.escape(schedule.group)}</b>"
+        ),
         f"Занятий: {count_lessons(schedule)}",
     ]
 
@@ -8211,15 +8679,24 @@ async def _notify_changed(
     return delivered, still_pending
 
 
-async def _check_date(bot: Bot, day: date, group_id: Optional[int] = None) -> None:
+async def _check_date(
+    bot: Bot,
+    day: date,
+    group_id: Optional[int] = None,
+    *,
+    record_history: bool = True,
+) -> None:
     """Проверка расписания на КОНКРЕТНУЮ дату.
 
     Сценарии:
     - расписания нет (пусто)     -> состояние не меняем, ничего не шлём;
     - ошибка источника           -> состояние не меняем, ничего не шлём;
-    - расписание появилось впервые -> уведомление «опубликовано»;
+    - расписание появилось впервые -> уведомление «опубликовано» только тем,
+                                    кто ещё не видел эту версию;
     - расписание изменилось      -> уведомление «изменилось»;
     - совпадает с последним      -> ничего не шлём;
+    - подписчиков нет            -> кэш и baseline обновляем (новым подписчикам
+                                    уже опубликованное не уйдёт как «новое»);
     - доставка не удалась        -> состояние не обновляется,
                                     повторим в следующем цикле.
     """
@@ -8237,7 +8714,8 @@ async def _check_date(bot: Bot, day: date, group_id: Optional[int] = None) -> No
     try:
         schedule = (await get_schedule(day) if group.id == GROUP_ID
                     else await get_schedule(day, group.id))
-        save_schedule_cache(schedule)
+        if schedule.lessons:
+            save_schedule_cache(schedule)
     except ScheduleUnavailable:
         # Ошибка загрузки/парсинга — не считается изменением и также не
         # завершает backfill/историю.
@@ -8247,17 +8725,11 @@ async def _check_date(bot: Bot, day: date, group_id: Optional[int] = None) -> No
         )
         return
 
-    # Накопление не зависит от наличия подписчиков. Предметы регистрируются
-    # при первом появлении, завершённые пары — только после своего конца.
-    if schedule.schedule_type == "group":
+    # Накопление истории запускается для активных/выбранных групп. Предметы
+    # регистрируются при первом появлении, завершённые пары — после окончания.
+    if schedule.schedule_type == "group" and record_history:
         register_subjects_from_schedule(schedule)
         record_completed_lessons(schedule)
-
-    if not subscribers:
-        # Некому отправлять — baseline не фиксируем, чтобы первый подписавшийся
-        # получил уведомление о текущем опубликованном расписании.
-        logger.info("Проверка %s: подписчиков нет, уведомление пропускаем.", date_key)
-        return
 
     if not schedule.lessons:
         # Отсутствие расписания — тоже не изменение.
@@ -8276,6 +8748,22 @@ async def _check_date(bot: Bot, day: date, group_id: Optional[int] = None) -> No
 
     if old_hash == signature:
         logger.info("Изменений нет: %s", date_key)
+        return
+
+    if not subscribers:
+        # Сохраняем baseline и без подписчиков, чтобы при первом появлении
+        # подписчика бот не отправлял ему уже опубликованное расписание как
+        # «новое», а дальнейшие изменения корректно сравнивались со старым.
+        state[state_key] = {
+            "hash": signature,
+            "data": normalize_schedule(schedule),
+        }
+        save_state(state)
+        logger.info(
+            "Проверка %s: подписчиков нет, baseline сохранён (%s).",
+            date_key,
+            group.name,
+        )
         return
 
     first_time = old_state is None
@@ -8357,7 +8845,8 @@ async def _check_staff_date(bot: Bot, staff_id: int, day: date) -> None:
     state_key = f"{target_key}:{day.isoformat()}"
     try:
         schedule = await get_staff_schedule(staff_id, day)
-        save_schedule_cache(schedule)
+        if schedule.lessons:
+            save_schedule_cache(schedule)
     except ScheduleUnavailable:
         return
     if not schedule.lessons:
@@ -8386,15 +8875,84 @@ async def _check_staff_date(bot: Bot, staff_id: int, day: date) -> None:
 # МОНИТОРИНГ ИЗМЕНЕНИЙ
 # ============================================================
 
-async def schedule_monitor(bot: Bot) -> None:
+async def run_schedule_monitor_cycle(
+    bot: Bot,
+    birthday_checked_dates: Optional[set[str]] = None,
+) -> None:
+    """Один цикл фонового парсинга и проверки расписаний для всех групп."""
+    active_groups = active_group_ids()
+    active_group_set = set(active_groups)
+    # Разовый пересчёт изученного времени после миграции истории на
+    # запись по подгруппам (срабатывает один раз, дальше — пустой флаг).
+    if GROUP_ID in active_group_set:
+        try:
+            await recalculate_study_history()
+        except Exception:
+            logger.exception("Ошибка разового пересчёта истории занятий")
+
+    # История запускается только для реально выбранных / подписанных групп.
+    # Уже обработанные даты пропускаются по БД.
+    for gid in active_groups:
+        try:
+            await backfill_lesson_history(group_id=gid)
+        except Exception:
+            logger.exception("Ошибка backfill истории занятий (%s)", gid)
+
+    # Каждый цикл даты вычисляются заново через Asia/Yekaterinburg.
+    today = get_today()
+    days = (today, get_tomorrow())
+    monitor_groups = sorted(set(GROUPS.keys()) | active_group_set)
+    semaphore = asyncio.Semaphore(MONITOR_CONCURRENCY)
+
+    async def guarded(check, *args, **kwargs):
+        async with semaphore:
+            try:
+                await check(*args, **kwargs)
+            except Exception:
+                logger.exception("Ошибка фоновой проверки: %s", args)
+
+    jobs = []
+    for day in days:
+        for group_id in monitor_groups:
+            jobs.append(
+                guarded(
+                    _check_date,
+                    bot,
+                    day,
+                    group_id,
+                    record_history=(group_id in active_group_set),
+                )
+            )
+        for staff_id in load_monitored_staff_ids():
+            jobs.append(guarded(_check_staff_date, bot, staff_id, day))
+    if jobs:
+        await asyncio.gather(*jobs)
+
+    checked_dates = birthday_checked_dates if birthday_checked_dates is not None else set()
+    if today.isoformat() not in checked_dates:
+        try:
+            birthday_result = await check_birthdays(bot, today)
+            if birthday_result is not None:
+                checked_dates.add(today.isoformat())
+        except Exception:
+            logger.exception("Ошибка скрытой ежедневной проверки")
+
+    # Момент завершения цикла — для «Последняя проверка» в /status.
+    _LAST_SCHEDULE_CHECK["at"] = now_local()
+
+
+async def schedule_monitor(
+    bot: Bot,
+    initial_done: Optional[asyncio.Event] = None,
+) -> None:
     """Фоновая задача. Не блокирует polling, одна на процесс.
 
-    Каждые 5 минут даты сегодня/завтра пересчитываются заново
-    (переход через полночь обрабатывается автоматически), обе даты
-    проверяются независимо.
+    Со старта сразу парсит расписания (сегодня/завтра) для всех групп и
+    каждые 5 минут перепроверяет обновления.
     """
     logger.info(
-        "Мониторинг запущен. Интервал: %s сек (%s мин).",
+        "Мониторинг запущен (групп в каталоге: %s). Интервал: %s сек (%s мин).",
+        len(GROUPS),
         CHECK_INTERVAL,
         CHECK_INTERVAL // 60,
     )
@@ -8402,57 +8960,18 @@ async def schedule_monitor(bot: Bot) -> None:
     birthday_checked_dates: set[str] = set()
     catalog_refreshed_at = time.monotonic()
     while True:
-        if time.monotonic() - catalog_refreshed_at >= GROUP_CATALOG_TTL:
-            await refresh_group_catalog()
-            catalog_refreshed_at = time.monotonic()
-        active_groups = active_group_ids()
-        # Разовый пересчёт изученного времени после миграции истории на
-        # запись по подгруппам (срабатывает один раз, дальше — пустой флаг).
-        if GROUP_ID in active_groups:
-            try:
-                await recalculate_study_history()
-            except Exception:
-                logger.exception("Ошибка разового пересчёта истории занятий")
-
-        # История запускается только для реально выбранных / подписанных групп.
-        # Уже обработанные даты пропускаются по БД.
-        for gid in active_groups:
-            try:
-                await backfill_lesson_history(group_id=gid)
-            except Exception:
-                logger.exception("Ошибка backfill истории занятий (%s)", gid)
-
-        # Каждый цикл даты вычисляются заново через Asia/Yekaterinburg.
-        today = get_today()
-        days = (today, get_tomorrow())
-        semaphore = asyncio.Semaphore(MONITOR_CONCURRENCY)
-
-        async def guarded(check, *args):
-            async with semaphore:
-                try:
-                    await check(*args)
-                except Exception:
-                    logger.exception("Ошибка фоновой проверки: %s", args)
-
-        jobs = []
-        for day in days:
-            for group_id in active_groups:
-                jobs.append(guarded(_check_date, bot, day, group_id))
-            for staff_id in load_monitored_staff_ids():
-                jobs.append(guarded(_check_staff_date, bot, staff_id, day))
-        if jobs:
-            await asyncio.gather(*jobs)
-
-        if today.isoformat() not in birthday_checked_dates:
-            try:
-                birthday_result = await check_birthdays(bot, today)
-                if birthday_result is not None:
-                    birthday_checked_dates.add(today.isoformat())
-            except Exception:
-                logger.exception("Ошибка скрытой ежедневной проверки")
-
-        # Момент завершения цикла — для «Последняя проверка» в /status.
-        _LAST_SCHEDULE_CHECK["at"] = now_local()
+        try:
+            if time.monotonic() - catalog_refreshed_at >= GROUP_CATALOG_TTL:
+                await refresh_group_catalog()
+                catalog_refreshed_at = time.monotonic()
+            await run_schedule_monitor_cycle(bot, birthday_checked_dates)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Ошибка цикла мониторинга расписания")
+        finally:
+            if initial_done is not None and not initial_done.is_set():
+                initial_done.set()
 
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -8521,11 +9040,21 @@ async def main() -> None:
     await _setup_commands(bot)
 
     # Один фоновый монитор на процесс: повторный вызов main()
-    # не создаёт второй scheduler.
+    # не создаёт второй scheduler. Сразу при старте парсим расписания для
+    # всех групп (не дольше 20 с ожидания до старта polling).
+    initial_cycle_done = asyncio.Event()
     monitor_task = getattr(main, "_monitor_task", None)
     if monitor_task is None or monitor_task.done():
-        monitor_task = asyncio.create_task(schedule_monitor(bot))
+        monitor_task = asyncio.create_task(
+            schedule_monitor(bot, initial_done=initial_cycle_done)
+        )
         main._monitor_task = monitor_task
+        try:
+            await asyncio.wait_for(initial_cycle_done.wait(), timeout=20.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Первичный парсинг всех групп продолжается в фоне; запускаем polling."
+            )
 
     try:
         await dp.start_polling(bot)

@@ -209,7 +209,7 @@ class TestNewUserNullGroup(DBTestCase):
                 conn.execute("SELECT COUNT(*) FROM study_jobs").fetchone()[0], 0
             )
 
-    def test_schedule_monitor_does_not_fetch_or_backfill_without_active_groups(self):
+    def test_schedule_monitor_parses_all_groups_without_backfill_when_no_active_groups(self):
         class StopLoop(Exception):
             pass
 
@@ -228,25 +228,44 @@ class TestNewUserNullGroup(DBTestCase):
             recalc_calls.append((args, kwargs))
             return 0
 
-        async def track_get_schedule(*args, **kwargs):
-            schedule_calls.append((args, kwargs))
-            return make_schedule(date(2026, 11, 10), "Не должно вызываться")
+        async def track_get_schedule(day, group_id=None):
+            schedule_calls.append((day, group_id))
+            sched = make_schedule(day, "Плановая пара")
+            if group_id is not None:
+                sched.group = bot.get_group(group_id).name
+            return sched
 
         # Новый пользователь зарегистрировался через /start, но группу не выбрал.
+        with bot.db_connect() as conn:
+            conn.execute("DELETE FROM lesson_history")
         run(bot.cmd_start(RecordingMessage(chat_id=555004, text="/start")))
         self.assertEqual(bot.active_group_ids(), [])
+        fake_bot = FakeBot()
 
-        with mock.patch.object(bot, "backfill_lesson_history", track_backfill), \
+        with mock.patch.object(
+            bot, "now_local", return_value=datetime(2026, 11, 10, 12, 0, 0)
+        ), mock.patch.object(bot, "backfill_lesson_history", track_backfill), \
              mock.patch.object(bot, "recalculate_study_history", track_recalc), \
              mock.patch.object(bot, "get_schedule", track_get_schedule), \
              mock.patch.object(bot, "check_birthdays", mock.AsyncMock(return_value=False)), \
              mock.patch("asyncio.sleep", stop_sleep):
             with self.assertRaises(StopLoop):
-                run(bot.schedule_monitor(FakeBot()))
+                run(bot.schedule_monitor(fake_bot))
 
+        # Без выбранных пользователями групп backfill истории не запускается,
+        # но расписание сегодня/завтра парсится для всех групп каталога.
         self.assertEqual(backfill_calls, [])
         self.assertEqual(recalc_calls, [])
-        self.assertEqual(schedule_calls, [])
+        self.assertEqual(fake_bot.sent, [])
+        self.assertEqual(len(schedule_calls), len(bot.GROUPS) * 2)
+        today = date(2026, 11, 10)
+        tomorrow = date(2026, 11, 11)
+        for gid in bot.GROUPS:
+            self.assertIsNotNone(bot.load_cached_schedule(f"group:{gid}", today))
+            self.assertIsNotNone(bot.load_cached_schedule(f"group:{gid}", tomorrow))
+        with bot.db_connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM lesson_history").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM study_jobs").fetchone()[0], 0)
 
 
 class TestThreeStepSelectionFlow(DBTestCase):
