@@ -6,10 +6,11 @@ Telegram-бот расписания всех групп и преподават
 - Разбирает HTML через BeautifulSoup (только карточки div.card.myCard с .card-header).
 - Игнорирует недельную таблицу.
 - Генерирует современную PNG-картинку через Pillow: одна дата = одна
-  вертикальная карточка (1080×1620, 2:3; при плотном дне холст растёт по
-  лестнице форматов). Карточка пары: номер, время, предмет, преподаватель
-  и лавандовая колонка аудитории («Ауд.» + крупный код комнаты);
-  изменения и отмены показываются внутри карточки пары.
+  вертикальная карточка шириной 1080. Высота — динамическая: холст
+  подгоняется под количество пар, число подгрупп в паре, длину предметов
+  и строки изменений (см. choose_plan). Карточка пары: номер, время,
+  предмет, преподаватель и лавандовая колонка аудитории («Ауд.» + крупный
+  код комнаты); изменения и отмены показываются внутри карточки пары.
 - Поддержка подписок (SQLite), фоновый мониторинг изменений.
 - Работает в Docker, кодировка UTF-8.
 - Все даты считаются в часовом поясе Asia/Yekaterinburg (UTC+5),
@@ -23,6 +24,8 @@ Telegram-бот расписания всех групп и преподават
   время приводится в серой курсивной сноске внизу картинки.
 - /status — PNG-карточка состояния бота в дизайне расписания
   (подписки, прогресс учёбы, текущее потребление ресурсов).
+- /top («топ») — преподаватели группы по изученным часам.
+- /graph («график») — нагрузка по неделям, период месяц / 3 / 6 / год.
 
 """
 
@@ -54,6 +57,7 @@ import schedule_icons
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.filters.command import CommandException
 from aiogram.types import (
@@ -86,6 +90,7 @@ from staff_directory import (
     STAFF_DIRECTORY,
     STAFF_MEMBERS,
     StaffMember,
+    normalize_staff_text,
     search_staff,
 )
 
@@ -393,6 +398,9 @@ logging.Formatter.converter = _log_time_converter
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+# Кэш аналитики: топ и график не перерисовываются на каждый запрос.
+ANALYTICS_DIR = DATA_DIR / "analytics"
+ANALYTICS_DIR.mkdir(parents=True, exist_ok=True)
 
 GROUPS: dict[int, GroupInfo] = dict(FALLBACK_GROUPS)
 _CACHE_LOCKS: dict[str, asyncio.Lock] = {}
@@ -598,6 +606,53 @@ class ScheduleTextRequest:
 
 
 _SCHEDULE_TEXT_RE = re.compile(r"^расписание(?:\s+(.*))?$", re.IGNORECASE)
+
+# Текстовые команды без слэша: «топ» и «график». Разбираются тем же
+# сообщением-роутером, что и «расписание», поэтому отдельного парсера нет.
+_TOP_TEXT_RE = re.compile(r"^топ(?:\s+(?:преподавателей|преподов))?$",
+                          re.IGNORECASE)
+_GRAPH_TEXT_RE = re.compile(
+    r"^график(?:\s+нагрузки)?(?:\s+(?P<period>.*))?$", re.IGNORECASE)
+_GRAPH_PERIOD_ALIASES = {
+    "месяц": "1m", "1 месяц": "1m", "за месяц": "1m", "последний месяц": "1m",
+    "3 месяца": "3m", "три месяца": "3m", "квартал": "3m",
+    "за 3 месяца": "3m", "последние 3 месяца": "3m",
+    "6 месяцев": "6m", "шесть месяцев": "6m", "полгода": "6m",
+    "за полгода": "6m", "за 6 месяцев": "6m",
+    "год": "12m", "12 месяцев": "12m", "за год": "12m",
+    "последний год": "12m",
+}
+
+
+def parse_graph_period(raw: str) -> Optional[str]:
+    """«месяц», «3 месяца», «полгода», «год» -> ключ периода графика."""
+    text = clean_text(raw).casefold()
+    text = re.sub(r"^за\s+", "", text) if text not in _GRAPH_PERIOD_ALIASES else text
+    if not text:
+        return DEFAULT_LOAD_PERIOD
+    if text in _GRAPH_PERIOD_ALIASES:
+        return _GRAPH_PERIOD_ALIASES[text]
+    if text in LOAD_CHART_PERIODS:
+        return text
+    return None
+
+
+def parse_top_text(text: str) -> bool:
+    """True для «топ» / «топ преподавателей»."""
+    return bool(_TOP_TEXT_RE.fullmatch(clean_text(text).casefold()))
+
+
+def parse_graph_text(text: str) -> tuple[bool, Optional[str]]:
+    """(это ли запрос графика, период).
+
+    Период ``None`` означает «распознано, но период не понят» — тогда
+    показываем подсказку вместо картинки.
+    """
+    match = _GRAPH_TEXT_RE.fullmatch(clean_text(text).casefold())
+    if not match:
+        return False, None
+    period = parse_graph_period(match.group("period") or "")
+    return True, period
 
 
 def _extract_staff_date_and_query(raw: str) -> tuple[str, Optional[date], bool]:
@@ -3063,6 +3118,307 @@ def count_active_study_days(
 
 
 # ============================================================
+# АНАЛИТИКА ГРУППЫ: ТОП ПРЕПОДАВАТЕЛЕЙ И ГРАФИК НАГРУЗКИ
+# ============================================================
+
+# Периоды графика нагрузки. Хранится только число месяцев: подпись и
+# границы считаются из него, поэтому «месяц / 3 / 6 / год» — один код.
+LOAD_CHART_PERIODS = OrderedDict((
+    ("1m", ("Месяц", 1)),
+    ("3m", ("3 месяца", 3)),
+    ("6m", ("6 месяцев", 6)),
+    ("12m", ("Год", 12)),
+))
+DEFAULT_LOAD_PERIOD = "3m"
+TOP_TEACHERS_LIMIT = 10
+
+
+def _teacher_key(value: str) -> str:
+    """Ключ преподавателя: «Гайзуллин И.Т.» и «гайзуллин ильдар» — один.
+
+    Сравнение идёт по фамилии (первое слово) и первым буквам инициалов,
+    приведённым к нижнему регистру и без точек. Полное имя из справочника
+    и сокращённая запись с сайта схлопываются в один ключ.
+    """
+    text = normalize_staff_text(clean_text(value))
+    text = text.replace(".", " ")
+    tokens = [token for token in text.split() if token]
+    if not tokens:
+        return ""
+    surname = tokens[0]
+    initials = "".join(token[0] for token in tokens[1:] if token)
+    return f"{surname}|{initials[:2]}"
+
+
+def _teacher_display(value: str) -> str:
+    """Аккуратное ФИО для показа: справочник, если преподаватель опознан.
+
+    Сайт пишет «Степанов С.В.», а в справочнике — полное ФИО. Поиск идёт
+    через search_staff (он сверяет и фамилию, и инициалы), поэтому
+    «Иванов И.И.» не превратится в «Иванову Кристину Алексеевну».
+    """
+    raw = clean_text(value)
+    if not raw or raw == "—":
+        return ""
+    try:
+        matches = search_staff(raw)
+    except Exception:      # справочник не должен ломать аналитику
+        logger.exception("Ошибка поиска преподавателя %s", raw)
+        return raw
+    # search_staff допускает инициалы из любого слова ФИО («Иванов И.И.»
+    # находил «Иванову Кристину Алексеевну»). Здесь сверяем строго: имя и
+    # отчество должны начинаться именно с указанных букв.
+    initials = [token[0].casefold()
+                for token in re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", raw)[1:]
+                if len(token) == 1]
+    for member in matches:
+        words = member.full_name.split()
+        if not initials:
+            return member.full_name
+        if len(words) >= 2 and all(
+                words[index + 1][0].casefold() == letter
+                for index, letter in enumerate(
+                    initials[:len(words) - 1])):
+            return member.full_name
+    return raw
+
+
+@dataclass(frozen=True)
+class TeacherLoad:
+    """Изученные часы одного преподавателя внутри группы."""
+
+    name: str
+    display_name: str
+    minutes: int           # слоты группы, где он вёл занятия (без дублей)
+    lessons: int           # количество пар (слотов) с этим преподавателем
+    subjects: tuple = ()   # преподаваемые предметы, по убыванию часов
+
+    @property
+    def academic_hours(self) -> float:
+        return self.minutes / ACADEMIC_HOUR_MINUTES
+
+
+def load_teacher_rankings(
+    group_name: str = GROUP_NAME,
+    start: Optional[date] = None,
+    end: Optional[date] = None,
+    limit: int = TOP_TEACHERS_LIMIT,
+) -> list[TeacherLoad]:
+    """Топ преподавателей группы по фактически изученным часам.
+
+    Часы считаются как время группы: пара с двумя подгруппами у разных
+    преподавателей даёт каждому СВОЁ время подгруппы, но общая сумма
+    группы не удваивается (внутри слота время берётся один раз на
+    преподавателя). Отменённые занятия в историю не попадают вовсе.
+    """
+    clauses = ["group_name = ?", "TRIM(teacher) != ''", "teacher != '—'"]
+    params: list = [group_name]
+    if start is not None:
+        clauses.append("date >= ?")
+        params.append(start.isoformat())
+    if end is not None:
+        clauses.append("date <= ?")
+        params.append(end.isoformat())
+    sql = (
+        "SELECT date, pair_number, teacher, normalized_subject,"
+        "       MAX(duration_minutes) AS slot_minutes"
+        "  FROM lesson_history WHERE " + " AND ".join(clauses) +
+        "  GROUP BY date, pair_number, teacher, normalized_subject"
+    )
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            subjects = {
+                row["normalized_subject"]: row["original_subject"]
+                for row in conn.execute(
+                    "SELECT normalized_subject, original_subject FROM subjects"
+                )
+            }
+    except Exception:
+        logger.exception("Ошибка подсчёта часов преподавателей")
+        return []
+
+    aggregated: dict = {}
+    for row in rows:
+        key = _teacher_key(row["teacher"])
+        if not key:
+            continue
+        entry = aggregated.setdefault(key, {
+            "name": clean_text(row["teacher"]),
+            "minutes": 0,
+            "slots": set(),
+            "subjects": {},
+        })
+        minutes = int(row["slot_minutes"] or 0)
+        entry["minutes"] += minutes
+        entry["slots"].add((row["date"], row["pair_number"]))
+        subject_key = row["normalized_subject"]
+        entry["subjects"][subject_key] = entry["subjects"].get(subject_key, 0) + minutes
+        if not entry.get("display"):
+            entry["display"] = subjects.get(subject_key, "")
+
+    result: list[TeacherLoad] = []
+    for entry in aggregated.values():
+        subject_names = []
+        for subject_key, _minutes in sorted(entry["subjects"].items(),
+                                           key=lambda item: (-item[1], item[0])):
+            # subjects хранит нормализованные имена; показываем исходное.
+            subject_names.append(subject_key)
+        result.append(TeacherLoad(
+            name=entry["name"],
+            display_name=_teacher_display(entry["name"]),
+            minutes=entry["minutes"],
+            lessons=len(entry["slots"]),
+            subjects=tuple(subject_names),
+        ))
+    result.sort(key=lambda item: (-item.minutes, -item.lessons,
+                                  item.display_name.casefold()))
+    return result[:max(1, int(limit))] if limit else result
+
+
+def _period_bounds(period: str, today: Optional[date] = None) -> tuple[date, date, str]:
+    """Границы периода графика: (первый день, последний день, подпись)."""
+    today = today or get_today()
+    label, months = LOAD_CHART_PERIODS.get(period, LOAD_CHART_PERIODS[DEFAULT_LOAD_PERIOD])
+    year = today.year
+    month_index = today.month - 1 - (months - 1)
+    while month_index < 0:
+        month_index += 12
+        year -= 1
+    start = date(year, month_index + 1, 1)
+    return start, today, label
+
+
+def load_workload_series(
+    group_name: str = GROUP_NAME,
+    period: str = DEFAULT_LOAD_PERIOD,
+    today: Optional[date] = None,
+) -> dict:
+    """Нагрузка группы по неделям за выбранный период.
+
+    Возвращает словарь с точками: начало недели, академические часы,
+    число пар. «Нагрузка» — фактически изученное время (завершённые
+    пары), поэтому график показывает, когда учились плотнее, а когда
+    было почти пусто. Пара с подгруппами считается один раз (слот
+    «дата + пара»), как и во всех остальных подсчётах группы.
+    """
+    start, end, label = _period_bounds(period, today)
+    try:
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT date, SUM(slot_minutes) AS minutes,"
+                "       COUNT(*) AS slots FROM ("
+                "  SELECT date, pair_number, MAX(duration_minutes) AS slot_minutes"
+                "  FROM lesson_history"
+                "  WHERE group_name = ? AND date >= ? AND date <= ?"
+                "  GROUP BY date, pair_number"
+                ") GROUP BY date ORDER BY date",
+                (group_name, start.isoformat(), end.isoformat()),
+            ).fetchall()
+    except Exception:
+        logger.exception("Ошибка загрузки нагрузки")
+        rows = []
+
+    by_day = {}
+    for row in rows:
+        try:
+            day = date.fromisoformat(row["date"])
+        except ValueError:
+            continue
+        by_day[day] = (int(row["minutes"] or 0), int(row["slots"] or 0))
+
+    # Неделя начинается с понедельника: точки ровно по календарным неделям.
+    bucket = start - timedelta(days=start.weekday())
+    points: list = []
+    total_minutes = 0
+    total_slots = 0
+    while bucket <= end:
+        week_end = bucket + timedelta(days=6)
+        minutes = slots = days = 0
+        for offset in range(7):
+            day = bucket + timedelta(days=offset)
+            if day < start or day > end:
+                continue
+            entry = by_day.get(day)
+            if entry:
+                minutes += entry[0]
+                slots += entry[1]
+                days += 1
+        total_minutes += minutes
+        total_slots += slots
+        points.append({
+            "start": bucket,
+            "end": min(week_end, end),
+            "minutes": minutes,
+            "hours": minutes / ACADEMIC_HOUR_MINUTES,
+            "lessons": slots,
+            "days": days,
+        })
+        bucket = week_end + timedelta(days=1)
+
+    peak = max((point["hours"] for point in points), default=0.0)
+    average = (total_minutes / ACADEMIC_HOUR_MINUTES / len(points)) if points else 0.0
+    return {
+        "period": period if period in LOAD_CHART_PERIODS else DEFAULT_LOAD_PERIOD,
+        "label": label,
+        "start": start,
+        "end": end,
+        "points": points,
+        "total_minutes": total_minutes,
+        "total_hours": total_minutes / ACADEMIC_HOUR_MINUTES,
+        "total_lessons": total_slots,
+        "peak_hours": peak,
+        "average_hours": average,
+        "active_weeks": sum(1 for point in points if point["minutes"] > 0),
+    }
+
+
+def _hours_text(hours: float) -> str:
+    """«12,5 акад. ч» — единый формат для аналитики."""
+    return f"{_format_academic_units(hours)} акад. ч"
+
+
+def top_teachers_text(rankings: list, group_name: str,
+                      period_label: str = "") -> str:
+    """Текстовая версия топа преподавателей (fallback без картинки)."""
+    lines = [f"<b>Топ преподавателей · {html.escape(group_name)}</b>"]
+    if period_label:
+        lines.append(f"<i>{html.escape(period_label)}</i>")
+    if not rankings:
+        lines.append("")
+        lines.append("Пока нет завершённых занятий: топ появится после первых пар.")
+        return "\n".join(lines)
+    lines.append("")
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    for position, entry in enumerate(rankings, start=1):
+        prefix = medals.get(position, f"{position}.")
+        lines.append(
+            f"{prefix} <b>{html.escape(entry.display_name)}</b> — "
+            f"{_hours_text(entry.academic_hours)} · "
+            f"{entry.lessons} {_plural(entry.lessons, 'пара', 'пары', 'пар')}"
+        )
+    lines.append("")
+    lines.append("Часы — время пар группы, где вёл этот преподаватель.")
+    return "\n".join(lines)
+
+
+def workload_text(data: dict, group_name: str) -> str:
+    """Текстовая версия графика нагрузки (fallback)."""
+    lines = [f"<b>Нагрузка · {html.escape(group_name)}</b>",
+             f"<i>{html.escape(data['label'])}: "
+             f"{format_date_full(data['start'])} — "
+             f"{format_date_full(data['end'])}</i>", ""]
+    if not data["points"] or data["total_minutes"] <= 0:
+        lines.append("За этот период завершённых пар нет.")
+        return "\n".join(lines)
+    lines.append(f"Всего: {_hours_text(data['total_hours'])} · "
+                 f"{data['total_lessons']} "
+                 f"{_plural(data['total_lessons'], 'пара', 'пары', 'пар')}")
+    lines.append(f"Пик недели: {_hours_text(data['peak_hours'])}")
+    return "\n".join(lines)
+
+
+# ============================================================
 # ПРОГНОЗ ИЗУЧЕННОГО ВРЕМЕНИ (1 сентября — 30 июня)
 # ============================================================
 
@@ -3729,23 +4085,35 @@ S_DIVIDER    = "#E3E0EE"   # разделитель колонок подвал�
 # ------------------------------------------------------------
 
 SCHEDULE_WIDTH = 1080
-SCHEDULE_HEIGHT = 1620                     # 2:3 — базовый формат
+SCHEDULE_HEIGHT = 1620                     # «эталонный» формат 2:3
 
 S_SCALE_MIN = 0.62
 S_SCALE_MAX = 1.12          # занятий мало — карточки крупнее
 S_SCALE_STEP = 0.02         # квант подбора масштаба (стабильный результат)
 
-# Лестница форматов: (высота холста, минимально допустимый масштаб).
-# Холст растёт только когда на более компактном формате текст уже упёрся
-# в пол читаемости; вертикального кропа не используется никогда.
-SCHEDULE_RATIO_LADDER = (
-    (1620, 0.92),                          # 2:3 — основной формат
-    (1740, 0.84),                          # плотный день
-    (1860, 0.76),                          # 7–9 занятий
-    (1980, S_SCALE_MIN),                   # потолок: выше — уже «чрезмерно»
-)
-SCHEDULE_HEIGHT_MAX = SCHEDULE_RATIO_LADDER[-1][0]
-
+# --- ДИНАМИЧЕСКАЯ ВЫСОТА И РАЗМЕР БЛОКОВ ---------------------------------
+# Холст больше не выбирается из фиксированной «лестницы форматов»: его
+# высота вычисляется по фактическому объёму контента.
+#
+#   1. Масштаб (кегли, отступы, высота строк и блоков) подбирается от
+#      S_SCALE_MAX вниз по SCHEDULE_SCALE_LADDER — крупная карточка для
+#      короткого дня, компактная для плотного.
+#   2. Layout измеряется честно: Pen меряет теми же шрифтами, что и рендер,
+#      а высота каждой карточки пары считается по её содержимому (предмет,
+#      каждая подгруппа отдельным блоком, преподаватель, изменения).
+#   3. Высота холста = шапка + карточки + зазоры + подвал + safe area,
+#      округлённая по шагу. Одна пара — аккуратная карточка, восемь пар с
+#      подгруппами — заметно выше, но без «мёртвой» пустоты под списком.
+#   4. Предел снизу — SCHEDULE_HEIGHT_TARGET (пустой день не превращается
+#      в полоску), сверху — SCHEDULE_HEIGHT_ABS_MAX.
+SCHEDULE_HEIGHT_STEP = 20                  # шаг округления высоты, px
+SCHEDULE_HEIGHT_TARGET = 1200              # «эталонная» высота карточки
+SCHEDULE_HEIGHT_COMFORT = 1900             # выше — уплотняем блоки, не холст
+SCHEDULE_HEIGHT_FLOOR = 900                # минимум: пустой день — не полоска
+SCHEDULE_HEIGHT_ABS_MAX = 4000             # предел: выше — уже не карточка
+SCHEDULE_HEIGHT_MAX = SCHEDULE_HEIGHT      # совместимость: «эталон» 2:3
+SCHEDULE_SCALE_LADDER = (S_SCALE_MAX, 1.08, 1.04, 1.0, 0.96, 0.92, 0.88,
+                         0.84, 0.80, 0.76, 0.72, 0.68, 0.64, S_SCALE_MIN)
 SAFE_AREA = 52            # единый безопасный отступ со всех четырёх сторон
 SUPER_SAMPLE = 2          # рендер в 2x + LANCZOS -> чёткий текст
 
@@ -4007,17 +4375,20 @@ def _pen(size: int, weight: str = "regular") -> Pen:
     return Pen(size, weight)
 
 
-def _metrics_for(scale: float) -> dict:
-    """Адаптивные метрики: кегли и отступы зависят от количества занятий.
+def _metrics_for(scale: float, room_floor: Optional[float] = None) -> dict:
+    """Адаптивные метрики: кегли и отступы зависят от масштаба.
 
-    Полы важнее масштаба: при плотном дне карточки становятся
-    компактнее, но аудитория и время не мельчают ниже своих полов.
+    ``room_floor`` позволяет подбору высоты временно опустить пол кода
+    аудитории: холст и так растягивается под контент, поэтому «мельче
+    пола» — это последний, а не первый способ уложить плотный день.
+    По умолчанию действует ROOM_FONT_MIN (жёсткий пол читаемости).
     """
     scale = max(S_SCALE_MIN, min(S_SCALE_MAX, float(scale)))
     m: dict = {"scale": round(scale, 3)}
     for key, base in S_TYPE.items():
         m[key] = max(_type_floor(key), int(round(base * scale)))
-    m["room"] = max(m["room"], ROOM_FONT_MIN)
+    m["room"] = max(m["room"], ROOM_FONT_MIN if room_floor is None
+                    else int(room_floor))
     for key, base in S_SPACE.items():
         m[key] = max(S_SPACE_MIN[key], int(round(base * scale)))
     m["line_gap"] = max(1, int(round(S_LINE_GAP_BASE * scale)))
@@ -5401,9 +5772,21 @@ def _breath_metrics(m: dict, extra: float) -> dict:
 
 
 def build_plan(schedule, changes: list, title: Optional[str], scale: float,
-               H: int, ctx: dict, specs: Optional[list] = None) -> dict:
-    """Чистый расчёт layout: всё измеряется, ничего не рисуется."""
-    m = _metrics_for(scale)
+               H: int, ctx: dict, specs: Optional[list] = None, *,
+               center: bool = False, room_floor: Optional[float] = None,
+               breath: float = 0.0) -> dict:
+    """Чистый расчёт layout: всё измеряется, ничего не рисуется.
+
+    ``center=True`` — контент центрируется по вертикали: так один-два
+    занятия не «висят» сверху, а лишний воздух распределяется вокруг
+    карточек, а не сваливается в одну дыру под списком.
+
+    ``breath`` — сколько «воздуха» добавить внутри карточек, не трогая
+    кегли: короткий день занимает крупные, но не растянутые блоки.
+    """
+    m = _metrics_for(scale, room_floor)
+    if breath:
+        m = _breath_metrics(m, breath)
     W = SCHEDULE_WIDTH
     if specs is None:
         specs = build_specs(schedule, changes, ctx)
@@ -5436,11 +5819,16 @@ def build_plan(schedule, changes: list, title: Optional[str], scale: float,
                  + gap * max(0, len(stack) - 1))
         return stack, total, gap
 
-    # Карточки не растягиваем под высоту холста: 1–2 занятия остаются
-    # компактными, лишний воздух — под списком, подвал прижат к низу.
+    # Карточки НЕ растягиваются: их высота — это ровно то, что занимают
+    # номер пары, время, предметы подгрупп и плашки изменений. Холст под
+    # эту высоту подгоняет choose_plan().
     stack, total, gap = measure(m)
-    fits = total <= available
+    fits = total <= available + 0.5
     shift_top = 0.0
+    if center and stack and fits and available > total:
+        # Воздух делится между шапкой и подвалом, но не больше трети
+        # свободного места: подвал остаётся прижатым к низу карточки.
+        shift_top = min((available - total) / 2.0, 140.0)
 
     # --- расстановка ---
     cards: list = []
@@ -5481,6 +5869,7 @@ def build_plan(schedule, changes: list, title: Optional[str], scale: float,
         "fits": fits, "needed": total + content_top + footer_h + 2 * SAFE_AREA,
         "title": title, "elements": ops, "left": (inner_x, inner_w),
         "empty": not stack,
+        "room_floor": ROOM_FONT_MIN if room_floor is None else int(room_floor),
     }
     return plan
 
@@ -5509,29 +5898,62 @@ def fit_scale(schedule, changes, title, ctx, specs, H: int) -> dict:
     return best
 
 
-def choose_plan(schedule, changes, title, ctx, specs) -> dict:
-    """Выбор формата: 2:3, при нехватке воздуха — выше по лестнице.
+def _round_height(value: float, floor: Optional[int] = None) -> int:
+    """Высота холста — кратно SCHEDULE_HEIGHT_STEP, в разумных границах."""
+    step = SCHEDULE_HEIGHT_STEP
+    low = SCHEDULE_HEIGHT_FLOOR if floor is None else int(floor)
+    rounded = int(_math.ceil(float(value) / step) * step)
+    return max(low, min(SCHEDULE_HEIGHT_ABS_MAX, rounded))
 
-    Холст растёт только если иначе текст упёрся бы в пол; вертикального
-    кропа не бывает ни при каких обстоятельствах.
+
+def _measure_needed(schedule, changes, title, ctx, specs, scale: float) -> float:
+    """Сколько высоты требует контент при данном масштабе (честный замер)."""
+    plan = build_plan(schedule, changes, title, scale,
+                      SCHEDULE_HEIGHT_ABS_MAX, ctx, specs)
+    return float(plan["needed"])
+
+
+def choose_plan(schedule, changes, title, ctx, specs) -> dict:
+    """Динамическая высота карточки: холст по контенту, блоки по масштабу.
+
+    Раньше холст выбирался из фиксированной лестницы 1620/1740/1860/1980 и
+    почти всегда оставался «просторным» независимо от содержимого. Теперь:
+
+    1. Масштаб — самый крупный из SCHEDULE_SCALE_LADDER, при котором
+       контент ещё укладывается в комфортную высоту
+       SCHEDULE_HEIGHT_COMFORT; если не укладывается ни один — берётся
+       самый компактный. Кегли, внутренние отступы и высота блоков одной
+       пары одинаковы во всех карточках.
+    2. Высота холста считается по фактическому контенту: шапка + карточки
+       пар + зазоры + подвал + safe area. У пары с подгруппами блоков
+       больше — её карточка выше, и холст это учитывает. Одна пара —
+       компактная карточка, восемь пар — вытянутая.
+    3. Если контента мало, лишнюю пустоту «съедает» не раздутый шрифт, а
+       SCHEDULE_HEIGHT_FLOOR (минимальная высота) и breath — чуть больше
+       воздуха внутри карточек.
+    4. Плотный день (11 подгрупп) упирается в ABS_MAX — тогда масштаб
+       опускается ниже, но кропа по-прежнему нет.
+
+    Кропа не бывает ни при каких обстоятельствах: высота — свободная
+    переменная, ширина фиксирована (1080).
     """
-    fallback = None
-    for H, min_scale in SCHEDULE_RATIO_LADDER:
-        plan = fit_scale(schedule, changes, title, ctx, specs, H)
-        if plan["fits"] and plan["scale"] >= min_scale:
-            return plan
-        fallback = plan
-    needed = int((fallback or {}).get("needed") or SCHEDULE_HEIGHT_MAX)
-    H = max(SCHEDULE_RATIO_LADDER[-1][0], min(needed, SCHEDULE_HEIGHT_MAX))
-    plan = fit_scale(schedule, changes, title, ctx, specs, H)
-    for _ in range(3):
-        if plan["fits"]:
+    chosen = None
+    for scale in SCHEDULE_SCALE_LADDER:
+        needed = _measure_needed(schedule, changes, title, ctx, specs, scale)
+        chosen = (scale, needed)
+        # Комфортная высота: до неё холст растёт, дальше уже уплотняем
+        # блоки — иначе 9 пар давали бы «полотенце» на пол-экрана.
+        if needed <= SCHEDULE_HEIGHT_COMFORT:
             break
-        target = max(H, int(plan["needed"]) + 2 * SAFE_AREA)
-        if target <= H:
-            break
-        H = target
-        plan = fit_scale(schedule, changes, title, ctx, specs, H)
+    scale, needed = chosen
+    height = _round_height(needed)
+    # «Воздух» заполняет остаток до минимальной высоты, но кегли не растут.
+    breath = max(0.0, min(92.0, (height - needed) * 0.42))
+    plan = build_plan(schedule, changes, title, scale, height, ctx, specs,
+                      center=True, breath=breath)
+    if not plan["fits"]:
+        plan = build_plan(schedule, changes, title, scale, height, ctx, specs,
+                          center=True)
     return plan
 
 
@@ -5773,6 +6195,12 @@ def validate_layout(plan: dict) -> list:
 
 # Последний layout-отчёт — для диагностики и тестов.
 _LAST_RENDER: dict = {}
+# Последняя отрисовка графика нагрузки — для диагностики и тестов.
+_LAST_WORKLOAD: dict = {}
+# Последняя отрисовка топа преподавателей — для диагностики и тестов.
+_LAST_TOP: dict = {}
+# Готовые картинки аналитики: не перерисовываем то, что не менялось.
+_ANALYTICS_CACHE: dict = {}
 
 
 def render_schedule_image(
@@ -5782,8 +6210,13 @@ def render_schedule_image(
 ) -> Path:
     """PNG расписания ОДНОГО ДНЯ, заточенный под превью Telegram.
 
-    - Формат вертикальный: 1080×1620 (2:3), при плотном дне — выше по
-      лестнице форматов; кропа не бывает никогда.
+    - Формат вертикальный, ширина 1080. ВЫСОТА ДИНАМИЧЕСКАЯ: холст
+      подгоняется под фактическое содержимое — количество пар, число
+      подгрупп в паре (у каждой свой блок со своим предметом и
+      аудиторией), длину названий и строки изменений. Одна пара — почти
+      квадратная карточка, восемь пар с подгруппами — заметно выше.
+      Минимум — эталонные 1080×1620, максимум — SCHEDULE_HEIGHT_ABS_MAX,
+      кропа не бывает никогда.
     - Одна картинка = одна дата. Никаких «сегодня + завтра» вместе.
     - Карточка пары: номер, время, предмет, преподаватель и аудитория —
       лавандовая колонка с крупным кодом комнаты, не зелёная плашка.
@@ -5830,11 +6263,12 @@ def render_schedule_image(
         plan = choose_plan(schedule, changes, title, ctx, specs)
         problems = validate_layout(plan)
         if problems:
-            # Паникуем не сразу: пробуем самый компактный читаемый
-            # вариант на максимальном холсте — он гарантированно
-            # ничего не режет.
+            # Паникуем не сразу: самый компактный читаемый вариант на
+            # холсте точно по контенту — он гарантированно ничего не режет.
+            backup_h = min(max(int(plan["H"]), int(plan["needed"])),
+                           SCHEDULE_HEIGHT_ABS_MAX)
             backup = build_plan(schedule, changes, title, S_SCALE_MIN,
-                                max(plan["H"], SCHEDULE_HEIGHT_MAX), ctx, specs)
+                                backup_h, ctx, specs, center=True)
             backup_problems = validate_layout(backup)
             if len(backup_problems) < len(problems):
                 plan, problems = backup, backup_problems
@@ -6517,6 +6951,385 @@ def render_status_image(chat_id: int) -> Path:
 
 
 # ============================================================
+# КАРТИНКИ АНАЛИТИКИ: ГРАФИК НАГРУЗКИ
+# ============================================================
+
+def _chart_points(points: list) -> list:
+    """Точки графика: недели, где были занятия (нули — разрыв линии)."""
+    return [(index, point) for index, point in enumerate(points)]
+
+
+def _fmt_axis_hours(value: float) -> str:
+    """Подпись оси Y: «0», «4», «12,5» — без «акад. ч» на каждом шаге."""
+    if abs(value - round(value)) < 0.05:
+        return str(int(round(value)))
+    return f"{value:.1f}".replace(".", ",")
+
+
+def render_workload_chart(
+    group_name: str,
+    data: dict,
+    period: str = DEFAULT_LOAD_PERIOD,
+) -> Path:
+    """PNG «График нагрузки» по неделям выбранного периода.
+
+    Показывает, КОГДА учёба была плотнее, а когда почти пусто: столбики
+    академических часов по неделям, линия среднего и подпись пика. Ниже —
+    подсказка про период; сам период переключается кнопками под картинкой
+    (Месяц / 3 месяца / 6 месяцев / Год), без повторного ввода команды.
+    """
+    W = SCHEDULE_WIDTH
+    MARGIN = 52
+    points = data.get("points") or []
+    peak = max((point["hours"] for point in points), default=0.0)
+    average = float(data.get("average_hours") or 0.0)
+    top_value = max(peak, average, 1.0)
+    axis_top = float(_math.ceil(top_value / 4.0) * 4) if top_value > 4 else 4.0
+
+    font_label = get_font(22, bold=True)
+    font_title = get_font(52, bold=True)
+    font_sub = get_font(26)
+    font_axis = get_font(22)
+    font_note = get_font(22)
+    font_stat_value = get_font(34, bold=True)
+    font_stat_label = get_font(20)
+
+    HEADER_H = 250
+    STATS_H = 132
+    PLOT_H = 500
+    FOOTER_H = 96
+    H = HEADER_H + STATS_H + PLOT_H + FOOTER_H + MARGIN
+
+    image = Image.new("RGB", (W, H), COL_BG)
+    draw = ImageDraw.Draw(image)
+
+    # ---------- шапка ----------
+    draw.rectangle((0, 0, W, HEADER_H), fill=COL_WHITE)
+    draw.rectangle((0, 0, 14, HEADER_H), fill=COL_ACCENT)
+    draw.text((MARGIN + 20, 44), "ГРАФИК НАГРУЗКИ", font=font_label,
+              fill=COL_ACCENT)
+    title = group_name or "Группа не выбрана"
+    title_font = font_title
+    max_title = W - 2 * MARGIN - 40
+    if title_font.getlength(title) > max_title:
+        for size in (46, 42, 38, 34, 30, 26, 22):
+            candidate = get_font(size, bold=True)
+            if candidate.getlength(title) <= max_title:
+                title_font = candidate
+                break
+    draw.text((MARGIN + 20, 92), title, font=title_font, fill=COL_INK)
+    draw.text(
+        (MARGIN + 22, 190),
+        f"{data['label']} · {format_date_full(data['start'])} — "
+        f"{format_date_full(data['end'])}",
+        font=font_sub, fill=COL_MUTED,
+    )
+
+    # ---------- карточка со статистикой ----------
+    card_x0, card_x1 = MARGIN, W - MARGIN
+    stats_y = HEADER_H + 8
+    draw.rounded_rectangle(
+        (card_x0 + 6, stats_y + 10, card_x1 + 6, stats_y + STATS_H + 10),
+        radius=28, fill="#E6EAF3",
+    )
+    draw.rounded_rectangle(
+        (card_x0, stats_y, card_x1, stats_y + STATS_H),
+        radius=28, fill=COL_WHITE, outline=COL_BORDER, width=2,
+    )
+    stats = [
+        ("Всего за период", _hours_text(data["total_hours"])),
+        ("Пар", str(data["total_lessons"])),
+        ("Пик недели", _hours_text(peak)),
+        ("Среднее в неделю", _hours_text(average)),
+    ]
+    slot_w = (card_x1 - card_x0) / len(stats)
+    for index, (label, value) in enumerate(stats):
+        center = card_x0 + slot_w * index + slot_w / 2
+        # Рамка значения сжимается, а не вылезает на соседнюю колонку.
+        value_font = font_stat_value
+        max_value_w = slot_w - 24
+        if draw.textlength(value, font=value_font) > max_value_w:
+            for size in (30, 27, 24, 22, 20):
+                candidate = get_font(size, bold=True)
+                if candidate.getlength(value) <= max_value_w:
+                    value_font = candidate
+                    break
+        label_w = draw.textlength(label, font=font_stat_label)
+        draw.text((center - label_w / 2, stats_y + 30), label,
+                  font=font_stat_label, fill=COL_MUTED)
+        value_w = draw.textlength(value, font=value_font)
+        draw.text((center - value_w / 2, stats_y + 62), value,
+                  font=value_font, fill=COL_INK)
+
+    # ---------- область графика ----------
+    plot_top = stats_y + STATS_H + 58
+    bars_top = plot_top + 46
+    bars_bottom = plot_top + PLOT_H - 70
+    axis_w = 54
+    left = card_x0 + axis_w + 22
+    right = card_x1 - 20
+
+    # сетка + подписи оси Y (слева от области, «акад. ч» — над шкалой)
+    rows = 4
+    for step in range(rows + 1):
+        value = axis_top * step / rows
+        y = bars_bottom - (bars_bottom - bars_top) * step / rows
+        draw.line((left, y, right, y), fill="#E8E6F0", width=1)
+        label = _fmt_axis_hours(value)
+        label_w = draw.textlength(label, font=font_axis)
+        draw.text((left - 16 - label_w, y - _text_h(font_axis) / 2),
+                  label, font=font_axis, fill=COL_MUTED)
+    draw.text((card_x0 + 8, plot_top + 6), "акад. ч", font=font_axis,
+              fill=COL_MUTED)
+
+    if not points or data["total_minutes"] <= 0:
+        message = "За этот период завершённых пар нет"
+        message_w = draw.textlength(message, font=font_sub)
+        draw.text(((W - message_w) / 2, bars_top + (bars_bottom - bars_top) / 2),
+                  message, font=font_sub, fill=COL_MUTED)
+    else:
+        count = len(points)
+        step_w = (right - left) / count
+        bar_w = max(6.0, min(44.0, step_w * 0.64))
+        peak_index = max(
+            (position for position, point in enumerate(points)), default=-1,
+            key=lambda position: points[position]["hours"],
+        )
+        # средний уровень — пунктиром: «выше/ниже обычного» видно сразу
+        avg_y = None
+        if average > 0:
+            avg_y = bars_bottom - (bars_bottom - bars_top) * (average / axis_top)
+            dash = 12
+            x = left
+            while x < right:
+                draw.line((x, avg_y, min(x + dash, right), avg_y),
+                          fill=COL_WARN, width=2)
+                x += dash * 2
+
+        # подписи дат под осями — до столбиков, чтобы они не перекрывались
+        label_every = max(1, int(_math.ceil(count / 6)))
+        for index, point in enumerate(points):
+            if index % label_every and index != count - 1:
+                continue
+            center = left + step_w * (index + 0.5)
+            label = point["start"].strftime("%d.%m")
+            label_w = draw.textlength(label, font=font_axis)
+            x = min(max(left, center - label_w / 2), right - label_w)
+            draw.text((x, bars_bottom + 18), label, font=font_axis,
+                      fill=COL_MUTED)
+
+        for index, point in enumerate(points):
+            center = left + step_w * (index + 0.5)
+            hours = point["hours"]
+            if hours <= 0:
+                # «мёртвая» неделя: тихая засечка на нуле
+                draw.line((center - bar_w / 2, bars_bottom,
+                           center + bar_w / 2, bars_bottom),
+                          fill=COL_BORDER, width=3)
+                continue
+            height = (bars_bottom - bars_top) * (hours / axis_top)
+            height = max(4.0, min(bars_bottom - bars_top, height))
+            top = bars_bottom - height
+            fill = COL_ACCENT if hours >= average else COL_ACCENT_LIGHT
+            draw.rounded_rectangle(
+                (center - bar_w / 2, top, center + bar_w / 2, bars_bottom),
+                radius=min(bar_w / 2, 8), fill=fill,
+            )
+            # Подписываем только самый высокий столбик: повтор «16 16 16»
+            # вдоль ряда ничего не добавляет и шумит.
+            if index == peak_index:
+                value = _fmt_axis_hours(hours)
+                value_w = draw.textlength(value, font=font_axis)
+                draw.text((center - value_w / 2, top - _text_h(font_axis) - 2),
+                          value, font=font_axis, fill=COL_ACCENT)
+
+        # Подпись среднего уровня — поверх столбиков, на подложке цвета фона.
+        if avg_y is not None:
+            avg_label = "среднее"
+            label_w = draw.textlength(avg_label, font=font_axis)
+            label_h = _text_h(font_axis)
+            chip_w = label_w + 16
+            chip = (right - chip_w - 2, avg_y - label_h - 10,
+                    right - 2, avg_y - 2)
+            draw.rounded_rectangle(chip, radius=8, fill=COL_BG)
+            draw.text((chip[0] + 8, chip[1] + 3), avg_label, font=font_axis,
+                      fill=COL_WARN)
+
+    # ---------- подвал ----------
+    note = ("Нагрузка по неделям — академические часы завершённых пар "
+            "(1 акад. ч = 40 мин).")
+    draw.text((MARGIN + 20, H - MARGIN - _text_h(font_note) + 18), note,
+              font=font_note, fill=COL_MUTED)
+
+    filename = (
+        f"workload_{hashlib.sha256((group_name + data['period']).encode('utf-8')).hexdigest()[:12]}"
+        f"_{data['end'].isoformat()}.png"
+    )
+    path = ANALYTICS_DIR / filename
+    image.save(path, "PNG", optimize=True, compress_level=9)
+    _LAST_WORKLOAD.update({
+        "path": str(path), "size": (W, H), "period": data["period"],
+        "data": data, "group": group_name,
+    })
+    logger.info("График нагрузки сохранён: %s (%sx%s, период %s)",
+                path, W, H, data["period"])
+    return path
+
+
+
+def render_top_teachers_image(
+    group_name: str,
+    rankings: list,
+    period_label: str = "",
+) -> Path:
+    """PNG «Топ преподавателей группы по изученным часам».
+
+    Список — по убыванию часов: место, ФИО, часы академическими часами,
+    число пар и доля от общего времени группы. Три первых места — с
+    лавандовым акцентом, остальные — ровным списком. Высота картинки
+    зависит от количества строк: 3 преподавателя — компактная карточка,
+    10 — вытянутая.
+    """
+    W = SCHEDULE_WIDTH
+    MARGIN = 52
+    HEADER_H = 250
+    ROW_H = 84
+    TOP_BAR_H = 32
+    FOOTER_H = 96
+    rows = rankings or []
+
+    font_label = get_font(22, bold=True)
+    font_title = get_font(52, bold=True)
+    font_sub = get_font(26)
+    font_rank = get_font(30, bold=True)
+    font_name = get_font(30, bold=True)
+    font_value = get_font(30, bold=True)
+    font_meta = get_font(21)
+    font_note = get_font(22)
+
+    H = HEADER_H + 20 + TOP_BAR_H + len(rows) * ROW_H + FOOTER_H + MARGIN
+
+    image = Image.new("RGB", (W, H), COL_BG)
+    draw = ImageDraw.Draw(image)
+
+    # ---------- шапка ----------
+    draw.rectangle((0, 0, W, HEADER_H), fill=COL_WHITE)
+    draw.rectangle((0, 0, 14, HEADER_H), fill=COL_ACCENT)
+    draw.text((MARGIN + 20, 44), "ТОП ПРЕПОДАВАТЕЛЕЙ",
+              font=font_label, fill=COL_ACCENT)
+    title = group_name or "Группа не выбрана"
+    title_font = font_title
+    max_title = W - 2 * MARGIN - 40
+    if title_font.getlength(title) > max_title:
+        for size in (46, 42, 38, 34, 30, 26, 22):
+            candidate = get_font(size, bold=True)
+            if candidate.getlength(title) <= max_title:
+                title_font = candidate
+                break
+    draw.text((MARGIN + 20, 92), title, font=title_font, fill=COL_INK)
+    draw.text((MARGIN + 22, 190),
+              period_label or "По изученным часам с начала учебного года",
+              font=font_sub, fill=COL_MUTED)
+
+    # ---------- шапка списка ----------
+    card_x0, card_x1 = MARGIN, W - MARGIN
+    y = HEADER_H + 20
+    draw.text((card_x0 + 26, y), "ПРЕПОДАВАТЕЛЬ", font=font_meta,
+              fill=COL_MUTED)
+    hours_label = "ИЗУЧЕНО"
+    hours_w = draw.textlength(hours_label, font=font_meta)
+    draw.text((card_x1 - 26 - hours_w, y), hours_label, font=font_meta,
+              fill=COL_MUTED)
+    y += TOP_BAR_H
+
+    if not rows:
+        message = "Пока нет завершённых пар — топ появится после первых занятий"
+        message_w = draw.textlength(message, font=font_sub)
+        draw.text(((W - message_w) / 2, y + 40), message, font=font_sub,
+                  fill=COL_MUTED)
+    else:
+        total_minutes = sum(entry.minutes for entry in rows) or 1
+        for index, entry in enumerate(rows):
+            row_top = y + index * ROW_H
+            row_box = (card_x0, row_top, card_x1, row_top + ROW_H - 12)
+            pinned = index < 3
+            draw.rounded_rectangle(
+                (row_box[0] + 5, row_box[1] + 8, row_box[2] + 5,
+                 row_box[3] + 8),
+                radius=24, fill="#E6EAF3",
+            )
+            draw.rounded_rectangle(
+                row_box, radius=24, fill=COL_WHITE,
+                outline=COL_ACCENT if pinned else COL_BORDER,
+                width=2 if pinned else 1,
+            )
+            # место
+            place_x = row_box[0] + 26
+            place_y = row_top + (ROW_H - 12 - _text_h(font_rank)) / 2
+            draw.text((place_x, place_y), str(index + 1), font=font_rank,
+                      fill=COL_ACCENT if pinned else COL_MUTED)
+            # ФИО и мета-строка
+            name_x = place_x + 44
+            name_right = card_x1 - 250
+            name = entry.display_name or entry.name
+            name_font = font_name
+            if draw.textlength(name, font=name_font) > name_right - name_x:
+                for size in (27, 24, 22, 20):
+                    candidate = get_font(size, bold=True)
+                    if candidate.getlength(name) <= name_right - name_x:
+                        name_font = candidate
+                        break
+                else:
+                    name_font = get_font(20, bold=True)
+                    while (len(name) > 4 and
+                           draw.textlength(name + "…", font=name_font)
+                           > name_right - name_x):
+                        name = name[:-1]
+                    name = name + "…"
+            draw.text((name_x, row_top + 14), name, font=name_font,
+                      fill=COL_INK)
+            share = entry.minutes / total_minutes * 100
+            meta = (f"{entry.lessons} "
+                    f"{_plural(entry.lessons, 'пара', 'пары', 'пар')}"
+                    f" · {share:.0f}% времени группы".replace(".", ","))
+            draw.text((name_x, row_top + 48), meta, font=font_meta,
+                      fill=COL_MUTED)
+            # часы
+            value = _hours_text(entry.academic_hours)
+            value_w = draw.textlength(value, font=font_value)
+            draw.text((card_x1 - 26 - value_w, row_top + 20), value,
+                      font=font_value, fill=COL_ACCENT if pinned else COL_INK)
+
+    # ---------- подвал ----------
+    note = ("Часы — время пар группы, где вёл этот преподаватель "
+            "(1 акад. ч = 40 мин).")
+    draw.text((MARGIN + 20, H - MARGIN - _text_h(font_note) + 18), note,
+              font=font_note, fill=COL_MUTED)
+
+    filename = (
+        f"top_{hashlib.sha256(group_name.encode('utf-8')).hexdigest()[:12]}"
+        f"_{get_today().isoformat()}.png"
+    )
+    path = ANALYTICS_DIR / filename
+    image.save(path, "PNG", optimize=True, compress_level=9)
+    _LAST_TOP.update({"path": str(path), "size": (W, H),
+                      "rows": len(rows), "group": group_name})
+    logger.info("Топ преподавателей сохранён: %s (%sx%s, строк %s)",
+                path, W, H, len(rows))
+    return path
+
+
+def workload_period_keyboard(period: str = DEFAULT_LOAD_PERIOD) -> InlineKeyboardMarkup:
+    """Кнопки выбора периода графика: активный период помечен галочкой."""
+    buttons = []
+    for key, (label, _months) in LOAD_CHART_PERIODS.items():
+        mark = "• " if key == period else ""
+        buttons.append(InlineKeyboardButton(
+            text=f"{mark}{label}", callback_data=f"load:{key}"))
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+# ============================================================
 # КЛАВИАТУРА
 # ============================================================
 
@@ -6567,6 +7380,8 @@ def main_keyboard(is_subscribed: bool, has_group: bool = True) -> InlineKeyboard
          InlineKeyboardButton(text="О группе", callback_data="groupinfo")],
         [InlineKeyboardButton(text=group_button_text, callback_data="groups"),
          InlineKeyboardButton(text="Преподаватели", callback_data="teacher")],
+        [InlineKeyboardButton(text="Топ преподавателей", callback_data="top"),
+         InlineKeyboardButton(text="График нагрузки", callback_data="graph")],
         [InlineKeyboardButton(
             text="Уведомления: вкл." if is_subscribed else "Уведомления: выкл.",
             callback_data="notifications")],
@@ -6782,39 +7597,38 @@ def _photo_caption(schedule: Schedule) -> str:
 
 
 async def _send_photo(destination, schedule: Schedule, reply_markup=None) -> bool:
-    """Отправляет постоянный PNG из кэша; генерация выполняется один раз на версию."""
-    path = await get_cached_image(schedule)
+    """PNG расписания из кэша — с умным очищением чата.
+
+    Прошлый ответ бота того же типа (предыдущее расписание, топ, график)
+    РЕДАКТИРУЕТСЯ: у пользователя один актуальный экран, а не лента
+    картинок. Если предыдущий ответ был текстом, он удаляется.
+    """
     try:
+        path = await get_cached_image(schedule)
         caption = _photo_caption(schedule)
-        kwargs = {"caption": caption}
-        if reply_markup is not None:
-            kwargs["reply_markup"] = reply_markup
-        if _is_message_destination(destination):
-            await destination.answer_photo(FSInputFile(path), **kwargs)
-        else:
-            await destination.message.answer_photo(FSInputFile(path), **kwargs)
+        ok = await deliver(destination, photo=path, caption=caption,
+                           reply_markup=reply_markup, edit=_deliver_edits(destination))
         chat_id = _destination_chat_id(destination)
-        if chat_id is not None and schedule.lessons:
+        if ok and chat_id is not None and schedule.lessons:
             record_schedule_notification(
                 chat_id,
                 schedule.date.isoformat(),
                 schedule_signature(schedule),
                 schedule_target_key(schedule),
             )
-        return True
+        return ok
     except Exception:
         logger.exception("Ошибка отправки изображения")
         return False
 
 
-async def _send_text(destination, text: str) -> None:
+async def _send_text(destination, text: str) -> bool:
+    """Текстовый экран с очищением чата (см. deliver)."""
     try:
-        if _is_message_destination(destination):
-            await destination.answer(text)
-        else:
-            await destination.message.answer(text)
+        return await deliver(destination, text=text, edit=_deliver_edits(destination))
     except Exception:
         logger.exception("Ошибка отправки текста")
+        return False
 
 
 def _destination_chat_id(destination) -> Optional[int]:
@@ -6842,11 +7656,8 @@ async def _prompt_group_selection(
     prefix: str = "Сначала выберите группу.",
 ) -> None:
     text = f"<b>{html.escape(prefix)}</b>\n\n<b>Шаг 1 из 3 · Выберите курс:</b>"
-    markup = group_course_keyboard()
-    if _is_message_destination(destination):
-        await destination.answer(text, reply_markup=markup)
-    else:
-        await destination.message.answer(text, reply_markup=markup)
+    await deliver(destination, text=text, reply_markup=group_course_keyboard(),
+                  edit=_deliver_edits(destination))
 
 
 async def _edit_or_answer(
@@ -6854,14 +7665,23 @@ async def _edit_or_answer(
     text: str,
     reply_markup: InlineKeyboardMarkup,
 ) -> None:
+    """Экран выбора группы: шаг меняет тот же экран, а не плодит новые.
+
+    Правка идёт «мимо» deliver, поэтому сообщение нужно запомнить: иначе
+    следующий ответ бота не узнает о нём и оставит висеть в чате.
+    """
     msg = callback.message
     if getattr(msg, "text", None) and hasattr(msg, "edit_text"):
         try:
             await msg.edit_text(text, reply_markup=reply_markup)
-            return
         except Exception:
-            pass
-    await msg.answer(text, reply_markup=reply_markup)
+            logger.debug("Не удалось переключить шаг выбора группы",
+                         exc_info=True)
+        else:
+            remember_bot_message(_destination_chat_id(callback),
+                                 getattr(msg, "message_id", None), "text")
+            return
+    await _edit_or_send_text(callback, text, reply_markup)
 
 
 async def _schedule_for_destination(destination, day: date, group_id: int) -> Schedule:
@@ -7007,10 +7827,12 @@ async def _send_staff_schedule(
     destination,
     member: StaffMember,
     target_day: date,
-    *,
-    edit_existing: bool = False,
 ) -> bool:
-    """Получает и отправляет staff-расписание с навигацией."""
+    """Получает и отправляет staff-расписание с навигацией.
+
+    Нужна ли правка прошлого экрана, решает deliver(): при навигации
+    кнопками экран остаётся на месте, при новой команде — обновляется.
+    """
     try:
         schedule = await get_staff_schedule_cached(member.staff_id, target_day)
         keyboard = staff_keyboard(member.staff_id, target_day)
@@ -7021,39 +7843,15 @@ async def _send_staff_schedule(
                 f"{format_date_full(target_day)}\n\n"
                 "Занятий нет или расписание ещё не опубликовано."
             )
-            if _is_message_destination(destination):
-                await destination.answer(text, reply_markup=keyboard)
-            else:
-                await destination.message.answer(text, reply_markup=keyboard)
+            await _edit_or_send_text(destination, text, keyboard)
             return True
 
         path = await get_cached_image(schedule)
         try:
             caption = _photo_caption(schedule)
-            if edit_existing and isinstance(destination, CallbackQuery):
-                try:
-                    await destination.message.edit_media(
-                        media=InputMediaPhoto(
-                            media=FSInputFile(path),
-                            caption=caption,
-                        ),
-                        reply_markup=keyboard,
-                    )
-                except Exception:
-                    # Старые сообщения или тестовые mock-и могут не уметь
-                    # edit_media; сохраняем функциональность отправкой новой
-                    # картинки, а не теряем ответ навигации.
-                    await destination.message.answer_photo(
-                        FSInputFile(path), caption=caption, reply_markup=keyboard
-                    )
-            elif _is_message_destination(destination):
-                await destination.answer_photo(
-                    FSInputFile(path), caption=caption, reply_markup=keyboard
-                )
-            else:
-                await destination.message.answer_photo(
-                    FSInputFile(path), caption=caption, reply_markup=keyboard
-                )
+            # Навигация кнопками правит тот же экран (см. deliver),
+            # новая команда — присылает свежий внизу и убирает старый.
+            await _send_photo_file(destination, path, caption, keyboard)
             chat_id = _destination_chat_id(destination)
             if chat_id is not None and schedule.lessons:
                 record_schedule_notification(
@@ -7081,6 +7879,104 @@ async def _send_staff_schedule(
         return False
 
 
+def analytics_image_path(kind: str, group_name: str, *,
+                         period: str = "", signature=(), render=None):
+    """Готовая картинка аналитики: из кэша или нарисованная один раз.
+
+    Кэш живёт в памяти процесса и в ``ANALYTICS_DIR`` на диске, поэтому
+    повторный «топ» или «график» без новых завершённых пар не тратит
+    время на Pillow. Ошибка отрисовки не ломает обработчик: вернётся
+    ``None``, и вызывающий код отправит текст.
+    """
+    key = (kind, group_name, period, tuple(signature))
+    cached = _ANALYTICS_CACHE.get(key)
+    if cached and Path(cached).is_file():
+        return Path(cached)
+    if render is None:
+        return None
+    try:
+        path = render()
+    except Exception:
+        logger.exception("Не удалось нарисовать %s для %s", kind, group_name)
+        return None
+    _ANALYTICS_CACHE[key] = str(path)
+    return path
+
+
+async def _send_photo_file(destination, path: Path, caption: str,
+                           reply_markup=None) -> bool:
+    """Отправить готовый PNG (график, топ) с очищением чата.
+
+    Смена периода графика кнопками — это правка того же сообщения:
+    «график» не размножается на каждый клик.
+    """
+    try:
+        return await deliver(destination, photo=path, caption=caption,
+                             reply_markup=reply_markup,
+                             edit=_deliver_edits(destination))
+    except Exception:
+        logger.exception("Ошибка отправки изображения")
+        return False
+
+
+async def _handle_top(destination) -> None:
+    """Топ преподавателей группы по изученным часам.
+
+    Картинка кэшируется по (группа, число пар в истории): повторный
+    запрос не перерисовывает PNG, а история меняется только с новыми
+    завершёнными парами.
+    """
+    group_id = _selected_group_id(destination)
+    if group_id is None:
+        await _prompt_group_selection(
+            destination, prefix="Сначала выберите группу для топа."
+        )
+        return
+    group = get_group(group_id)
+    rankings = load_teacher_rankings(group.name)
+    caption = top_teachers_text(rankings, group.name)
+    path = None
+    path = analytics_image_path(
+        "top", group.name,
+        signature=tuple((entry.name, entry.minutes) for entry in rankings),
+        render=lambda: render_top_teachers_image(
+            group.name, rankings, "С начала учебного года"
+        ),
+    )
+
+    if path is not None and await _send_photo_file(destination, path, caption):
+        return
+    await _edit_or_send_text(destination, caption)
+
+
+async def _handle_load_chart(destination,
+                             period: str = DEFAULT_LOAD_PERIOD) -> None:
+    """График нагрузки с выбором периода: месяц / 3 / 6 / год."""
+    key = period if period in LOAD_CHART_PERIODS else DEFAULT_LOAD_PERIOD
+    group_id = _selected_group_id(destination)
+    if group_id is None:
+        await _prompt_group_selection(
+            destination, prefix="Сначала выберите группу для графика."
+        )
+        return
+    group = get_group(group_id)
+    data = load_workload_series(group.name, key)
+    caption = workload_text(data, group.name)
+    markup = workload_period_keyboard(key)
+    # Кэш перерисовки: (группа, период, последний день, сумма минут).
+    path = analytics_image_path(
+        "load", group.name, period=key,
+        signature=(data["end"].isoformat(), data["total_minutes"]),
+        render=lambda: render_workload_chart(group.name, data, key),
+    )
+
+    if path is not None and await _send_photo_file(destination, path, caption,
+                                                   markup):
+        return
+    # Без картинки остаётся текст, но выбор периода должен быть доступен.
+    await _edit_or_send_text(destination, caption, markup)
+
+
 async def _handle_staff_request(destination, request: ScheduleTextRequest) -> None:
     if request.error:
         await _send_text(
@@ -7103,15 +7999,11 @@ async def _handle_staff_request(destination, request: ScheduleTextRequest) -> No
         return
     target_day = request.date or get_tomorrow()
     if len(matches) > 1:
-        text = "👨‍🏫 <b>Выберите преподавателя:</b>"
-        if _is_message_destination(destination):
-            await destination.answer(
-                text, reply_markup=staff_choice_keyboard(matches, target_day)
-            )
-        else:
-            await destination.message.answer(
-                text, reply_markup=staff_choice_keyboard(matches, target_day)
-            )
+        await _edit_or_send_text(
+            destination,
+            "👨‍🏫 <b>Выберите преподавателя:</b>",
+            staff_choice_keyboard(matches, target_day),
+        )
         return
     chat_id = _destination_chat_id(destination)
     if chat_id is not None:
@@ -7200,15 +8092,9 @@ async def _send_status(destination) -> None:
 
     if path is not None:
         try:
-            if chat is not None:
-                await destination.answer_photo(FSInputFile(path),
-                                               caption=caption)
-            else:
-                await destination.message.answer_photo(FSInputFile(path),
-                                                       caption=caption)
-            return
-        except Exception:
-            logger.exception("Не удалось отправить картинку статуса")
+            if await _send_photo_file(destination, path, caption):
+                return
+            logger.error("Не удалось отправить картинку статуса")
         finally:
             try:
                 path.unlink(missing_ok=True)
@@ -7216,6 +8102,284 @@ async def _send_status(destination) -> None:
                 pass
 
     await _send_text(destination, await _status_text(chat_id))
+
+
+# ============================================================
+# УМНОЕ ОЧИЩЕНИЕ ЧАТА
+# ============================================================
+# Правила (осознанно разные для разных сообщений):
+#
+#   * ПРЕДЫДУЩИЙ ОТВЕТ БОТА того же типа (текст → текст, картинка →
+#     картинка) НЕ УДАЛЯЕТСЯ, а РЕДАКТИРУЕТСЯ. Пользователь видит один
+#     актуальный экран: расписание сменяется расписанием, график — графиком
+#     при смене периода, меню — меню. Чат не «прыгает», история не растёт.
+#
+#   * Если тип ответа меняется (меню-текст → картинка расписания или
+#     наоборот), редактирование невозможно в принципе, поэтому старое
+#     сообщение бота УДАЛЯЕТСЯ, а новое отправляется.
+#
+#   * КОМАНДА ПОЛЬЗОВАТЕЛЯ (`/today`, «топ», «график за год», нажатая
+#     кнопка) удаляется ПОСЛЕ успешной доставки ответа: в чате остаётся
+#     ровно один ответ бота и ничего лишнего. Если ответ не ушёл —
+#     команда остаётся, чтобы её можно было повторить.
+#
+#   * Ничего не трогаем, если бот не может этого сделать: в группах
+#     удаление требует прав администратора, редактирование — нет.
+#     Любая ошибка Telegram (нет прав, сообщение старше 48 часов, уже
+#     удалено) только пишется в debug-лог и не ломает сценарий.
+#
+#   * Служебные ветки (модерация рассылки, оплата) не очищаются: там
+#     удаление сообщений ломает пошаговый сценарий.
+
+CHAT_CLEANUP = os.getenv("CHAT_CLEANUP", "1").strip().lower() not in (
+    "0", "false", "no", "off"
+)
+# Сколько помним id сообщений чата и как долго (Telegram всё равно не даёт
+# удалять сообщения старше 48 часов).
+CHAT_HISTORY_LIMIT = 8
+CHAT_HISTORY_TTL = int(os.getenv("CHAT_HISTORY_TTL", str(6 * 3600)))
+
+# chat_id -> {"commands": [(message_id, ts)], "bot": [(message_id, kind, ts)]}
+_CHAT_SESSIONS: dict = {}
+
+
+def _cleanup_enabled() -> bool:
+    return bool(CHAT_CLEANUP)
+
+
+def _chat_session(chat_id: Optional[int]) -> Optional[dict]:
+    """Состояние чата: последние команды и последние ответы бота."""
+    if chat_id is None or not _cleanup_enabled():
+        return None
+    now = time.time()
+    session = _CHAT_SESSIONS.get(chat_id)
+    if session is None:
+        session = {"commands": [], "bot": []}
+        _CHAT_SESSIONS[chat_id] = session
+    session["commands"] = [
+        (message_id, stamp) for message_id, stamp in session["commands"]
+        if now - stamp <= CHAT_HISTORY_TTL
+    ][-CHAT_HISTORY_LIMIT:]
+    session["bot"] = [
+        (message_id, kind, stamp) for message_id, kind, stamp in session["bot"]
+        if now - stamp <= CHAT_HISTORY_TTL
+    ][-CHAT_HISTORY_LIMIT:]
+    return session
+
+
+def _cleanup_bot(destination):
+    """Bot для удаления/редактирования. None — значит, трогать нельзя."""
+    if not _cleanup_enabled():
+        return None
+    bot = getattr(destination, "bot", None)
+    if bot is None:
+        bot = getattr(getattr(destination, "message", None), "bot", None)
+    return bot if isinstance(bot, Bot) else None
+
+
+def _looks_like_message(event) -> bool:
+    """Это сообщение (aiogram или совместимый объект)?
+
+    Проверка по атрибутам, а не только по isinstance: так же работают
+    тестовые двойники и обёртки над Message.
+    """
+    if isinstance(event, Message):
+        return True
+    return (
+        getattr(event, "message_id", None) is not None
+        and getattr(event, "chat", None) is not None
+    )
+
+
+def remember_user_command(destination, message: Optional[Message] = None) -> None:
+    """Запомнить команду пользователя, чтобы удалить её после ответа."""
+    message = message if message is not None else destination
+    if not _looks_like_message(message):
+        return
+    if getattr(message, "from_user", None) is None:
+        return
+    # Сообщения самого бота и пересланное чужое не трогаем.
+    if getattr(message.from_user, "is_bot", False):
+        return
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    message_id = getattr(message, "message_id", None)
+    session = _chat_session(chat_id)
+    if session is None or message_id is None:
+        return
+    session["commands"].append((int(message_id), time.time()))
+
+
+def remember_bot_message(chat_id: Optional[int], message_id: Optional[int],
+                         kind: str = "text") -> None:
+    """Запомнить ответ бота: следующий ответ отредактирует или удалит его."""
+    session = _chat_session(chat_id)
+    if session is None or message_id is None:
+        return
+    session["bot"].append((int(message_id), kind, time.time()))
+
+
+async def _delete_message(bot, chat_id: Optional[int],
+                          message_id: Optional[int]) -> bool:
+    if bot is None or chat_id is None or message_id is None:
+        return False
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=int(message_id))
+        return True
+    except Exception as error:      # нет прав / старше 48 ч / уже удалено
+        logger.debug("Не удалось удалить сообщение %s в %s: %s",
+                     message_id, chat_id, error)
+        return False
+
+
+async def _edit_message(bot, chat_id: Optional[int], message_id: Optional[int],
+                        *, kind: str, text: Optional[str],
+                        photo: Optional[Path], caption: str,
+                        reply_markup) -> bool:
+    """Правка последнего ответа вместо отправки нового."""
+    if bot is None or chat_id is None or message_id is None:
+        return False
+    try:
+        if kind == "photo":
+            await bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                media=InputMediaPhoto(media=FSInputFile(photo),
+                                      caption=caption or ""),
+                reply_markup=reply_markup,
+            )
+        else:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                text=text or "",
+                reply_markup=reply_markup,
+            )
+        return True
+    except TelegramBadRequest as error:
+        # «message is not modified» — это успех: экран уже такой, как надо.
+        if "not modified" in str(error).lower():
+            return True
+        logger.debug("Не удалось отредактировать сообщение %s: %s",
+                     message_id, error)
+        return False
+    except Exception as error:
+        logger.debug("Не удалось отредактировать сообщение %s: %s",
+                     message_id, error)
+        return False
+
+
+async def _send_answer(destination, *, text: Optional[str],
+                       photo: Optional[Path], caption: str,
+                       reply_markup):
+    """Новая отправка. Возвращает (message_id, kind, отправлено ли)."""
+    kind = "photo" if photo is not None else "text"
+    try:
+        if _is_message_destination(destination):
+            target = destination
+        else:
+            target = destination.message
+        if photo is not None:
+            sent = await target.answer_photo(
+                FSInputFile(photo), caption=caption or "",
+                reply_markup=reply_markup,
+            )
+        else:
+            sent = await target.answer(text or "", reply_markup=reply_markup)
+    except Exception:
+        logger.exception("Ошибка отправки ответа")
+        return None, kind, False
+    # message_id может отсутствовать (нестандартный транспорт, тесты) —
+    # сообщение всё равно считается доставленным, просто его не запомнить.
+    return getattr(sent, "message_id", None), kind, True
+
+
+async def deliver(destination, *, text: Optional[str] = None,
+                  photo: Optional[Path] = None, caption: str = "",
+                  reply_markup=None, edit: bool = False,
+                  cleanup_command: bool = True) -> bool:
+    """Единая точка отправки ответа с умным очищением чата.
+
+    ``text`` — текстовый экран, ``photo``+``caption`` — картинка.
+    При ``edit=True`` (только для callback-ов, см. ``_deliver_edits``)
+    прошлый ответ бота правится на месте, если совпал тип; иначе он
+    удаляется и отправляется новое сообщение. Команда пользователя,
+    вызвавшая ответ, удаляется после успешной доставки (если бот имеет на
+    это право).
+    """
+    chat_id = _destination_chat_id(destination)
+    bot = _cleanup_bot(destination)
+    session = _chat_session(chat_id)
+    kind = "photo" if photo is not None else "text"
+
+    previous = None
+    if session and session["bot"]:
+        message_id, previous_kind, _stamp = session["bot"][-1]
+        previous = (message_id, previous_kind)
+
+    delivered = False
+    if (edit and previous is not None and previous[1] == kind):
+        delivered = await _edit_message(
+            bot, chat_id, previous[0], kind=kind, text=text, photo=photo,
+            caption=caption, reply_markup=reply_markup,
+        )
+        if delivered:
+            # Экран остался тем же сообщением — просто продлеваем его жизнь.
+            session["bot"][-1] = (previous[0], kind, time.time())
+
+    if not delivered:
+        message_id, kind, delivered = await _send_answer(
+            destination, text=text, photo=photo, caption=caption,
+            reply_markup=reply_markup,
+        )
+        if not delivered:
+            return False
+        # Старый экран другого типа (или тот, который не удалось
+        # отредактировать) больше не нужен.
+        if previous is not None:
+            await _delete_message(bot, chat_id, previous[0])
+            if session:
+                session["bot"] = [entry for entry in session["bot"]
+                                  if entry[0] != previous[0]]
+        remember_bot_message(chat_id, message_id, kind)
+
+    if cleanup_command and session and session["commands"]:
+        # Удаляем только последнюю команду — ту, на которую сейчас ответили.
+        # Более старые записи остались от сообщений, которые мы НЕ отвечали
+        # (например, пользователь просто поздоровался), и удалять их нельзя.
+        message_id, stamp = session["commands"][-1]
+        # Не вышло (нет прав, старше 48 ч) — всё равно забываем: повторно
+        # это сообщение уже не удалить, а память не должна копиться.
+        await _delete_message(bot, chat_id, message_id)
+        session["commands"] = session["commands"][:-1]
+    return True
+
+
+def _deliver_edits(destination) -> bool:
+    """Можно ли ПРАВИТЬ прошлый ответ вместо нового сообщения.
+
+    Да — когда пользователь листает кнопками (callback): экран остаётся на
+    месте, чат не «прыгает», история не растёт. Нет — когда пришла новая
+    команда: ответ должен появиться внизу и быть замеченным, поэтому
+    старый экран удаляется, а новый отправляется.
+    """
+    if isinstance(destination, CallbackQuery):
+        return True
+    # Тестовые двойники и обёртки: callback узнаём по .data + .message.
+    return (
+        not _looks_like_message(destination)
+        and getattr(destination, "message", None) is not None
+        and getattr(destination, "data", None) is not None
+    )
+
+
+async def _edit_or_send_text(destination, text: str, reply_markup=None) -> bool:
+    """Текст с очищением чата — короткая обёртка над deliver().
+
+    Экран листается кнопками — правим на месте; пришла новая команда —
+    прошлый экран удаляется, а ответ появляется внизу.
+    """
+    return await deliver(destination, text=text, reply_markup=reply_markup,
+                         edit=_deliver_edits(destination))
 
 
 # ============================================================
@@ -7266,6 +8430,35 @@ class AntiSpamMiddleware(BaseMiddleware):
             return None
         return await handler(event, data)
 
+
+class ChatCleanupMiddleware(BaseMiddleware):
+    """Помнит команду пользователя, чтобы убрать её после ответа бота.
+
+    Сообщения, которые отправлены ботом, пересланные чужие сообщения и
+    служебные сценарии (модерация рассылки, оплата, ввод даты, поиск
+    преподавателя) не удаляются: там сообщение — часть диалога.
+    """
+
+    SERVICE_PENDING = ("broadcast_compose", "date", "teacher_search")
+
+    async def __call__(self, handler, event, data):
+        if _cleanup_enabled() and _looks_like_message(event):
+            chat = getattr(event, "chat", None)
+            actor = getattr(event, "from_user", None)
+            if (chat is not None and actor is not None
+                    and not getattr(actor, "is_bot", False)):
+                pending = ""
+                try:
+                    pending = get_user_settings(chat.id).get("pending_action", "")
+                except Exception:
+                    logger.exception("Не удалось прочитать состояние чата")
+                if pending not in self.SERVICE_PENDING:
+                    remember_user_command(event)
+        return await handler(event, data)
+
+
+_cleanup_middleware = ChatCleanupMiddleware()
+dp.message.outer_middleware(_cleanup_middleware)
 
 _spam_middleware = AntiSpamMiddleware()
 dp.message.outer_middleware(_spam_middleware)
@@ -7320,13 +8513,20 @@ async def cmd_start(message: Message):
             if selected_group_id is None
             else ""
         )
-        await message.answer(
-            f"{premium_title(BOT_NAME)}\n\n"
-            f"{hint}"
-            "Основные действия доступны кнопками главного меню.\n"
-            "«Выбрать группу» — пошаговый выбор: курс → специальность → группа.\n"
-            "«Преподаватели» — поиск по фамилии и отдельные уведомления.\n\n"
-            "Команды: /today, /schedule, /date, /groups, /teacher, /subscribe, /status.",
+        await deliver(
+            message,
+            text=(
+                f"{premium_title(BOT_NAME)}\n\n"
+                f"{hint}"
+                "Основные действия доступны кнопками главного меню.\n"
+                "«Выбрать группу» — пошаговый выбор: курс → специальность → группа.\n"
+                "«Преподаватели» — поиск по фамилии и отдельные уведомления.\n\n"
+                "«Топ преподавателей» и «График нагрузки» — аналитика группы.\n\n"
+                "Команды: /today, /schedule, /date, /groups, /teacher, "
+                "/top, /graph, /subscribe, /status.\n"
+                "Без слэша: «расписание на завтра», «топ», "
+                "«график за 3 месяца»."
+            ),
             reply_markup=main_keyboard(
                 _is_subscribed(chat_id), has_group=selected_group_id is not None
             ),
@@ -7334,32 +8534,39 @@ async def cmd_start(message: Message):
         return
 
     if selected_group_id is None:
-        text = (
-            f"{premium_title(BOT_NAME)}\n\n"
-            "Добро пожаловать! Для начала выберите вашу группу.\n\n"
-            "<b>Шаг 1 из 3 · Выберите курс:</b>"
+        await deliver(
+            message,
+            text=(
+                f"{premium_title(BOT_NAME)}\n\n"
+                "Добро пожаловать! Для начала выберите вашу группу.\n\n"
+                "<b>Шаг 1 из 3 · Выберите курс:</b>"
+            ),
+            reply_markup=group_course_keyboard(include_menu=False),
         )
-        await message.answer(text, reply_markup=group_course_keyboard(include_menu=False))
         return
 
     group = get_group(selected_group_id)
-    text = (
-        f"{premium_title(BOT_NAME)}\n\n"
-        f"Группа: <b>{html.escape(group.name)}</b>\n"
-        f"{group.form} · {group.study} · {group.course} курс\n\n"
-        "Выберите действие кнопками ниже.\n"
-        "По дате: <code>/date 10.11.2026</code>\n"
-        "Текстом: «расписание на завтра»."
+    await deliver(
+        message,
+        text=(
+            f"{premium_title(BOT_NAME)}\n\n"
+            f"Группа: <b>{html.escape(group.name)}</b>\n"
+            f"{group.form} · {group.study} · {group.course} курс\n\n"
+            "Выберите действие кнопками ниже.\n"
+            "По дате: <code>/date 10.11.2026</code>\n"
+            "Текстом: «расписание на завтра»."
+        ),
+        reply_markup=main_keyboard(_is_subscribed(chat_id), has_group=True),
     )
-    await message.answer(text, reply_markup=main_keyboard(_is_subscribed(chat_id), has_group=True))
 
 
 @dp.message(BotCommandFilter("groups"))
 async def cmd_groups(message: Message):
     save_user_profile(message.from_user, message.chat.id)
     has_group = get_user_settings(message.chat.id).get("group_id") is not None
-    await message.answer(
-        "<b>Выбор группы</b>\nШаг 1 из 3 · Выберите курс:",
+    await deliver(
+        message,
+        text="<b>Выбор группы</b>\nШаг 1 из 3 · Выберите курс:",
         reply_markup=group_course_keyboard(include_menu=has_group),
     )
 
@@ -7368,7 +8575,8 @@ async def cmd_groups(message: Message):
 async def cmd_teacher(message: Message):
     save_user_profile(message.from_user, message.chat.id)
     set_pending_action(message.chat.id, "teacher_search")
-    await message.answer("<b>Преподаватель</b>\nОтправьте фамилию или ФИО.")
+    await deliver(message,
+                  text="<b>Преподаватель</b>\nОтправьте фамилию или ФИО.")
 
 
 @dp.message(BotCommandFilter("today"))
@@ -7439,18 +8647,17 @@ async def cmd_subscribe(message: Message):
     selected_group = get_group(selected_group_id)
     if subscribe_user(chat.id, chat_type=chat.type, title=title, group_id=selected_group.id):
         where = "Этот чат" if is_group else "Вы"
-        await message.answer(
-            f"<b>Уведомления включены</b>\n\n"
-            f"{where} будет получать обновлённое расписание "
-            f"при его изменении.\n\n"
-            f"Отключить: /unsubscribe"
+        await deliver(
+            message,
+            text=(
+                f"<b>Уведомления включены</b>\n\n"
+                f"{where} будет получать обновлённое расписание "
+                f"при его изменении.\n\n"
+                f"Отключить: /unsubscribe"
+            ),
         )
     else:
-        await message.answer(
-            "Уведомления уже включены."
-            if is_group
-            else "Уведомления уже включены."
-        )
+        await deliver(message, text="Уведомления уже включены.")
 
 
 @dp.message(BotCommandFilter("unsubscribe"))
@@ -7465,18 +8672,32 @@ async def cmd_unsubscribe(message: Message):
         return
 
     if unsubscribe_user(chat.id):
-        await message.answer("<b>Уведомления отключены</b>")
+        await deliver(message, text="<b>Уведомления отключены</b>")
     else:
-        await message.answer(
-            "Этот чат не был подписан на уведомления."
-            if is_group
-            else "Вы не были подписаны на уведомления."
+        await deliver(
+            message,
+            text=("Этот чат не был подписан на уведомления."
+                  if is_group else "Вы не были подписаны на уведомления."),
         )
 
 
 @dp.message(BotCommandFilter("status"))
 async def cmd_status(message: Message):
     await _send_status(message)
+
+
+@dp.message(BotCommandFilter("top"))
+async def cmd_top(message: Message):
+    """«/топ» и «/top» — преподаватели группы по изученным часам."""
+    save_user_profile(message.from_user, message.chat.id)
+    await _handle_top(message)
+
+
+@dp.message(BotCommandFilter("graph"))
+async def cmd_graph(message: Message):
+    """«/график» и «/graph» — нагрузка по неделям с выбором периода."""
+    save_user_profile(message.from_user, message.chat.id)
+    await _handle_load_chart(message, DEFAULT_LOAD_PERIOD)
 
 
 # ============================================================
@@ -7773,7 +8994,27 @@ async def cmd_text_schedule(message: Message):
         await _send_staff_schedule(message, matches[0], get_tomorrow())
         return
 
-    request = parse_schedule_text(message.text or "")
+    raw_text = message.text or ""
+
+    # «топ» и «график» — текстовые команды без слэша.
+    if parse_top_text(raw_text):
+        await _handle_top(message)
+        return
+
+    is_graph, graph_period = parse_graph_text(raw_text)
+    if is_graph:
+        if graph_period is None:
+            await message.answer(
+                "Период не распознан.\n\n"
+                "Напишите: <code>график</code>, <code>график за месяц</code>, "
+                "<code>график за 3 месяца</code>, <code>график за 6 месяцев</code> "
+                "или <code>график за год</code>."
+            )
+            return
+        await _handle_load_chart(message, graph_period)
+        return
+
+    request = parse_schedule_text(raw_text)
 
     if not request.matched:
         # Сообщение не про расписание — молчим.
@@ -7838,10 +9079,8 @@ async def _send_group_info(destination, group: GroupInfo) -> None:
          InlineKeyboardButton(text="Сменить группу", callback_data="groups")],
         [InlineKeyboardButton(text="Главное меню", callback_data="menu")],
     ])
-    if _is_message_destination(destination):
-        await destination.answer_photo(FSInputFile(path), caption=caption, reply_markup=keyboard)
-    else:
-        await destination.message.answer_photo(FSInputFile(path), caption=caption, reply_markup=keyboard)
+    await deliver(destination, photo=path, caption=caption,
+                  reply_markup=keyboard, edit=_deliver_edits(destination))
 
 
 @dp.callback_query(F.data == "groups:noop")
@@ -7853,9 +9092,10 @@ async def cb_groups_noop(callback: CallbackQuery):
 async def cb_groups(callback: CallbackQuery):
     await callback.answer()
     has_group = _selected_group_id(callback) is not None
-    await callback.message.answer(
+    await _edit_or_send_text(
+        callback,
         "<b>Выбор группы</b>\nШаг 1 из 3 · Выберите курс:",
-        reply_markup=group_course_keyboard(include_menu=has_group),
+        group_course_keyboard(include_menu=has_group),
     )
 
 
@@ -7978,16 +9218,18 @@ async def cb_menu(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     group_id = _selected_group_id(callback)
     if group_id is None:
-        await callback.message.answer(
+        await _edit_or_send_text(
+            callback,
             f"{premium_title(BOT_NAME)}\nГруппа: <i>не выбрана</i>\n\n"
             "Для просмотра расписания выберите группу или найдите преподавателя.",
-            reply_markup=main_keyboard(_is_subscribed(chat_id), has_group=False),
+            main_keyboard(_is_subscribed(chat_id), has_group=False),
         )
         return
     group = get_group(group_id)
-    await callback.message.answer(
+    await _edit_or_send_text(
+        callback,
         f"{premium_title(BOT_NAME)}\nГруппа: <b>{html.escape(group.name)}</b>",
-        reply_markup=main_keyboard(_is_subscribed(chat_id), has_group=True),
+        main_keyboard(_is_subscribed(chat_id), has_group=True),
     )
 
 
@@ -8000,7 +9242,8 @@ async def cb_notifications(callback: CallbackQuery):
         member = STAFF_BY_ID.get(staff_id)
         text = f"<b>Уведомления</b>\nПреподаватель: {member.full_name if member else staff_id}"
         await callback.answer()
-        await callback.message.answer(text, reply_markup=notification_keyboard(enabled, staff_id))
+        await _edit_or_send_text(callback, text,
+                                 notification_keyboard(enabled, staff_id))
         return
 
     group_id = settings.get("group_id")
@@ -8015,7 +9258,8 @@ async def cb_notifications(callback: CallbackQuery):
     enabled = _is_subscribed(callback.message.chat.id)
     text = f"<b>Уведомления</b>\nГруппа: {get_group(group_id).name}\nНовое и изменённое расписание."
     await callback.answer()
-    await callback.message.answer(text, reply_markup=notification_keyboard(enabled, None))
+    await _edit_or_send_text(callback, text,
+                             notification_keyboard(enabled, None))
 
 
 @dp.callback_query(F.data == "teacher")
@@ -8023,8 +9267,8 @@ async def cb_teacher(callback: CallbackQuery):
     save_user_profile(callback.from_user, callback.message.chat.id)
     set_pending_action(callback.message.chat.id, "teacher_search")
     await callback.answer()
-    await callback.message.answer(
-        "<b>Расписание преподавателя</b>\nОтправьте фамилию или ФИО."
+    await _edit_or_send_text(
+        callback, "<b>Расписание преподавателя</b>\nОтправьте фамилию или ФИО."
     )
 
 
@@ -8040,11 +9284,12 @@ async def cb_teacher_notify(callback: CallbackQuery):
     set_user_staff(callback.message.chat.id, staff_id)
     subscribe_teacher(callback.message.chat.id, staff_id, enabled)
     await callback.answer("Уведомления включены" if enabled else "Уведомления отключены")
-    await callback.message.answer(
+    await _edit_or_send_text(
+        callback,
         f"<b>{member.full_name}</b>\n" +
         ("Новое и изменённое расписание будет приходить в этот чат." if enabled
          else "Уведомления отключены."),
-        reply_markup=notification_keyboard(enabled, staff_id),
+        notification_keyboard(enabled, staff_id),
     )
 
 
@@ -8072,7 +9317,7 @@ async def cb_staff_pick(callback: CallbackQuery):
     save_user_profile(callback.from_user, callback.message.chat.id)
     set_user_staff(callback.message.chat.id, member.staff_id)
     await callback.answer()
-    await _send_staff_schedule(callback, member, target_day, edit_existing=False)
+    await _send_staff_schedule(callback, member, target_day)
 
 
 @dp.callback_query(F.data.startswith("staff:"))
@@ -8083,7 +9328,7 @@ async def cb_staff_navigation(callback: CallbackQuery):
         return
     member, target_day = parsed
     await callback.answer()
-    await _send_staff_schedule(callback, member, target_day, edit_existing=True)
+    await _send_staff_schedule(callback, member, target_day)
 
 
 @dp.callback_query(F.data == "schedule")
@@ -8124,9 +9369,15 @@ async def cb_subscribe(callback: CallbackQuery):
     if subscribe_user(
         chat.id, chat_type=chat.type, title=chat.title or "", group_id=group_id
     ):
-        await callback.message.answer(f"<b>Уведомления включены</b>\nГруппа: {get_group(group_id).name}")
+        await _edit_or_send_text(
+            callback,
+            f"<b>Уведомления включены</b>\nГруппа: {get_group(group_id).name}",
+        )
     else:
-        await callback.message.answer(f"Уведомления уже включены\nГруппа: {get_group(group_id).name}")
+        await _edit_or_send_text(
+            callback,
+            f"Уведомления уже включены\nГруппа: {get_group(group_id).name}",
+        )
 
 
 @dp.callback_query(F.data == "unsubscribe")
@@ -8136,15 +9387,35 @@ async def cb_unsubscribe(callback: CallbackQuery):
         return
     await callback.answer()
     if unsubscribe_user(callback.message.chat.id):
-        await callback.message.answer("<b>Уведомления отключены</b>")
+        await _edit_or_send_text(callback, "<b>Уведомления отключены</b>")
     else:
-        await callback.message.answer("Этот чат не был подписан.")
+        await _edit_or_send_text(callback, "Этот чат не был подписан.")
 
 
 @dp.callback_query(F.data == "status")
 async def cb_status(callback: CallbackQuery):
     await callback.answer()
-    await _send_status(callback.message)
+    await _send_status(callback)
+
+
+@dp.callback_query(F.data == "top")
+async def cb_top(callback: CallbackQuery):
+    await callback.answer()
+    await _handle_top(callback)
+
+
+@dp.callback_query(F.data == "graph")
+async def cb_graph(callback: CallbackQuery):
+    await callback.answer()
+    await _handle_load_chart(callback, DEFAULT_LOAD_PERIOD)
+
+
+@dp.callback_query(F.data.startswith("load:"))
+async def cb_load_period(callback: CallbackQuery):
+    """Смена периода графика: load:1m / load:3m / load:6m / load:12m."""
+    period = (callback.data or "").split(":", 1)[-1]
+    await callback.answer()
+    await _handle_load_chart(callback, period)
 
 
 @dp.callback_query(F.data == "date")
@@ -8156,20 +9427,23 @@ async def cb_date(callback: CallbackQuery):
         return
     set_pending_action(callback.message.chat.id, "date")
     await callback.answer()
-    await callback.message.answer(
-        "<b>Расписание по дате</b>\nОтправьте дату: 10.11.2026, 4 сентября или «завтра»."
+    await _edit_or_send_text(
+        callback,
+        "<b>Расписание по дате</b>\nОтправьте дату: 10.11.2026, "
+        "4 сентября или «завтра».",
     )
 
 
 @dp.callback_query(F.data == "help")
 async def cb_help(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.answer(
+    await _edit_or_send_text(
+        callback,
         "<b>Помощь</b>\n\n"
         "Основные действия доступны кнопками главного меню.\n"
         "«Выбрать / Сменить группу» — пошаговый выбор: курс → специальность → группа.\n"
         "«Преподаватели» — поиск по фамилии и отдельные уведомления.\n\n"
-        "Команды: /today, /schedule, /date, /groups, /teacher, /subscribe, /status."
+        "Команды: /today, /schedule, /date, /groups, /teacher, /subscribe, /status.",
     )
 
 
@@ -8989,6 +10263,8 @@ COMMANDS = [
     BotCommand(command="subscribe", description="Включить уведомления"),
     BotCommand(command="unsubscribe", description="Отключить уведомления"),
     BotCommand(command="status", description="Статус подписки"),
+    BotCommand(command="top", description="Топ преподавателей группы"),
+    BotCommand(command="graph", description="График нагрузки"),
     BotCommand(command="help", description="Помощь"),
 ]
 

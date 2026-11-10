@@ -1288,19 +1288,21 @@ class TestPillowRendering(unittest.TestCase):
                    "14:55", "16:15"),
         ])
 
-    # --- формат ---
-    def test_image_is_portrait_2_to_3(self):
-        """Один день = одна вертикальная картинка 2:3 (1080×1620)."""
-        self.assertEqual((bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT),
-                         (1080, 1620))
+    # --- формат: высота динамическая ---
+    def test_image_height_fits_four_pairs(self):
+        """Ширина фиксирована; высота — по контенту, в разумных пределах."""
+        self.assertEqual(bot.SCHEDULE_WIDTH, 1080)
         path = bot.render_schedule_image(self.four_pairs())
         with Image.open(path) as img:
             w, h = img.size
-        self.assertEqual((w, h), (1080, 1620))
-        self.assertGreater(h, w, "картинка должна быть вертикальной")
-        self.assertEqual(round(h / w, 2), 1.5, "соотношение ~2:3")
-        # длинная сторона в разумных пределах: без «чрезмерно высокого» холста
-        self.assertLessEqual(h, 1980)
+        self.assertEqual(w, 1080)
+        # 4 пары: холст выше минимального, но не «полотенце»
+        self.assertGreaterEqual(h, bot.SCHEDULE_HEIGHT_FLOOR)
+        self.assertLessEqual(h, bot.SCHEDULE_HEIGHT_ABS_MAX)
+        self.assertGreaterEqual(h, bot.SCHEDULE_HEIGHT_FLOOR)
+        self.assertLessEqual(h, 2000)
+        self.assertEqual(h % bot.SCHEDULE_HEIGHT_STEP, 0,
+                         "высота округляется по шагу — стабильные картинки")
 
     def test_text_is_supersampled_and_sharp(self):
         """Рендер идёт в 2x и даунскейлится — иначе текст в превью мыльный."""
@@ -1308,7 +1310,8 @@ class TestPillowRendering(unittest.TestCase):
         path = bot.render_schedule_image(self.four_pairs())
         with Image.open(path) as img:
             # финал всегда в 1x: холст не «случайно» в два раза больше
-            self.assertEqual(img.size, (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
+            self.assertEqual(img.size, bot._LAST_RENDER["size"])
+            self.assertEqual(img.size[0], bot.SCHEDULE_WIDTH)
             self.assertEqual(img.format, "PNG")
 
     def test_file_is_small_enough_for_telegram(self):
@@ -1404,7 +1407,7 @@ class TestPillowRendering(unittest.TestCase):
                              min(text_sizes("room")))
         with Image.open(path) as img:
             self.assertEqual(img.size[0], bot.SCHEDULE_WIDTH)
-            self.assertGreaterEqual(img.size[1], bot.SCHEDULE_HEIGHT,
+            self.assertGreaterEqual(img.size[1], bot.SCHEDULE_HEIGHT_TARGET,
                                     "если не влезает — растёт холст, а не кроп")
             self.assertEqual(outside_safe_area(img, bot.SAFE_AREA - 6), [])
 
@@ -1437,7 +1440,8 @@ class TestPillowRendering(unittest.TestCase):
         self.assertNotIn("right", plan)
         with Image.open(path) as img:
             w, h = img.size
-            self.assertEqual((w, h), (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
+            self.assertEqual(w, bot.SCHEDULE_WIDTH)
+            self.assertEqual((w, h), bot._LAST_RENDER["size"])
             # правая половина не зарезервирована под колонку: карточка
             # занимает всю ширину safe area
             box = plan["cards"][0]["box"]
@@ -1484,8 +1488,8 @@ class TestPillowRendering(unittest.TestCase):
         self.assertTrue(Path(path).exists())
         self.assertEqual(bot._LAST_RENDER["problems"], [])
         with Image.open(path) as img:
-            self.assertGreater(img.size[1], img.size[0])
-            self.assertLessEqual(img.size[1], bot.SCHEDULE_HEIGHT_MAX,
+            self.assertGreater(img.size[1], bot.SCHEDULE_HEIGHT_TARGET)
+            self.assertLessEqual(img.size[1], bot.SCHEDULE_HEIGHT_ABS_MAX,
                                  "11 подгрупп не должны ломать формат холста")
 
     def test_added_subgroup_and_removed_subgroup_render(self):
@@ -1541,8 +1545,9 @@ class TestPillowRendering(unittest.TestCase):
         self.assertIn("Занятий нет", text)
         self.assertEqual(bot._LAST_RENDER["problems"], [])
         with Image.open(path) as img:
-            self.assertEqual(img.size, (bot.SCHEDULE_WIDTH,
-                                        bot.SCHEDULE_HEIGHT))
+            self.assertEqual(img.size[0], bot.SCHEDULE_WIDTH)
+            self.assertGreaterEqual(img.size[1], bot.SCHEDULE_HEIGHT_FLOOR,
+                                    "пустой день — карточка, а не полоска")
 
     def test_two_days_never_share_one_image(self):
         """Сегодня и завтра — две отдельные картинки, каждая про свой день."""
@@ -1963,8 +1968,7 @@ class TestImageLayoutFixes(unittest.TestCase):
         bot.render_schedule_image(two)
         box_two = bot._LAST_RENDER["plan"]["cards"][0]["box"]
         with Image.open(path_two) as img_two:
-            self.assertEqual(img_two.size,
-                             (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
+            self.assertEqual(img_two.size[0], bot.SCHEDULE_WIDTH)
         # подгруппы — строки ВНУТРИ одной карточки, карточка выше
         self.assertGreater(len(bot._LAST_RENDER["plan"]["specs"][0]["items"]),
                            1)
@@ -1994,18 +1998,17 @@ class TestScheduleCardDesign(unittest.TestCase):
             ],
         )
 
-    def test_format_is_vertical_and_ratio_ladder_is_consistent(self):
-        self.assertEqual((bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT),
-                         (1080, 1620))
-        heights = [h for h, _ in bot.SCHEDULE_RATIO_LADDER]
-        self.assertEqual(heights[0], bot.SCHEDULE_HEIGHT)
-        self.assertEqual(heights, sorted(heights), "лестница форматов по росту")
-        self.assertTrue(all(h > bot.SCHEDULE_WIDTH for h in heights),
-                        "все форматы вертикальные")
-        self.assertLessEqual(max(heights), 1980)
+    def test_canvas_height_is_dynamic_and_consistent(self):
+        """Высота карточки считается по контенту, а не берётся из лестницы."""
+        self.assertEqual(bot.SCHEDULE_WIDTH, 1080)
+        self.assertEqual(bot.SCHEDULE_HEIGHT, 1620)      # «эталон» 2:3
+        self.assertLessEqual(bot.SCHEDULE_HEIGHT_FLOOR, bot.SCHEDULE_HEIGHT_TARGET)
+        self.assertLess(bot.SCHEDULE_HEIGHT_TARGET, bot.SCHEDULE_HEIGHT_ABS_MAX)
         path = bot.render_schedule_image(self.schedule_with_subgroups())
         with Image.open(path) as img:
-            self.assertEqual(img.size, (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
+            self.assertEqual(img.size[0], bot.SCHEDULE_WIDTH)
+            self.assertEqual(img.size, bot._LAST_RENDER["size"])
+            self.assertGreaterEqual(img.size[1], bot.SCHEDULE_HEIGHT_FLOOR)
 
     def plan_problems(self):
         return bot._LAST_RENDER["problems"]
@@ -2226,8 +2229,7 @@ class TestTotalStudyBadge(DBTestCase):
                          "Первое занятие по предмету")
         self.assertEqual(bot._LAST_RENDER["problems"], [])
         with Image.open(path) as img:
-            self.assertEqual(img.size,
-                             (bot.SCHEDULE_WIDTH, bot.SCHEDULE_HEIGHT))
+            self.assertEqual(img.size[0], bot.SCHEDULE_WIDTH)
 
     def test_subject_progress_is_absent_on_staff_image(self):
         bot.record_completed_lesson(

@@ -17,6 +17,8 @@ COPY assets ./assets
 
 RUN mkdir -p /app/data
 RUN mkdir -p /app/data/images
+# Кэш аналитики (топ преподавателей, график нагрузки) — часть того же volume.
+RUN mkdir -p /app/data/analytics
 
 # Проверяем наличие шрифтов во время сборки
 RUN test -f /app/fonts/DejaVuSans.ttf
