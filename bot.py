@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Telegram-бот расписания группы ЭС7-24 (Институт нефти и газа, ishnk.ru).
+Telegram-бот расписания всех групп и преподавателей колледжа (ishnk.ru).
 
 - Получает расписание напрямую по HTTP (aiohttp), БЕЗ браузера.
 - Разбирает HTML через BeautifulSoup (только карточки div.card.myCard с .card-header).
@@ -28,6 +28,7 @@ Telegram-бот расписания группы ЭС7-24 (Институт н�
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
@@ -54,6 +55,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.filters.command import CommandException
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
@@ -64,7 +66,16 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    LabeledPrice,
     Message,
+)
+from college import (
+    FALLBACK_GROUPS,
+    GroupInfo,
+    groups_from_payload,
+    groups_to_payload,
+    parse_groups_payload,
+    sorted_groups,
 )
 
 from staff_directory import (
@@ -84,8 +95,8 @@ STAFF_MAPPING = STAFF_DIRECTORY
 
 load_dotenv()
 
-# Брендинг и группа
-BOT_NAME = "ИНК • Расписание"
+# Брендинг. GROUP_* оставлены для миграции старых баз и совместимости.
+BOT_NAME = "ИНК · Расписание"
 GROUP_NAME = os.getenv("GROUP_NAME", "ЭС7-24").strip()
 GROUP_ID = int(os.getenv("GROUP_ID", "508"))
 BASE_URL = os.getenv(
@@ -132,6 +143,25 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 
 # Таймаут HTTP-запроса
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
+GROUPS_URL = os.getenv("GROUPS_URL", "http://ishnk.ru/2025/json/groups")
+GROUP_CATALOG_TTL = int(os.getenv("GROUP_CATALOG_TTL", "21600"))
+MONITOR_CONCURRENCY = max(1, int(os.getenv("MONITOR_CONCURRENCY", "4")))
+BROADCAST_PRICE = 50
+BROADCAST_AD_PRICE = 150
+PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "").strip()
+ADMIN_IDS = {
+    int(value.strip()) for value in os.getenv("ADMIN_IDS", "").split(",")
+    if value.strip().lstrip("-").isdigit()
+}
+PREMIUM_EMOJI_ID = os.getenv("PREMIUM_EMOJI_ID", "").strip()
+# Telegram collectible/premium usernames не возвращаются методом getMe как
+# основной username. Команды с этими упоминаниями принимаем явно и только
+# для перечисленных алиасов, не перехватывая команды других ботов.
+BOT_USERNAME_ALIASES = {
+    value.strip().lstrip("@").casefold()
+    for value in os.getenv("BOT_USERNAME_ALIASES", "mellowagent").split(",")
+    if value.strip().lstrip("@")
+}
 
 # Часовой пояс бота — фиксированный. Нельзя использовать локальное
 # время сервера, поэтому переменная TIMEZONE не берётся из окружения.
@@ -360,6 +390,18 @@ logging.Formatter.converter = _log_time_converter
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+GROUPS: dict[int, GroupInfo] = dict(FALLBACK_GROUPS)
+_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def get_group(group_id: Optional[int] = None) -> GroupInfo:
+    group_id = int(group_id or GROUP_ID)
+    return GROUPS.get(group_id) or FALLBACK_GROUPS.get(group_id) or GroupInfo(
+        id=group_id, name=f"Группа {group_id}", course=0, semester=0,
+        study="Не указано", education="9", is_correspondence=False,
+        has_schedule=True,
+    )
 
 
 # ============================================================
@@ -678,8 +720,12 @@ HEADERS = {
 }
 
 
-def build_url(day: date) -> str:
-    return f"{BASE_URL}/{day.isoformat()}"
+def build_url(day: date, group_id: Optional[int] = None) -> str:
+    selected_id = int(group_id or GROUP_ID)
+    if selected_id == GROUP_ID and BASE_URL.endswith(f"/{GROUP_ID}"):
+        return f"{BASE_URL}/{day.isoformat()}"
+    base = BASE_URL.rsplit("/", 1)[0] if BASE_URL.rsplit("/", 1)[-1].isdigit() else BASE_URL
+    return f"{base}/{selected_id}/{day.isoformat()}"
 
 
 def build_staff_url(staff_id: int, day: date) -> str:
@@ -731,10 +777,59 @@ async def fetch_url(url: str, label: str = "страницы колледжа"):
         return None
 
 
-async def fetch_html(day: date):
+async def fetch_html(day: date, group_id: Optional[int] = None):
+    group = get_group(group_id)
     return await fetch_url(
-        build_url(day), f"расписания группы на {day.isoformat()}"
+        build_url(day, group.id), f"расписания {group.name} на {day.isoformat()}"
     )
+
+
+async def refresh_group_catalog(force: bool = False) -> int:
+    """Обновляет все группы одним POST-запросом; при сбое сохраняет снимок."""
+    global GROUPS
+    if not force:
+        try:
+            updated = float(get_meta_value("groups_updated_at", "0"))
+            if time.time() - updated < GROUP_CATALOG_TTL:
+                return len(GROUPS)
+        except ValueError:
+            pass
+    try:
+        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                GROUPS_URL,
+                data={"search": ""},
+                headers={
+                    "Accept": "application/json, text/javascript, */*; q=0.01",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            ) as response:
+                if response.status != 200:
+                    raise ScheduleUnavailable(f"Каталог групп: HTTP {response.status}")
+                payload = await response.json(content_type=None)
+        fresh = parse_groups_payload(payload)
+        if not fresh:
+            raise ScheduleUnavailable("Каталог групп пуст")
+        GROUPS = fresh
+        set_meta_value("college_groups", json.dumps(groups_to_payload(fresh), ensure_ascii=False))
+        set_meta_value("groups_updated_at", str(time.time()))
+        return len(fresh)
+    except Exception as error:
+        logger.warning("Каталог групп не обновлён: %s", error)
+        return len(GROUPS)
+
+
+def restore_group_catalog() -> None:
+    global GROUPS
+    raw = get_meta_value("college_groups")
+    if raw:
+        try:
+            saved = groups_from_payload(json.loads(raw))
+            if saved:
+                GROUPS = saved
+        except (TypeError, ValueError):
+            logger.warning("Повреждён локальный каталог групп, используется снимок")
 
 
 async def fetch_staff_html(staff_id: int, day: date):
@@ -1215,20 +1310,21 @@ def parse_schedule(
     )
 
 
-async def get_schedule(day: date) -> Schedule:
+async def get_schedule(day: date, group_id: Optional[int] = None) -> Schedule:
     """Единая функция получения расписания ровно на переданную дату.
 
     ВАЖНО: без скрытого fallback. Если расписания на `day` нет —
     возвращается пустое расписание (lessons == []), а не данные
     другой даты. При ошибке сети/источника бросается ScheduleUnavailable.
     """
-    html = await fetch_html(day)
+    group = get_group(group_id)
+    html = await (fetch_html(day) if group.id == GROUP_ID else fetch_html(day, group.id))
 
     if html is None:
         raise ScheduleUnavailable(f"Сайт недоступен для {day.isoformat()}")
 
     try:
-        return parse_schedule(html, day)
+        return parse_schedule(html, day, group=group.name)
     except Exception:
         logger.exception("Ошибка парсинга HTML")
         raise ScheduleUnavailable("Ошибка парсинга расписания")
@@ -1336,7 +1432,7 @@ def _field_key(value: str) -> str:
     return normalize_value(value).casefold().strip()
 
 
-def schedule_from_storage(stored, day: date) -> Schedule:
+def schedule_from_storage(stored, day: date, group: Optional[str] = None) -> Schedule:
     """Восстанавливает Schedule из JSON в БД (значения display-нормализованы)."""
     if stored is None:
         return Schedule(date=day, group=GROUP_NAME, lessons=[])
@@ -1373,7 +1469,7 @@ def schedule_from_storage(stored, day: date) -> Schedule:
                 groups=groups,
             )
         )
-    return Schedule(date=day, group=GROUP_NAME, lessons=lessons)
+    return Schedule(date=day, group=group or GROUP_NAME, lessons=lessons)
 
 
 def schedule_signature(schedule: Schedule) -> str:
@@ -1820,6 +1916,93 @@ def init_db() -> None:
                 """
             )
 
+            # Персональный выбор студента/преподавателя. Старые подписчики
+            # без строки автоматически относятся к прежней GROUP_ID.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    chat_id INTEGER PRIMARY KEY,
+                    group_id INTEGER NOT NULL DEFAULT 508,
+                    staff_id INTEGER,
+                    role TEXT NOT NULL DEFAULT 'student',
+                    pending_action TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    username TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS teacher_subscribers (
+                    chat_id INTEGER NOT NULL,
+                    staff_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, staff_id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS schedule_cache (
+                    target_key TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    hash TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    image_path TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (target_key, date)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS study_jobs (
+                    group_id INTEGER PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    error TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS broadcasts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    author_name TEXT NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    original_chat_id INTEGER NOT NULL,
+                    original_message_id INTEGER NOT NULL,
+                    is_ad INTEGER NOT NULL DEFAULT 0,
+                    amount INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    payment_charge_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    moderator_id INTEGER,
+                    moderation_note TEXT NOT NULL DEFAULT ''
+                )
+            """)
+
+            # У одного чата могут быть независимые подписки на разные группы.
+            notification_columns = {
+                row["name"] for row in conn.execute(
+                    "PRAGMA table_info(schedule_notifications)"
+                )
+            }
+            if "target_key" not in notification_columns:
+                conn.execute("ALTER TABLE schedule_notifications RENAME TO schedule_notifications_legacy")
+                conn.execute("""
+                    CREATE TABLE schedule_notifications (
+                        user_id INTEGER NOT NULL,
+                        date TEXT NOT NULL,
+                        target_key TEXT NOT NULL DEFAULT 'group:508',
+                        hash TEXT NOT NULL,
+                        sent_at TEXT NOT NULL,
+                        PRIMARY KEY (user_id, date, target_key)
+                    )
+                """)
+                conn.execute("""
+                    INSERT INTO schedule_notifications
+                        (user_id, date, target_key, hash, sent_at)
+                    SELECT user_id, date, 'group:508', hash, sent_at
+                    FROM schedule_notifications_legacy
+                """)
+                conn.execute("DROP TABLE schedule_notifications_legacy")
+
             # Миграция истории занятий на схему v2 выполняется в самом
             # конце: ей нужны уже созданные lesson_backfill_days/bot_meta.
             _migrate_lesson_history(conn)
@@ -1829,19 +2012,27 @@ def init_db() -> None:
                 ON lesson_history (group_name, normalized_subject, date)
                 """
             )
+            cache_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(schedule_cache)")
+            }
+            if "image_context" not in cache_columns:
+                conn.execute("ALTER TABLE schedule_cache ADD COLUMN image_context TEXT NOT NULL DEFAULT ''")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_broadcasts_status ON broadcasts(status, id)")
         logger.info("База данных готова: %s", DB_PATH)
     except Exception:
         logger.exception("Ошибка инициализации SQLite")
 
 
 def subscribe_user(
-    user_id: int, chat_type: str = "private", title: str = ""
+    user_id: int, chat_type: str = "private", title: str = "",
+    group_id: Optional[int] = None,
 ) -> bool:
     """Добавляет подписчика (ЛС или групповой чат).
 
     True если добавлен, False если уже был.
     """
     created = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    added = False
     try:
         with db_connect() as conn:
             cur = conn.execute(
@@ -1850,15 +2041,14 @@ def subscribe_user(
                 " VALUES (?, ?, ?, ?)",
                 (user_id, created, chat_type, title or ""),
             )
-            if cur.rowcount == 0:
-                # Обновляем название чата, оно могло измениться.
+            added = cur.rowcount > 0
+            if not added:
                 conn.execute(
-                    "UPDATE subscribers SET chat_type = ?, title = ?"
-                    " WHERE user_id = ?",
+                    "UPDATE subscribers SET chat_type = ?, title = ? WHERE user_id = ?",
                     (chat_type, title or "", user_id),
                 )
-                return False
-            return True
+        set_user_group(user_id, int(group_id or GROUP_ID))
+        return added
     except Exception:
         logger.exception("Ошибка SQLite (subscribe)")
         return False
@@ -1877,11 +2067,15 @@ def unsubscribe_user(user_id: int) -> bool:
         return False
 
 
-def load_subscribers() -> list:
+def load_subscribers(group_id: Optional[int] = None) -> list:
+    selected_id = int(group_id or GROUP_ID)
     try:
         with db_connect() as conn:
             rows = conn.execute(
-                "SELECT user_id FROM subscribers ORDER BY user_id"
+                "SELECT s.user_id FROM subscribers s "
+                "LEFT JOIN user_settings u ON u.chat_id = s.user_id "
+                "WHERE COALESCE(u.group_id, ?) = ? ORDER BY s.user_id",
+                (GROUP_ID, selected_id),
             ).fetchall()
             return [int(row["user_id"]) for row in rows]
     except Exception:
@@ -1900,6 +2094,99 @@ def subscriber_info(user_id: int):
     except Exception:
         logger.exception("Ошибка SQLite (subscriber info)")
         return None
+
+
+def get_user_settings(chat_id: int) -> dict:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_settings WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+    if row:
+        return dict(row)
+    return {
+        "chat_id": chat_id, "group_id": GROUP_ID, "staff_id": None,
+        "role": "student", "pending_action": "", "display_name": "",
+        "username": "",
+    }
+
+
+def save_user_profile(user, chat_id: Optional[int] = None) -> None:
+    if user is None:
+        return
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT INTO user_settings
+                (chat_id, group_id, display_name, username, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                username = excluded.username, updated_at = excluded.updated_at
+        """, (chat_id or user.id, GROUP_ID, user.full_name or "",
+              user.username or "", stamp))
+
+
+def set_user_group(chat_id: int, group_id: int) -> None:
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT INTO user_settings (chat_id, group_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                group_id = excluded.group_id, role = 'student',
+                staff_id = NULL, updated_at = excluded.updated_at
+        """, (chat_id, group_id, stamp))
+
+
+def set_user_staff(chat_id: int, staff_id: int) -> None:
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT INTO user_settings (chat_id, staff_id, role, updated_at)
+            VALUES (?, ?, 'teacher', ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                staff_id = excluded.staff_id, role = 'teacher',
+                updated_at = excluded.updated_at
+        """, (chat_id, staff_id, stamp))
+
+
+def set_pending_action(chat_id: int, action: str = "") -> None:
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE user_settings SET pending_action = ? WHERE chat_id = ?",
+            (action, chat_id),
+        )
+
+
+def subscribe_teacher(chat_id: int, staff_id: int, enabled: bool = True) -> None:
+    with db_connect() as conn:
+        if enabled:
+            conn.execute(
+                "INSERT OR REPLACE INTO teacher_subscribers VALUES (?, ?, ?)",
+                (chat_id, staff_id, now_local().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM teacher_subscribers WHERE chat_id = ? AND staff_id = ?",
+                (chat_id, staff_id),
+            )
+
+
+def teacher_subscription(chat_id: int, staff_id: int) -> bool:
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT 1 FROM teacher_subscribers WHERE chat_id = ? AND staff_id = ?",
+            (chat_id, staff_id),
+        ).fetchone() is not None
+
+
+def load_teacher_subscribers(staff_id: int) -> list[int]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM teacher_subscribers WHERE staff_id = ? ORDER BY chat_id",
+            (staff_id,),
+        ).fetchall()
+    return [int(row["chat_id"]) for row in rows]
 
 
 def load_state() -> dict:
@@ -1956,12 +2243,14 @@ def save_state(state: dict) -> None:
         logger.exception("Ошибка SQLite (save state)")
 
 
-def load_schedule_notifications() -> dict:
+def load_schedule_notifications(target_key: Optional[str] = None) -> dict:
     """{дата: {user_id: hash}} — последнее доставленное состояние каждому."""
+    target_key = target_key or f"group:{GROUP_ID}"
     try:
         with db_connect() as conn:
             rows = conn.execute(
-                "SELECT user_id, date, hash FROM schedule_notifications"
+                "SELECT user_id, date, hash FROM schedule_notifications WHERE target_key = ?",
+                (target_key,),
             ).fetchall()
             result = {}
             for row in rows:
@@ -1975,7 +2264,8 @@ def load_schedule_notifications() -> dict:
 
 
 def record_schedule_notification(
-    user_id: int, date_key: str, signature: str
+    user_id: int, date_key: str, signature: str,
+    target_key: Optional[str] = None,
 ) -> bool:
     """Фиксирует успешную отправку расписания подписчику."""
     try:
@@ -1983,8 +2273,8 @@ def record_schedule_notification(
         with db_connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO schedule_notifications"
-                " (user_id, date, hash, sent_at) VALUES (?, ?, ?, ?)",
-                (user_id, date_key, signature, now),
+                " (user_id, date, target_key, hash, sent_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, date_key, target_key or f"group:{GROUP_ID}", signature, now),
             )
             return True
     except Exception:
@@ -2238,8 +2528,6 @@ def record_completed_lessons(
     """
     if schedule.schedule_type != "group":
         return 0
-    if schedule.group != GROUP_NAME:
-        return 0
     if schedule.date < get_academic_year_start():
         return 0
 
@@ -2265,6 +2553,8 @@ def record_completed_lessons(
                 duration=minutes,
             ):
                 inserted += 1
+    if inserted:
+        invalidate_group_image_cache(schedule.group)
     return inserted
 
 
@@ -2531,7 +2821,7 @@ def study_note_lines(forecast: StudyForecast) -> list:
 
 def register_subjects_from_schedule(schedule: Schedule) -> int:
     """Регистрирует новые предметы без фиксированного справочника."""
-    if schedule.schedule_type != "group" or schedule.group != GROUP_NAME:
+    if schedule.schedule_type != "group":
         return 0
     values = {}
     for lesson in schedule.lessons:
@@ -2609,6 +2899,7 @@ def _mark_backfill_day_processed(group_name: str, day: date) -> None:
 async def backfill_lesson_history(
     start: Optional[date] = None,
     end: Optional[date] = None,
+    group_id: Optional[int] = None,
 ) -> int:
     """Backfill с 1 сентября до вчерашнего дня.
 
@@ -2617,6 +2908,7 @@ async def backfill_lesson_history(
     занятий.
     """
     today = get_today()
+    group = get_group(group_id)
     first = start or get_academic_year_start(today)
     last = end or (today - timedelta(days=1))
     if last < first:
@@ -2625,25 +2917,67 @@ async def backfill_lesson_history(
     inserted = 0
     day = first
     while day <= last:
-        if _backfill_day_processed(GROUP_NAME, day):
+        if _backfill_day_processed(group.name, day):
             day += timedelta(days=1)
             continue
         # Даже воскресенье запрашивается как историческая дата: пустой
         # ответ источника — это честный результат, а не придуманное занятие.
         try:
-            schedule = await get_schedule(day)
+            schedule = (await get_schedule(day) if group.id == GROUP_ID
+                        else await get_schedule(day, group.id))
         except ScheduleUnavailable:
             logger.warning("Backfill %s: источник недоступен, повторим позже", day)
             day += timedelta(days=1)
             continue
         register_subjects_from_schedule(schedule)
         inserted += record_completed_lessons(schedule)
-        _mark_backfill_day_processed(GROUP_NAME, day)
+        _mark_backfill_day_processed(group.name, day)
         day += timedelta(days=1)
     return inserted
 
 
 run_backfill = backfill_lesson_history
+
+
+def study_job_status(group_id: int) -> str:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT status FROM study_jobs WHERE group_id = ?", (group_id,)
+        ).fetchone()
+    return row["status"] if row else ""
+
+
+async def _run_study_job(group_id: int) -> None:
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        await backfill_lesson_history(group_id=group_id)
+        with db_connect() as conn:
+            conn.execute(
+                "UPDATE study_jobs SET status = 'ready', finished_at = ?, error = '' WHERE group_id = ?",
+                (now_local().strftime("%Y-%m-%d %H:%M:%S"), group_id),
+            )
+    except Exception as error:
+        logger.exception("Первичный расчёт группы %s", group_id)
+        with db_connect() as conn:
+            conn.execute(
+                "UPDATE study_jobs SET status = 'error', error = ? WHERE group_id = ?",
+                (str(error)[:500], group_id),
+            )
+
+
+def ensure_study_history(group_id: int) -> bool:
+    """Запускает расчёт один раз на группу. True — показать пояснение."""
+    status = study_job_status(group_id)
+    if status in ("running", "ready"):
+        return False
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT INTO study_jobs (group_id, status, started_at)
+            VALUES (?, 'running', ?)
+            ON CONFLICT(group_id) DO UPDATE SET status = 'running', started_at = excluded.started_at
+        """, (group_id, now_local().strftime("%Y-%m-%d %H:%M:%S")))
+    asyncio.create_task(_run_study_job(group_id))
+    return True
 
 
 async def recalculate_study_history() -> int:
@@ -2685,6 +3019,7 @@ async def recalculate_study_history() -> int:
 
 
 init_db()
+restore_group_catalog()
 
 
 # ============================================================
@@ -4952,8 +5287,8 @@ def render_schedule_image(
         subject_totals = {}
         if is_group:
             register_subjects_from_schedule(schedule)
-            subject_totals = load_subject_totals()
-        forecast = get_study_forecast() if is_group else None
+            subject_totals = load_subject_totals(schedule.group)
+        forecast = get_study_forecast(schedule.group) if is_group else None
         note_lines = study_note_lines(forecast) if forecast is not None else []
 
         ctx = {
@@ -4993,9 +5328,15 @@ def render_schedule_image(
         kind = "staff" if schedule.schedule_type == "staff" else "group"
         staff_part = f"_{schedule.staff_id}" if schedule.staff_id else ""
         suffix = "_changed" if changes else ""
+        owner = str(schedule.staff_id) if schedule.staff_id else schedule.group
+        owner_hash = hashlib.sha256(owner.encode("utf-8")).hexdigest()[:10]
+        content_hash = hashlib.sha256(
+            (schedule_signature(schedule) + repr([(c.kind, c.pair, c.subgroup) for c in changes]))
+            .encode("utf-8")
+        ).hexdigest()[:12]
         filename = (
-            f"schedule_{kind}{staff_part}_{schedule.date.isoformat()}"
-            f"{suffix}.png"
+            f"schedule_{kind}{staff_part}_{schedule.date.isoformat()}_"
+            f"{owner_hash}_{content_hash}{suffix}.png"
         )
         path = IMAGE_DIR / filename
         # PNG: максимум сжатия — картинка уходит в Telegram без перекодирования.
@@ -5028,6 +5369,178 @@ def render_schedule_image(
     except Exception:
         logger.exception("Ошибка генерации изображения")
         raise
+# ============================================================
+# ПОСТОЯННЫЙ КЭШ РАСПИСАНИЙ И PNG
+# ============================================================
+
+
+def schedule_target_key(schedule: Schedule) -> str:
+    if schedule.schedule_type == "staff":
+        return f"staff:{schedule.staff_id}"
+    group_id = next((key for key, value in GROUPS.items() if value.name == schedule.group), GROUP_ID)
+    return f"group:{group_id}"
+
+
+def _cache_lock(key: str) -> asyncio.Lock:
+    # Создаётся только в event loop; отдельный lock на группу/дату.
+    return _CACHE_LOCKS.setdefault(key, asyncio.Lock())
+
+
+def load_cached_schedule(target_key: str, day: date) -> Optional[Schedule]:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM schedule_cache WHERE target_key = ? AND date = ?",
+            (target_key, day.isoformat()),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        kind, owner_id = target_key.split(":", 1)
+        data = json.loads(row["data"])
+        if kind == "staff":
+            member = STAFF_BY_ID.get(int(owner_id))
+            if not member:
+                return None
+            schedule = schedule_from_storage(data, day, group=member.full_name)
+            schedule.schedule_type = "staff"
+            schedule.staff_id = member.staff_id
+            schedule.staff_name = member.full_name
+            return schedule
+        group = get_group(int(owner_id))
+        return schedule_from_storage(data, day, group=group.name)
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def schedule_image_context(schedule: Schedule) -> str:
+    if schedule.schedule_type != "group":
+        return "staff"
+    forecast = get_study_forecast(schedule.group)
+    payload = {
+        "studied": forecast.studied_minutes,
+        "remaining": forecast.remaining_minutes,
+        "total": forecast.total_minutes,
+        "subjects": load_subject_totals(schedule.group),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def save_schedule_cache(schedule: Schedule, image_path: Optional[Path] = None,
+                        image_context: Optional[str] = None) -> str:
+    target_key = schedule_target_key(schedule)
+    signature = schedule_signature(schedule)
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    with db_connect() as conn:
+        old = conn.execute(
+            "SELECT hash, image_path, image_context FROM schedule_cache WHERE target_key = ? AND date = ?",
+            (target_key, schedule.date.isoformat()),
+        ).fetchone()
+        old_path = old["image_path"] if old else ""
+        unchanged = bool(old and old["hash"] == signature)
+        path = str(image_path) if image_path else (old_path if unchanged else "")
+        context = image_context if image_context is not None else (old["image_context"] if old and unchanged else "")
+        if old_path and old_path != path:
+            Path(old_path).unlink(missing_ok=True)
+        conn.execute("""
+            INSERT INTO schedule_cache
+                (target_key, date, hash, data, image_path, image_context, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(target_key, date) DO UPDATE SET
+                hash = excluded.hash, data = excluded.data,
+                image_path = excluded.image_path, image_context = excluded.image_context,
+                updated_at = excluded.updated_at
+        """, (target_key, schedule.date.isoformat(), signature,
+              json.dumps(normalize_schedule(schedule), ensure_ascii=False), path, context, stamp))
+    return signature
+
+
+def invalidate_group_image_cache(group_name: str) -> None:
+    group_id = next((key for key, value in GROUPS.items() if value.name == group_name), GROUP_ID)
+    target_key = f"group:{group_id}"
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT image_path FROM schedule_cache WHERE target_key = ? AND image_path != ''",
+            (target_key,),
+        ).fetchall()
+        conn.execute(
+            "UPDATE schedule_cache SET image_path = '', image_context = '' WHERE target_key = ?",
+            (target_key,),
+        )
+    for row in rows:
+        Path(row["image_path"]).unlink(missing_ok=True)
+
+
+def cache_has_image(target_key: str, day: date) -> bool:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT image_path FROM schedule_cache WHERE target_key = ? AND date = ?",
+            (target_key, day.isoformat()),
+        ).fetchone()
+    return bool(row and row["image_path"] and Path(row["image_path"]).is_file())
+
+
+def cached_image_path(schedule: Schedule) -> Optional[Path]:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT hash, image_path, image_context FROM schedule_cache WHERE target_key = ? AND date = ?",
+            (schedule_target_key(schedule), schedule.date.isoformat()),
+        ).fetchone()
+    if (not row or row["hash"] != schedule_signature(schedule)
+            or row["image_context"] != schedule_image_context(schedule)
+            or not row["image_path"]):
+        return None
+    path = Path(row["image_path"])
+    return path if path.is_file() else None
+
+
+async def get_cached_image(schedule: Schedule) -> Path:
+    key = f"image:{schedule_target_key(schedule)}:{schedule.date.isoformat()}:{schedule_signature(schedule)}"
+    async with _cache_lock(key):
+        existing = cached_image_path(schedule)
+        if existing:
+            return existing
+        context = schedule_image_context(schedule)
+        path = render_schedule_image(schedule)
+        save_schedule_cache(schedule, path, context)
+        return path
+
+
+async def get_schedule_cached(day: date, group_id: Optional[int] = None,
+                              force_refresh: bool = False) -> Schedule:
+    group = get_group(group_id)
+    target_key = f"group:{group.id}"
+    if not force_refresh:
+        cached = load_cached_schedule(target_key, day)
+        if cached is not None:
+            return cached
+    async with _cache_lock(f"schedule:{target_key}:{day.isoformat()}"):
+        if not force_refresh:
+            cached = load_cached_schedule(target_key, day)
+            if cached is not None:
+                return cached
+        schedule = await get_schedule(day, group.id)
+        save_schedule_cache(schedule)
+        return schedule
+
+
+async def get_staff_schedule_cached(staff_id: int, day: date,
+                                    force_refresh: bool = False) -> Schedule:
+    target_key = f"staff:{int(staff_id)}"
+    if not force_refresh:
+        cached = load_cached_schedule(target_key, day)
+        if cached is not None:
+            return cached
+    async with _cache_lock(f"schedule:{target_key}:{day.isoformat()}"):
+        if not force_refresh:
+            cached = load_cached_schedule(target_key, day)
+            if cached is not None:
+                return cached
+        schedule = await get_staff_schedule(staff_id, day)
+        save_schedule_cache(schedule)
+        return schedule
+
+
 # ============================================================
 # КАРТИНКА СОСТОЯНИЯ БОТА (/status)
 # ============================================================
@@ -5184,11 +5697,12 @@ def render_status_image(chat_id: int) -> Path:
     что бот использует сейчас.
     """
     try:
-        forecast = get_study_forecast()
+        group = get_group(get_user_settings(chat_id)["group_id"])
+        forecast = get_study_forecast(group.name)
         runtime = get_runtime_stats()
         db_stats = _database_stats()
         created = subscriber_info(chat_id)
-        subscribers_total = len(load_subscribers())
+        subscribers_total = len(load_subscribers(group.id))
 
         # Шрифты
         font_label = get_font(24, bold=True)
@@ -5352,7 +5866,7 @@ def render_status_image(chat_id: int) -> Path:
         draw.text((MARGIN + 20, 40), "СОСТОЯНИЕ БОТА",
                   font=font_label, fill=COL_ACCENT)
 
-        big_title = GROUP_NAME
+        big_title = group.name
         big_font = font_group
         chip_text = "РАБОТАЕТ"
         chip_pad_x = 26
@@ -5483,18 +5997,20 @@ def staff_keyboard(staff_id: int, target_day: date) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="◀️ Предыдущий день",
+                    text="← Предыдущий день",
                     callback_data=f"staff:{int(staff_id)}:{(target_day - timedelta(days=1)).isoformat()}",
                 ),
                 InlineKeyboardButton(
-                    text="📅 Сегодня",
+                    text="Сегодня",
                     callback_data=f"staff:{int(staff_id)}:{get_today().isoformat()}",
                 ),
                 InlineKeyboardButton(
-                    text="Следующий день ▶️",
+                    text="Следующий день →",
                     callback_data=f"staff:{int(staff_id)}:{(target_day + timedelta(days=1)).isoformat()}",
                 ),
-            ]
+            ],
+            [InlineKeyboardButton(text="Уведомления об изменениях",
+                                  callback_data=f"teacher:notify:{int(staff_id)}:1")],
         ]
     )
 
@@ -5512,31 +6028,117 @@ def staff_choice_keyboard(matches: list[StaffMember], target_day: date) -> Inlin
 
 
 def main_keyboard(is_subscribed: bool) -> InlineKeyboardMarkup:
-    """Кнопки «Сегодня» (/today) и «Завтра» (/schedule)."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📅 Сегодня", callback_data="today"
-                ),
-                InlineKeyboardButton(
-                    text="📅 Завтра", callback_data="schedule"
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔕 Отключить" if is_subscribed else "🔔 Подписаться",
-                    callback_data="unsubscribe" if is_subscribed
-                    else "subscribe",
-                ),
-                InlineKeyboardButton(text="ℹ️ Статус", callback_data="status"),
-            ],
-            [
-                InlineKeyboardButton(text="🔎 По дате", callback_data="date"),
-                InlineKeyboardButton(text="🆘 Помощь", callback_data="help"),
-            ],
-        ]
-    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Сегодня", callback_data="today"),
+         InlineKeyboardButton(text="Завтра", callback_data="schedule")],
+        [InlineKeyboardButton(text="По дате", callback_data="date"),
+         InlineKeyboardButton(text="О группе", callback_data="groupinfo")],
+        [InlineKeyboardButton(text="Сменить группу", callback_data="groups"),
+         InlineKeyboardButton(text="Преподаватели", callback_data="teacher")],
+        [InlineKeyboardButton(
+            text="Уведомления: вкл." if is_subscribed else "Уведомления: выкл.",
+            callback_data="notifications")],
+        [InlineKeyboardButton(text="Всему колледжу · 50 ₽", callback_data="broadcast")],
+        [InlineKeyboardButton(text="Статус", callback_data="status"),
+         InlineKeyboardButton(text="Помощь", callback_data="help")],
+    ])
+
+
+def group_catalog_keyboard(course: Optional[int] = None, form: str = "all",
+                           page: int = 0) -> InlineKeyboardMarkup:
+    correspondence = None if form == "all" else form == "correspondence"
+    values = sorted_groups(GROUPS, course=course, correspondence=correspondence)
+    per_page = 8
+    pages = max(1, (len(values) + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for offset in range(page * per_page, min(len(values), (page + 1) * per_page), 2):
+        chunk = values[offset:offset + 2]
+        rows.append([InlineKeyboardButton(text=item.name, callback_data=f"group:set:{item.id}")
+                     for item in chunk])
+    if pages > 1:
+        rows.append([
+            InlineKeyboardButton(text="←", callback_data=f"groups:list:{course or 0}:{form}:{max(0, page - 1)}"),
+            InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="groups:noop"),
+            InlineKeyboardButton(text="→", callback_data=f"groups:list:{course or 0}:{form}:{min(pages - 1, page + 1)}"),
+        ])
+    rows.append([InlineKeyboardButton(text="Все формы", callback_data=f"groups:list:{course or 0}:all:0"),
+                 InlineKeyboardButton(text="Очная", callback_data=f"groups:list:{course or 0}:fulltime:0"),
+                 InlineKeyboardButton(text="Заочная", callback_data=f"groups:list:{course or 0}:correspondence:0")])
+    rows.append([InlineKeyboardButton(text=f"{number} курс" if number else "Все курсы",
+                                      callback_data=f"groups:list:{number}:{form}:0")
+                 for number in (0, 1, 2, 3, 4)])
+    rows.append([InlineKeyboardButton(text="Главное меню", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def notification_keyboard(enabled: bool, staff_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    if staff_id:
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="Отключить уведомления" if enabled else "Включить уведомления",
+            callback_data=f"teacher:notify:{staff_id}:{0 if enabled else 1}")]])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="Отключить уведомления" if enabled else "Включить уведомления",
+        callback_data="unsubscribe" if enabled else "subscribe")]])
+
+
+def premium_title(text: str) -> str:
+    """Premium custom emoji используется только при заданном ID из пака бота."""
+    if PREMIUM_EMOJI_ID:
+        return f'<tg-emoji emoji-id="{PREMIUM_EMOJI_ID}">◆</tg-emoji> <b>{text}</b>'
+    return f"<b>{text}</b>"
+
+
+def render_group_info_image(group: GroupInfo) -> Path:
+    """Инфо-карточка группы в палитре и типографике расписания."""
+    width, height = 1080, 1350
+    scale = 2
+    image = Image.new("RGB", (width * scale, height * scale), S_BG)
+    draw = ImageDraw.Draw(image)
+
+    def rect(box, radius, fill, outline=None, line=1):
+        draw.rounded_rectangle(tuple(int(v * scale) for v in box), radius=radius * scale,
+                               fill=fill, outline=outline, width=line * scale)
+
+    def text(x, y, value, size, color=S_INK, bold=False):
+        draw.text((x * scale, y * scale), sanitize_text(value),
+                  font=get_font(size * scale, bold=bold), fill=color)
+
+    rect((52, 52, 1028, 1298), 42, S_CARD)
+    text(104, 112, "ИНК · ГРУППА", 25, S_MUTED, True)
+    text(104, 175, group.name, 72, S_INK, True)
+    text(104, 280, "Карточка группы", 32, S_MUTED)
+    rect((104, 352, 976, 355), 1, S_BORDER)
+    fields = [
+        ("ФОРМА", group.form),
+        ("ОСНОВА", group.study),
+        ("БАЗА", f"{group.education} классов"),
+        ("КУРС", str(group.course)),
+        ("СЕМЕСТР", str(group.semester)),
+        ("ID ГРУППЫ", str(group.id)),
+    ]
+    for index, (label, value) in enumerate(fields):
+        col, row = index % 2, index // 2
+        x, y = 104 + col * 446, 410 + row * 190
+        rect((x, y, x + 416, y + 154), 26, S_PURPLE_L)
+        text(x + 28, y + 25, label, 21, S_MUTED, True)
+        text(x + 28, y + 72, value, 34, S_INK, True)
+    text(104, 1010, "УЧЕБНЫЙ ГОД", 21, S_MUTED, True)
+    text(104, 1055, f"1 семестр: {_info_date(group.start_1)} — {_info_date(group.end_1)}", 28)
+    text(104, 1110, f"2 семестр: {_info_date(group.start_2)} — {_info_date(group.end_2)}", 28)
+    status = "Расписание публикуется" if group.has_schedule else "Расписание пока не опубликовано"
+    text(104, 1215, status, 24, S_MUTED)
+    image = image.resize((width, height), Image.Resampling.LANCZOS)
+    path = IMAGE_DIR / f"group_info_{group.id}_v1.png"
+    image.save(path, "PNG", optimize=True, compress_level=9)
+    return path
+
+
+def _info_date(value: str) -> str:
+    try:
+        return date.fromisoformat(value).strftime("%d.%m.%Y")
+    except (TypeError, ValueError):
+        return "—"
 
 
 # ============================================================
@@ -5546,23 +6148,23 @@ def main_keyboard(is_subscribed: bool) -> InlineKeyboardMarkup:
 def _photo_caption(schedule: Schedule) -> str:
     if schedule.schedule_type == "staff":
         lines = [
-            "👨‍🏫 <b>Преподаватель</b>",
-            f"<b>{schedule.staff_name or schedule.group}</b>",
-            f"📅 {format_date_full(schedule.date)}",
+            premium_title("Преподаватель"),
+            f"<b>{html.escape(schedule.staff_name or schedule.group)}</b>",
+            format_date_full(schedule.date),
         ]
     else:
         lines = [
-            f"📚 <b>{schedule.group}</b>",
-            f"📅 {format_date_full(schedule.date)}",
+            premium_title(html.escape(schedule.group)),
+            format_date_full(schedule.date),
         ]
     if schedule.lessons:
-        lines.append(f"🕐 Занятий: {count_lessons(schedule)}")
+        lines.append(f"Занятий: {count_lessons(schedule)}")
     return "\n".join(lines)
 
 
 async def _send_photo(destination, schedule: Schedule, reply_markup=None) -> bool:
-    """Генерирует PNG и отправляет его. Временный файл удаляется после отправки."""
-    path = render_schedule_image(schedule)
+    """Отправляет постоянный PNG из кэша; генерация выполняется один раз на версию."""
+    path = await get_cached_image(schedule)
     try:
         caption = _photo_caption(schedule)
         kwargs = {"caption": caption}
@@ -5576,11 +6178,6 @@ async def _send_photo(destination, schedule: Schedule, reply_markup=None) -> boo
     except Exception:
         logger.exception("Ошибка отправки изображения")
         return False
-    finally:
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
 async def _send_text(destination, text: str) -> None:
@@ -5593,6 +6190,27 @@ async def _send_text(destination, text: str) -> None:
         logger.exception("Ошибка отправки текста")
 
 
+def _destination_chat_id(destination) -> int:
+    chat = getattr(destination, "chat", None)
+    if chat is not None:
+        return int(chat.id)
+    return int(destination.message.chat.id)
+
+
+def _selected_group_id(destination) -> int:
+    try:
+        return int(get_user_settings(_destination_chat_id(destination))["group_id"])
+    except Exception:
+        return GROUP_ID
+
+
+async def _schedule_for_destination(destination, day: date, group_id: int) -> Schedule:
+    # Не-Telegram объекты оставлены для обратной совместимости интеграционных тестов.
+    if isinstance(destination, (Message, CallbackQuery)):
+        return await get_schedule_cached(day, group_id)
+    return await (get_schedule(day) if group_id == GROUP_ID else get_schedule(day, group_id))
+
+
 async def _handle_today(destination):
     """Команда /today: расписание ТОЛЬКО на сегодняшний день.
 
@@ -5601,17 +6219,18 @@ async def _handle_today(destination):
     """
     try:
         today = get_today()
-        schedule = await get_schedule(today)
+        group = get_group(_selected_group_id(destination))
+        schedule = await _schedule_for_destination(destination, today, group.id)
         register_subjects_from_schedule(schedule)
         record_completed_lessons(schedule)
 
         if not schedule.lessons:
             await _send_text(
                 destination,
-                "📅 <b>Расписание на сегодня</b>\n\n"
-                f"👥 Группа: <b>{GROUP_NAME}</b>\n"
-                f"🗓 {format_date_header(today)}\n\n"
-                "☕ Занятий нет или расписание ещё не опубликовано.",
+                f"{premium_title('Расписание на сегодня')}\n\n"
+                f"Группа: <b>{html.escape(group.name)}</b>\n"
+                f"{format_date_header(today)}\n\n"
+                "Занятий нет или расписание ещё не опубликовано.",
             )
             return
 
@@ -5621,7 +6240,7 @@ async def _handle_today(destination):
     except ScheduleUnavailable:
         await _send_text(
             destination,
-            f"😔 Не удалось получить расписание на "
+            f"Не удалось получить расписание на "
             f"{format_date_full(get_today())}. Сайт недоступен, попробуй позже.",
         )
     except Exception:
@@ -5636,17 +6255,18 @@ async def _handle_schedule(destination):
     """
     try:
         tomorrow = get_tomorrow()
-        schedule = await get_schedule(tomorrow)
+        group = get_group(_selected_group_id(destination))
+        schedule = await _schedule_for_destination(destination, tomorrow, group.id)
         register_subjects_from_schedule(schedule)
         record_completed_lessons(schedule)
 
         if not schedule.lessons:
             await _send_text(
                 destination,
-                "📅 <b>Расписание на завтра</b>\n\n"
-                f"👥 Группа: <b>{GROUP_NAME}</b>\n"
-                f"🗓 {format_date_header(tomorrow)}\n\n"
-                "☕ Занятий нет — расписание ещё не опубликовано.",
+                f"{premium_title('Расписание на завтра')}\n\n"
+                f"Группа: <b>{html.escape(group.name)}</b>\n"
+                f"{format_date_header(tomorrow)}\n\n"
+                "Занятий нет или расписание ещё не опубликовано.",
             )
             return
 
@@ -5656,7 +6276,7 @@ async def _handle_schedule(destination):
     except ScheduleUnavailable:
         await _send_text(
             destination,
-            f"😔 Не удалось получить расписание на "
+            f"Не удалось получить расписание на "
             f"{format_date_full(get_tomorrow())}. Сайт недоступен, попробуй позже.",
         )
     except Exception:
@@ -5665,28 +6285,29 @@ async def _handle_schedule(destination):
 
 async def _handle_date(destination, target: date):
     """Показывает расписание на конкретную дату (без подстановки «сегодня»)."""
+    group = get_group(_selected_group_id(destination))
     try:
         if is_day_off(target):
             await _send_text(
                 destination,
-                f"📅 <b>{format_date_header(target)}</b>\n\n"
-                f"Группа: <b>{GROUP_NAME}</b>\n"
+                f"{premium_title(format_date_header(target))}\n\n"
+                f"Группа: <b>{html.escape(group.name)}</b>\n"
                 f"{format_date_full(target)}\n\n"
-                "☕ Воскресенье — занятий нет.",
+                "Воскресенье — занятий нет.",
             )
             return
 
-        schedule = await get_schedule(target)
+        schedule = await _schedule_for_destination(destination, target, group.id)
         register_subjects_from_schedule(schedule)
         record_completed_lessons(schedule)
 
         if not schedule.lessons:
             await _send_text(
                 destination,
-                f"📅 <b>{format_date_header(target)}</b>\n\n"
-                f"Группа: <b>{GROUP_NAME}</b>\n"
+                f"{premium_title(format_date_header(target))}\n\n"
+                f"Группа: <b>{html.escape(group.name)}</b>\n"
                 f"{format_date_full(target)}\n\n"
-                "☕ Занятий нет или расписание ещё не опубликовано.",
+                "Занятий нет или расписание ещё не опубликовано.",
             )
             return
 
@@ -5696,7 +6317,7 @@ async def _handle_date(destination, target: date):
     except ScheduleUnavailable:
         await _send_text(
             destination,
-            "😔 Не удалось получить расписание. Сайт недоступен, попробуй позже.",
+            "Не удалось получить расписание. Сайт недоступен, попробуй позже.",
         )
     except Exception:
         logger.exception("Ошибка /date")
@@ -5717,13 +6338,13 @@ async def _send_staff_schedule(
 ) -> bool:
     """Получает и отправляет staff-расписание с навигацией."""
     try:
-        schedule = await get_staff_schedule(member.staff_id, target_day)
+        schedule = await get_staff_schedule_cached(member.staff_id, target_day)
         keyboard = staff_keyboard(member.staff_id, target_day)
         if not schedule.lessons:
             text = (
-                "👨‍🏫 <b>Расписание преподавателя</b>\n"
+                "<b>Расписание преподавателя</b>\n"
                 f"<b>{member.full_name}</b>\n\n"
-                f"📅 {format_date_full(target_day)}\n\n"
+                f"{format_date_full(target_day)}\n\n"
                 "Занятий нет или расписание ещё не опубликовано."
             )
             if _is_message_destination(destination):
@@ -5732,7 +6353,7 @@ async def _send_staff_schedule(
                 await destination.message.answer(text, reply_markup=keyboard)
             return True
 
-        path = render_schedule_image(schedule)
+        path = await get_cached_image(schedule)
         try:
             caption = _photo_caption(schedule)
             if edit_existing and isinstance(destination, CallbackQuery):
@@ -5760,11 +6381,12 @@ async def _send_staff_schedule(
                     FSInputFile(path), caption=caption, reply_markup=keyboard
                 )
             return True
-        finally:
-            path.unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Ошибка отправки staff PNG")
+            return False
     except ScheduleUnavailable:
         text = (
-            "😔 Не удалось получить расписание преподавателя. "
+            "Не удалось получить расписание преподавателя. "
             "Сайт недоступен, попробуй позже."
         )
         if _is_message_destination(destination):
@@ -5793,7 +6415,7 @@ async def _handle_staff_request(destination, request: ScheduleTextRequest) -> No
     if not matches:
         await _send_text(
             destination,
-            f"👨‍🏫 Преподаватель «{clean_text(request.staff_query)}» не найден.\n"
+            f"Преподаватель «{clean_text(request.staff_query)}» не найден.\n"
             "Попробуй указать фамилию, имя, ФИО или инициалы.",
         )
         return
@@ -5809,28 +6431,31 @@ async def _handle_staff_request(destination, request: ScheduleTextRequest) -> No
                 text, reply_markup=staff_choice_keyboard(matches, target_day)
             )
         return
+    if isinstance(destination, (Message, CallbackQuery)):
+        set_user_staff(_destination_chat_id(destination), matches[0].staff_id)
     await _send_staff_schedule(destination, matches[0], target_day)
 
 
 async def _status_text(chat_id: int) -> str:
     """Текстовый fallback картинки статуса (если PNG не сгенерировался)."""
     created = subscriber_info(chat_id)
-    total = len(load_subscribers())
-    forecast = get_study_forecast()
+    group = get_group(get_user_settings(chat_id)["group_id"])
+    total = len(load_subscribers(group.id))
+    forecast = get_study_forecast(group.name)
     lines = [
-        f"📚 <b>{GROUP_NAME}</b>",
+        f"<b>{html.escape(group.name)}</b>",
         "—" * 18,
     ]
     if created:
-        lines.append("🔔 Этот чат подписан на уведомления.")
+        lines.append("Уведомления включены.")
         lines.append(f"Подписка оформлена: <i>{created}</i>")
     else:
-        lines.append("🔕 Этот чат не подписан на уведомления.")
+        lines.append("Уведомления отключены.")
     lines.append(f"Всего подписок: <b>{total}</b>")
     lines.append(f"Проверка изменений каждые {CHECK_INTERVAL // 60} мин.")
     lines.append(f"Часовой пояс: <b>{TIMEZONE}</b> (UTC+5)")
     if forecast.studied_minutes > 0:
-        lines.append(f"📖 {study_badge_text(forecast)}")
+        lines.append(study_badge_text(forecast))
         lines.append(f"По обыкновенному времени: {regular_study_time_text(forecast)}")
         if forecast.remaining_minutes:
             lines.append(
@@ -5839,19 +6464,20 @@ async def _status_text(chat_id: int) -> str:
             )
         lines.append(f"<i>{STUDY_NOTE_EXPLANATION}</i>")
     lines.append(
-        f"⏱ Аптайм: {format_uptime(time.monotonic() - _PROCESS_STARTED_MONOTONIC)}"
+        f"Аптайм: {format_uptime(time.monotonic() - _PROCESS_STARTED_MONOTONIC)}"
     )
     return "\n".join(lines)
 
 
-def _status_caption() -> str:
+def _status_caption(chat_id: Optional[int] = None) -> str:
     """Короткая подпись к картинке статуса."""
-    forecast = get_study_forecast()
-    lines = [f"🤖 <b>Статус бота</b> · 📚 <b>{GROUP_NAME}</b>"]
+    group = get_group(get_user_settings(chat_id)["group_id"]) if chat_id is not None else get_group()
+    forecast = get_study_forecast(group.name)
+    lines = [f"<b>Статус бота</b> · <b>{html.escape(group.name)}</b>"]
     if forecast.studied_minutes > 0:
-        lines.append(f"📖 {study_badge_text(forecast)}")
+        lines.append(study_badge_text(forecast))
     lines.append(
-        "⏱ Аптайм: "
+        "Аптайм: "
         f"{format_uptime(time.monotonic() - _PROCESS_STARTED_MONOTONIC)}"
     )
     return "\n".join(lines)
@@ -5865,7 +6491,7 @@ async def _send_status(destination) -> None:
         chat_id = chat.id
     else:
         chat_id = destination.message.chat.id
-    caption = _status_caption()
+    caption = _status_caption(chat_id)
     path = None
     try:
         path = render_status_image(chat_id)
@@ -5897,6 +6523,20 @@ async def _send_status(destination) -> None:
 # ============================================================
 
 dp = Dispatcher()
+
+
+class BotCommandFilter(Command):
+    """Команды с основным и дополнительными premium usernames бота."""
+
+    async def validate_mention(self, bot: Bot, command) -> None:
+        if not command.mention or self.ignore_mention:
+            return
+        me = await bot.me()
+        allowed = set(BOT_USERNAME_ALIASES)
+        if me.username:
+            allowed.add(me.username.casefold())
+        if command.mention.casefold() not in allowed:
+            raise CommandException("Mention did not match")
 
 
 async def _send_rate_warning(event) -> None:
@@ -5937,6 +6577,17 @@ def _is_subscribed(user_id: int) -> bool:
     return subscriber_info(user_id) is not None
 
 
+async def _callback_can_manage(callback: CallbackQuery) -> bool:
+    chat = callback.message.chat
+    if chat.type not in ("group", "supergroup"):
+        return True
+    try:
+        member = await callback.bot.get_chat_member(chat.id, callback.from_user.id)
+        return member.status in ("creator", "administrator")
+    except Exception:
+        return False
+
+
 async def _is_group_admin(message: Message) -> bool:
     """Проверяет, что автор сообщения — админ/создатель группы."""
     if message.chat.type not in ("group", "supergroup"):
@@ -5956,43 +6607,48 @@ async def _is_group_admin(message: Message) -> bool:
         return False
 
 
-@dp.message(Command("start", "help"))
+@dp.message(BotCommandFilter("start", "help"))
 async def cmd_start(message: Message):
     chat_id = message.chat.id
+    save_user_profile(message.from_user, chat_id)
+    set_pending_action(chat_id, "")
+    group = get_group(_selected_group_id(message))
     text = (
-        f"👋 Привет!\n\n"
-        f"Я бот <b>{BOT_NAME}</b> для группы <b>{GROUP_NAME}</b>.\n\n"
-        f"Доступные действия:\n"
-        f"📅 <b>Сегодня</b> — /today\n"
-        f"📅 <b>Завтра</b> — /schedule\n"
-        f"✍️ <b>Текстом</b> — просто напиши «расписание»\n"
-        f"    или «расписание на 4 сентября»\n"
-        f"👨‍🏫 <b>Преподаватель</b> — «расписание преподавателя Фамилия»\n"
-        f"🔎 <b>Поиск по дате</b> — /date 04.09.2026 или /date сегодня\n"
-        f"🔔 <b>Уведомления</b> — /subscribe\n"
-        f"🔕 <b>Отключить уведомления</b> — /unsubscribe\n"
-        f"ℹ️ <b>Статус</b> — /status\n"
-        f"🆘 <b>Помощь</b> — /help\n\n"
-        f"🔔 Подписчики автоматически получают обновлённое "
-        f"расписание при его изменении.\n"
-        f"👥 Меня можно добавить в группу — админ включает "
-        f"рассылку в чат командой /subscribe."
+        f"{premium_title(BOT_NAME)}\n\n"
+        f"Группа: <b>{html.escape(group.name)}</b>\n"
+        f"{group.form} · {group.study} · {group.course} курс\n\n"
+        "Выберите действие кнопками ниже.\n"
+        "По дате: <code>/date 10.11.2026</code>\n"
+        "Текстом: «расписание на завтра»."
     )
     await message.answer(text, reply_markup=main_keyboard(_is_subscribed(chat_id)))
 
 
-@dp.message(Command("today"))
+@dp.message(BotCommandFilter("groups"))
+async def cmd_groups(message: Message):
+    save_user_profile(message.from_user, message.chat.id)
+    await message.answer("<b>Выбор группы</b>", reply_markup=group_catalog_keyboard())
+
+
+@dp.message(BotCommandFilter("teacher"))
+async def cmd_teacher(message: Message):
+    save_user_profile(message.from_user, message.chat.id)
+    set_pending_action(message.chat.id, "teacher_search")
+    await message.answer("<b>Преподаватель</b>\nОтправьте фамилию или ФИО.")
+
+
+@dp.message(BotCommandFilter("today"))
 async def cmd_today(message: Message):
     """Показывает расписание только на сегодня."""
     await _handle_today(message)
 
 
-@dp.message(Command("schedule"))
+@dp.message(BotCommandFilter("schedule"))
 async def cmd_schedule(message: Message):
     await _handle_schedule(message)
 
 
-@dp.message(Command("date"))
+@dp.message(BotCommandFilter("date"))
 async def cmd_date(message: Message):
     """Поиск расписания по дате: /date 04.09.2026"""
     parts = (message.text or "").split(maxsplit=1)
@@ -6000,7 +6656,7 @@ async def cmd_date(message: Message):
 
     if not argument.strip():
         await message.answer(
-            "🔎 <b>Поиск расписания по дате</b>\n\n"
+            "<b>Поиск расписания по дате</b>\n\n"
             "Использование: <code>/date ДАТА</code>\n\n"
             "Примеры:\n"
             "• <code>/date 04.09.2026</code>\n"
@@ -6015,7 +6671,7 @@ async def cmd_date(message: Message):
 
     if target is None:
         await message.answer(
-            "❌ Не понял дату.\n\n"
+            "Дата не распознана.\n\n"
             "Попробуй так: <code>/date 04.09.2026</code>, "
             "<code>/date 4 сентября</code> или <code>/date завтра</code>."
         )
@@ -6024,48 +6680,49 @@ async def cmd_date(message: Message):
     await _handle_date(message, target)
 
 
-@dp.message(Command("subscribe"))
+@dp.message(BotCommandFilter("subscribe"))
 async def cmd_subscribe(message: Message):
     chat = message.chat
     is_group = chat.type in ("group", "supergroup")
 
     if is_group and not await _is_group_admin(message):
         await message.answer(
-            "⛔ Подписывать группу на расписание могут только администраторы чата."
+            "Изменять подписку группы может только администратор."
         )
         return
 
     title = chat.title or chat.full_name or ""
 
-    if subscribe_user(chat.id, chat_type=chat.type, title=title):
+    selected_group = get_group(_selected_group_id(message))
+    if subscribe_user(chat.id, chat_type=chat.type, title=title, group_id=selected_group.id):
         where = "Этот чат" if is_group else "Вы"
         await message.answer(
-            f"🔔 <b>Уведомления включены.</b>\n\n"
+            f"<b>Уведомления включены</b>\n\n"
             f"{where} будет получать обновлённое расписание "
             f"при его изменении.\n\n"
             f"Отключить: /unsubscribe"
         )
     else:
         await message.answer(
-            "🔔 Этот чат уже подписан на уведомления."
+            "Уведомления уже включены."
             if is_group
-            else "🔔 Вы уже подписаны на уведомления."
+            else "Уведомления уже включены."
         )
 
 
-@dp.message(Command("unsubscribe"))
+@dp.message(BotCommandFilter("unsubscribe"))
 async def cmd_unsubscribe(message: Message):
     chat = message.chat
     is_group = chat.type in ("group", "supergroup")
 
     if is_group and not await _is_group_admin(message):
         await message.answer(
-            "⛔ Отписывать группу могут только администраторы чата."
+            "Изменять подписку группы может только администратор."
         )
         return
 
     if unsubscribe_user(chat.id):
-        await message.answer("🔕 <b>Уведомления отключены.</b>")
+        await message.answer("<b>Уведомления отключены</b>")
     else:
         await message.answer(
             "Этот чат не был подписан на уведомления."
@@ -6074,9 +6731,221 @@ async def cmd_unsubscribe(message: Message):
         )
 
 
-@dp.message(Command("status"))
+@dp.message(BotCommandFilter("status"))
 async def cmd_status(message: Message):
     await _send_status(message)
+
+
+# ============================================================
+# ПЛАТНАЯ РАССЫЛКА: МОДЕРАЦИЯ -> ОПЛАТА -> ДОСТАВКА
+# ============================================================
+
+BROADCAST_RULES = (
+    "<b>Сообщение всему колледжу</b>\n\n"
+    "Стоимость: 50 ₽. Реклама: 150 ₽.\n"
+    "Публикация не анонимна: получатели увидят ваше имя и username.\n\n"
+    "Запрещены: 18+, насилие, сливы и персональные данные, травля, "
+    "дискриминация, мошенничество, ссылки на вредоносные ресурсы, спам, "
+    "продажа запрещённых товаров и незаконная реклама.\n\n"
+    "Сначала модератор проверяет сообщение, затем вы оплачиваете рассылку. "
+    "Оплата взимается только после одобрения."
+)
+
+
+def create_broadcast(message: Message, is_ad: bool = False) -> int:
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    user = message.from_user
+    with db_connect() as conn:
+        cursor = conn.execute("""
+            INSERT INTO broadcasts
+                (user_id, author_name, username, original_chat_id, original_message_id,
+                 is_ad, amount, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)
+        """, (user.id, user.full_name, user.username or "", message.chat.id,
+              message.message_id, int(is_ad), BROADCAST_AD_PRICE if is_ad else BROADCAST_PRICE,
+              stamp, stamp))
+        return int(cursor.lastrowid)
+
+
+def get_broadcast(broadcast_id: int) -> Optional[dict]:
+    with db_connect() as conn:
+        row = conn.execute("SELECT * FROM broadcasts WHERE id = ?", (broadcast_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_broadcast(broadcast_id: int, **fields) -> None:
+    allowed = {"is_ad", "amount", "status", "payment_charge_id", "moderator_id", "moderation_note"}
+    values = {key: value for key, value in fields.items() if key in allowed}
+    values["updated_at"] = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    assignments = ", ".join(f"{key} = ?" for key in values)
+    with db_connect() as conn:
+        conn.execute(
+            f"UPDATE broadcasts SET {assignments} WHERE id = ?",
+            (*values.values(), broadcast_id),
+        )
+
+
+def broadcast_recipients() -> list[int]:
+    with db_connect() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT chat_id FROM (
+                SELECT chat_id FROM user_settings WHERE chat_id > 0
+                UNION SELECT user_id AS chat_id FROM subscribers WHERE user_id > 0
+            ) ORDER BY chat_id
+        """).fetchall()
+    return [int(row["chat_id"]) for row in rows]
+
+
+async def send_broadcast_invoice(bot: Bot, item: dict) -> None:
+    if not PAYMENT_PROVIDER_TOKEN:
+        raise RuntimeError("PAYMENT_PROVIDER_TOKEN не настроен")
+    amount = int(item["amount"])
+    title = "Реклама всему колледжу" if item["is_ad"] else "Сообщение всему колледжу"
+    await bot.send_invoice(
+        chat_id=item["user_id"], title=title,
+        description=f"Модерация пройдена. Публикация не анонимна. Стоимость: {amount} ₽.",
+        payload=f"broadcast:{item['id']}:{item['user_id']}",
+        provider_token=PAYMENT_PROVIDER_TOKEN, currency="RUB",
+        prices=[LabeledPrice(label=title, amount=amount * 100)],
+    )
+
+
+@dp.callback_query(F.data == "broadcast")
+async def cb_broadcast(callback: CallbackQuery):
+    if not ADMIN_IDS or not PAYMENT_PROVIDER_TOKEN:
+        await callback.answer("Рассылка временно недоступна", show_alert=True)
+        return
+    save_user_profile(callback.from_user, callback.message.chat.id)
+    set_pending_action(callback.message.chat.id, "broadcast_compose")
+    await callback.answer()
+    await callback.message.answer(BROADCAST_RULES + "\n\nОтправьте одно сообщение: текст, фото, видео или документ.")
+
+
+@dp.callback_query(F.data.startswith("broadcast:type:"))
+async def cb_broadcast_type(callback: CallbackQuery):
+    try:
+        _, _, raw_id, raw_ad = callback.data.split(":")
+        broadcast_id, is_ad = int(raw_id), bool(int(raw_ad))
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректный запрос", show_alert=True)
+        return
+    item = get_broadcast(broadcast_id)
+    if not item or item["user_id"] != callback.from_user.id or item["status"] != "draft":
+        await callback.answer("Заявка недоступна", show_alert=True)
+        return
+    update_broadcast(broadcast_id, is_ad=int(is_ad),
+                     amount=BROADCAST_AD_PRICE if is_ad else BROADCAST_PRICE,
+                     status="moderation")
+    set_pending_action(callback.message.chat.id, "")
+    await callback.answer("Отправлено на модерацию")
+    await callback.message.answer(
+        f"Заявка №{broadcast_id} отправлена на модерацию. "
+        f"После одобрения появится счёт на {BROADCAST_AD_PRICE if is_ad else BROADCAST_PRICE} ₽."
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Одобрить", callback_data=f"moderation:approve:{broadcast_id}"),
+         InlineKeyboardButton(text="Отклонить", callback_data=f"moderation:reject:{broadcast_id}")],
+    ])
+    for admin_id in ADMIN_IDS:
+        try:
+            await callback.bot.send_message(
+                admin_id,
+                f"<b>Заявка №{broadcast_id}</b>\nАвтор: {html.escape(item['author_name'])}"
+                f" (@{html.escape(item['username'])})\nТип: {'реклама, 150 ₽' if is_ad else 'сообщение, 50 ₽'}",
+            )
+            await callback.bot.copy_message(admin_id, item["original_chat_id"], item["original_message_id"])
+            await callback.bot.send_message(admin_id, "Решение по заявке:", reply_markup=keyboard)
+        except Exception:
+            logger.exception("Не удалось отправить заявку модератору %s", admin_id)
+
+
+@dp.callback_query(F.data.startswith("moderation:"))
+async def cb_moderation(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Недостаточно прав", show_alert=True)
+        return
+    try:
+        _, decision, raw_id = callback.data.split(":")
+        broadcast_id = int(raw_id)
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    item = get_broadcast(broadcast_id)
+    if not item or item["status"] != "moderation":
+        await callback.answer("Заявка уже обработана", show_alert=True)
+        return
+    if decision == "reject":
+        update_broadcast(broadcast_id, status="rejected", moderator_id=callback.from_user.id)
+        await callback.answer("Отклонено")
+        await callback.bot.send_message(item["user_id"], f"Заявка №{broadcast_id} отклонена. Оплата не взималась.")
+        return
+    if decision != "approve":
+        await callback.answer("Некорректное решение", show_alert=True)
+        return
+    update_broadcast(broadcast_id, status="approved", moderator_id=callback.from_user.id)
+    item = get_broadcast(broadcast_id)
+    await callback.answer("Одобрено")
+    await send_broadcast_invoice(callback.bot, item)
+
+
+async def deliver_broadcast(bot: Bot, item: dict) -> None:
+    update_broadcast(item["id"], status="sending")
+    author = html.escape(item["author_name"])
+    username = f" (@{html.escape(item['username'])})" if item["username"] else ""
+    prefix = f"<b>Сообщение от {author}{username}</b>"
+    if item["is_ad"]:
+        prefix += "\nРеклама"
+    delivered = 0
+    for chat_id in broadcast_recipients():
+        try:
+            await bot.send_message(chat_id, prefix)
+            await bot.copy_message(chat_id, item["original_chat_id"], item["original_message_id"])
+            delivered += 1
+            await asyncio.sleep(0.05)
+        except Exception as error:
+            logger.warning("Рассылка №%s не доставлена %s: %s", item["id"], chat_id, error)
+    update_broadcast(item["id"], status="sent")
+    await bot.send_message(item["user_id"], f"Рассылка №{item['id']} завершена. Доставлено: {delivered}.")
+
+
+@dp.pre_checkout_query()
+async def on_pre_checkout(query):
+    try:
+        _, raw_id, raw_user = query.invoice_payload.split(":")
+        item = get_broadcast(int(raw_id))
+        valid = item and item["status"] == "approved" and item["user_id"] == int(raw_user) == query.from_user.id
+    except (ValueError, AttributeError):
+        valid = False
+    if valid:
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="Счёт недействителен. Запросите новую модерацию.")
+
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(message: Message):
+    payment = message.successful_payment
+    try:
+        _, raw_id, raw_user = payment.invoice_payload.split(":")
+        item = get_broadcast(int(raw_id))
+        if not item or item["user_id"] != int(raw_user) or int(raw_user) != message.from_user.id:
+            raise ValueError
+        if item["status"] in ("paid", "sending", "sent"):
+            return
+        if item["status"] != "approved":
+            raise ValueError
+        expected = int(item["amount"]) * 100
+        if payment.currency != "RUB" or payment.total_amount != expected:
+            raise ValueError
+    except (ValueError, AttributeError):
+        logger.error("Неизвестный платёж: %s", payment.invoice_payload)
+        await message.answer("Платёж сохранён, но заявка требует ручной проверки администратором.")
+        for admin_id in ADMIN_IDS:
+            await message.bot.send_message(admin_id, f"Требуется проверка платежа: {payment.telegram_payment_charge_id}")
+        return
+    update_broadcast(item["id"], status="paid", payment_charge_id=payment.telegram_payment_charge_id)
+    await message.answer("Оплата принята. Начата рассылка.")
+    await deliver_broadcast(message.bot, get_broadcast(item["id"]))
 
 
 # ============================================================
@@ -6094,6 +6963,39 @@ SCHEDULE_TEXT_HELP = (
 )
 
 
+async def _accept_broadcast_content(message: Message) -> None:
+    broadcast_id = create_broadcast(message)
+    await message.answer(
+        f"Заявка №{broadcast_id}. Выберите тип публикации.\n"
+        "После модерации будет выставлен счёт. Авторство сохранится.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Сообщение · 50 ₽", callback_data=f"broadcast:type:{broadcast_id}:0")],
+            [InlineKeyboardButton(text="Реклама · 150 ₽", callback_data=f"broadcast:type:{broadcast_id}:1")],
+            [InlineKeyboardButton(text="Отмена", callback_data=f"broadcast:cancel:{broadcast_id}")],
+        ]),
+    )
+
+
+@dp.callback_query(F.data.startswith("broadcast:cancel:"))
+async def cb_broadcast_cancel(callback: CallbackQuery):
+    try:
+        broadcast_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    item = get_broadcast(broadcast_id)
+    if item and item["user_id"] == callback.from_user.id and item["status"] == "draft":
+        update_broadcast(broadcast_id, status="cancelled")
+    set_pending_action(callback.message.chat.id, "")
+    await callback.answer("Заявка отменена")
+
+
+@dp.message(F.chat.type == "private", ~F.text)
+async def on_broadcast_media(message: Message):
+    if get_user_settings(message.chat.id).get("pending_action") == "broadcast_compose":
+        await _accept_broadcast_content(message)
+
+
 @dp.message(F.text)
 async def cmd_text_schedule(message: Message):
     """«расписание» / «расписание на <дата>» — без слэша.
@@ -6102,6 +7004,32 @@ async def cmd_text_schedule(message: Message):
     передаётся в ту же строгую функцию _handle_date/get_schedule,
     что и у команд с «/». Никакого fallback на другую дату.
     """
+    settings = get_user_settings(message.chat.id) if hasattr(message, "chat") else {}
+    pending = settings.get("pending_action", "")
+    if pending == "broadcast_compose":
+        await _accept_broadcast_content(message)
+        return
+    if pending == "date":
+        set_pending_action(message.chat.id, "")
+        target = parse_user_date(message.text or "")
+        if target is None:
+            await message.answer("Дата не распознана. Пример: 10.11.2026 или «завтра».")
+            return
+        await _handle_date(message, target)
+        return
+    if pending == "teacher_search":
+        set_pending_action(message.chat.id, "")
+        matches = search_staff(message.text or "")
+        if not matches:
+            await message.answer("Преподаватель не найден. Проверьте фамилию.")
+            return
+        if len(matches) > 1:
+            await message.answer("Выберите преподавателя:", reply_markup=staff_choice_keyboard(matches, get_tomorrow()))
+            return
+        set_user_staff(message.chat.id, matches[0].staff_id)
+        await _send_staff_schedule(message, matches[0], get_tomorrow())
+        return
+
     request = parse_schedule_text(message.text or "")
 
     if not request.matched:
@@ -6133,15 +7061,13 @@ async def on_chat_member_update(event: ChatMemberUpdated):
     if new_status in ("member", "administrator"):
         await event.bot.send_message(
             chat.id,
-            f"👋 Привет! Я бот <b>{BOT_NAME}</b> для группы <b>{GROUP_NAME}</b>.\n\n"
-            f"• /today — расписание на сегодня\n"
-            f"• /schedule — расписание на завтра\n"
-            f"• Напиши «расписание» или «расписание на дату» — без слэша\n"
-            f"• /date ДАТА — поиск по дате (например /date сегодня)\n"
-            f"• /subscribe — присылать расписание в этот чат "
-            f"при изменениях\n"
-            f"• /unsubscribe — отключить\n\n"
-            f"ℹ️ Подписать чат может администратор командой /subscribe.",
+            f"<b>{BOT_NAME}</b>\n"
+            "Расписание всех групп и преподавателей колледжа.\n\n"
+            "/groups — выбрать группу\n"
+            "/today и /schedule — расписание\n"
+            "/subscribe — уведомления об изменениях\n"
+            "/teacher — расписание преподавателя\n\n"
+            "Настройки группового чата изменяет администратор.",
         )
     elif new_status in ("left", "kicked"):
         unsubscribe_user(chat.id)
@@ -6151,6 +7077,152 @@ async def on_chat_member_update(event: ChatMemberUpdated):
 # ============================================================
 # INLINE-КНОПКИ
 # ============================================================
+
+
+async def _send_group_info(destination, group: GroupInfo) -> None:
+    path = render_group_info_image(group)
+    caption = (
+        f"{premium_title(html.escape(group.name))}\n"
+        f"{group.form} · {group.study}\n"
+        f"{group.base} · {group.course} курс · {group.semester} семестр"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Расписание на сегодня", callback_data="today"),
+         InlineKeyboardButton(text="Сменить группу", callback_data="groups")],
+        [InlineKeyboardButton(text="Главное меню", callback_data="menu")],
+    ])
+    if _is_message_destination(destination):
+        await destination.answer_photo(FSInputFile(path), caption=caption, reply_markup=keyboard)
+    else:
+        await destination.message.answer_photo(FSInputFile(path), caption=caption, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "groups:noop")
+async def cb_groups_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "groups")
+async def cb_groups(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "<b>Выбор группы</b>\nФильтры: форма обучения и курс.",
+        reply_markup=group_catalog_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("groups:list:"))
+async def cb_groups_list(callback: CallbackQuery):
+    try:
+        _, _, raw_course, form, raw_page = callback.data.split(":")
+        course, page = int(raw_course) or None, int(raw_page)
+        if form not in ("all", "fulltime", "correspondence"):
+            raise ValueError
+    except (ValueError, AttributeError):
+        await callback.answer("Некорректный фильтр", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        "<b>Выбор группы</b>\nФильтры: форма обучения и курс.",
+        reply_markup=group_catalog_keyboard(course, form, page),
+    )
+
+
+@dp.callback_query(F.data.startswith("group:set:"))
+async def cb_group_set(callback: CallbackQuery):
+    if not await _callback_can_manage(callback):
+        await callback.answer("Настройки изменяет администратор", show_alert=True)
+        return
+    try:
+        group_id = int(callback.data.rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("Группа не найдена", show_alert=True)
+        return
+    if group_id not in GROUPS:
+        await callback.answer("Группа не найдена", show_alert=True)
+        return
+    chat_id = callback.message.chat.id
+    save_user_profile(callback.from_user, chat_id)
+    set_user_group(chat_id, group_id)
+    group = get_group(group_id)
+    first_calculation = ensure_study_history(group_id)
+    await callback.answer(f"Выбрана {group.name}")
+    text = (
+        f"{premium_title(html.escape(group.name))}\n"
+        f"{group.form} · {group.study} · {group.course} курс"
+    )
+    if first_calculation:
+        text += (
+            "\n\nЗапущен первичный подсчёт изученных часов. "
+            "Он выполняется один раз для этой группы. "
+            "Дальше данные обновляются автоматически, запросы будут примерно в 10 раз быстрее."
+        )
+    await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Расписание", callback_data="today"),
+         InlineKeyboardButton(text="О группе", callback_data="groupinfo")],
+        [InlineKeyboardButton(text="Главное меню", callback_data="menu")],
+    ]))
+
+
+@dp.callback_query(F.data == "groupinfo")
+async def cb_group_info(callback: CallbackQuery):
+    await callback.answer()
+    await _send_group_info(callback, get_group(_selected_group_id(callback)))
+
+
+@dp.callback_query(F.data == "menu")
+async def cb_menu(callback: CallbackQuery):
+    await callback.answer()
+    group = get_group(_selected_group_id(callback))
+    await callback.message.answer(
+        f"{premium_title(BOT_NAME)}\nГруппа: <b>{html.escape(group.name)}</b>",
+        reply_markup=main_keyboard(_is_subscribed(callback.message.chat.id)),
+    )
+
+
+@dp.callback_query(F.data == "notifications")
+async def cb_notifications(callback: CallbackQuery):
+    settings = get_user_settings(callback.message.chat.id)
+    staff_id = settings.get("staff_id") if settings.get("role") == "teacher" else None
+    if staff_id:
+        enabled = teacher_subscription(callback.message.chat.id, staff_id)
+        member = STAFF_BY_ID.get(staff_id)
+        text = f"<b>Уведомления</b>\nПреподаватель: {member.full_name if member else staff_id}"
+    else:
+        enabled = _is_subscribed(callback.message.chat.id)
+        text = f"<b>Уведомления</b>\nГруппа: {get_group(settings['group_id']).name}\nНовое и изменённое расписание."
+    await callback.answer()
+    await callback.message.answer(text, reply_markup=notification_keyboard(enabled, staff_id))
+
+
+@dp.callback_query(F.data == "teacher")
+async def cb_teacher(callback: CallbackQuery):
+    save_user_profile(callback.from_user, callback.message.chat.id)
+    set_pending_action(callback.message.chat.id, "teacher_search")
+    await callback.answer()
+    await callback.message.answer(
+        "<b>Расписание преподавателя</b>\nОтправьте фамилию или ФИО."
+    )
+
+
+@dp.callback_query(F.data.startswith("teacher:notify:"))
+async def cb_teacher_notify(callback: CallbackQuery):
+    try:
+        _, _, raw_id, raw_enabled = callback.data.split(":")
+        staff_id, enabled = int(raw_id), bool(int(raw_enabled))
+        member = STAFF_BY_ID[staff_id]
+    except (ValueError, KeyError, AttributeError):
+        await callback.answer("Преподаватель не найден", show_alert=True)
+        return
+    set_user_staff(callback.message.chat.id, staff_id)
+    subscribe_teacher(callback.message.chat.id, staff_id, enabled)
+    await callback.answer("Уведомления включены" if enabled else "Уведомления отключены")
+    await callback.message.answer(
+        f"<b>{member.full_name}</b>\n" +
+        ("Новое и изменённое расписание будет приходить в этот чат." if enabled
+         else "Уведомления отключены."),
+        reply_markup=notification_keyboard(enabled, staff_id),
+    )
 
 
 def _parse_staff_callback(data: str, prefix: str = "staff"):
@@ -6174,6 +7246,8 @@ async def cb_staff_pick(callback: CallbackQuery):
         await callback.answer("Некорректный преподаватель", show_alert=True)
         return
     member, target_day = parsed
+    save_user_profile(callback.from_user, callback.message.chat.id)
+    set_user_staff(callback.message.chat.id, member.staff_id)
     await callback.answer()
     await _send_staff_schedule(callback, member, target_day, edit_existing=False)
 
@@ -6212,21 +7286,28 @@ async def cb_legacy_days(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "subscribe")
 async def cb_subscribe(callback: CallbackQuery):
+    if not await _callback_can_manage(callback):
+        await callback.answer("Настройки изменяет администратор", show_alert=True)
+        return
     await callback.answer()
     chat = callback.message.chat
+    group_id = _selected_group_id(callback)
     if subscribe_user(
-        chat.id, chat_type=chat.type, title=chat.title or ""
+        chat.id, chat_type=chat.type, title=chat.title or "", group_id=group_id
     ):
-        await callback.message.answer("🔔 <b>Уведомления включены.</b>")
+        await callback.message.answer(f"<b>Уведомления включены</b>\nГруппа: {get_group(group_id).name}")
     else:
-        await callback.message.answer("🔔 Этот чат уже подписан.")
+        await callback.message.answer(f"Уведомления уже включены\nГруппа: {get_group(group_id).name}")
 
 
 @dp.callback_query(F.data == "unsubscribe")
 async def cb_unsubscribe(callback: CallbackQuery):
+    if not await _callback_can_manage(callback):
+        await callback.answer("Настройки изменяет администратор", show_alert=True)
+        return
     await callback.answer()
     if unsubscribe_user(callback.message.chat.id):
-        await callback.message.answer("🔕 <b>Уведомления отключены.</b>")
+        await callback.message.answer("<b>Уведомления отключены</b>")
     else:
         await callback.message.answer("Этот чат не был подписан.")
 
@@ -6239,16 +7320,11 @@ async def cb_status(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "date")
 async def cb_date(callback: CallbackQuery):
+    save_user_profile(callback.from_user, callback.message.chat.id)
+    set_pending_action(callback.message.chat.id, "date")
     await callback.answer()
     await callback.message.answer(
-        "🔎 <b>Поиск расписания по дате</b>\n\n"
-        "Отправь команду <code>/date ДАТА</code>.\n\n"
-        "Примеры:\n"
-        "• <code>/date 04.09.2026</code>\n"
-        "• <code>/date 2026-09-04</code>\n"
-        "• <code>/date 4 сентября</code>\n"
-        "• <code>/date понедельник</code>\n"
-        "• <code>/date завтра</code>"
+        "<b>Расписание по дате</b>\nОтправьте дату: 10.11.2026, 4 сентября или «завтра»."
     )
 
 
@@ -6256,22 +7332,11 @@ async def cb_date(callback: CallbackQuery):
 async def cb_help(callback: CallbackQuery):
     await callback.answer()
     await callback.message.answer(
-        f"🆘 <b>Помощь</b>\n\n"
-        f"Я показываю расписание группы <b>{GROUP_NAME}</b>.\n\n"
-        f"• /today — расписание только на сегодня\n"
-        f"• /schedule — расписание только на завтра\n"
-        f"• Просто напиши «расписание» или «расписание на дату» "
-        f"(без слэша)\n"
-        f"• Для преподавателя: «расписание преподавателя Фамилия» "
-        f"или «расписание Фамилия на сегодня»\n"
-        f"• /date ДАТА — расписание на любую дату "
-        f"(например <code>/date сегодня</code>)\n"
-        f"• /subscribe — уведомления об изменениях\n"
-        f"• /unsubscribe — отключить уведомления\n"
-        f"• /status — статус чата\n\n"
-        f"Примеры /date: <code>сегодня</code>, <code>04.09.2026</code>, "
-        f"<code>2026-09-04</code>, <code>4 сентября</code>, "
-        f"<code>понедельник</code>."
+        "<b>Помощь</b>\n\n"
+        "Основные действия доступны кнопками главного меню.\n"
+        "«Сменить группу» — фильтры по курсу и форме обучения.\n"
+        "«Преподаватели» — поиск по фамилии и отдельные уведомления.\n\n"
+        "Команды: /today, /schedule, /date, /groups, /teacher, /subscribe, /status."
     )
 
 
@@ -6647,16 +7712,16 @@ def _notification_caption(
     else:
         day_str = label  # полный заголовок, без дублирования
     if first_time:
-        action = "🆕 <b>Расписание опубликовано!</b>"
+        action = "<b>Расписание опубликовано</b>"
     else:
-        action = "🔄 <b>Расписание изменилось!</b>"
+        action = "<b>Расписание изменилось</b>"
 
     lines = [
         action,
         "",
-        f"📅 {day_str}",
-        f"👥 Группа: <b>{schedule.group}</b>",
-        f"🕐 Занятий: {count_lessons(schedule)}",
+        day_str,
+        f"Группа: <b>{html.escape(schedule.group)}</b>",
+        f"Занятий: {count_lessons(schedule)}",
     ]
 
     if not first_time and changes:
@@ -6674,6 +7739,8 @@ async def _notify_changed(
     signature: str,
     first_time: bool,
     changes=None,
+    target_key: Optional[str] = None,
+    subscribers: Optional[list] = None,
 ) -> int:
     """Отправляет актуальное расписание ТЕМ, кто его ещё не получил.
 
@@ -6682,12 +7749,13 @@ async def _notify_changed(
     hash, поэтому повторных уведомлений не будет, а сбой у одного
     получателя не считается доставкой.
     """
-    subscribers = load_subscribers()
+    target_key = target_key or schedule_target_key(schedule)
+    subscribers = load_subscribers() if subscribers is None else subscribers
     if not subscribers:
         return 0, 0
 
     date_key = day.isoformat()
-    notifications = load_schedule_notifications().get(date_key, {})
+    notifications = load_schedule_notifications(target_key).get(date_key, {})
     pending = [
         user_id
         for user_id in subscribers
@@ -6721,7 +7789,7 @@ async def _notify_changed(
                     photo=FSInputFile(image_path),
                     caption=caption,
                 )
-                record_schedule_notification(user_id, date_key, signature)
+                record_schedule_notification(user_id, date_key, signature, target_key)
                 delivered += 1
             except Exception as error:
                 text = str(error).lower()
@@ -6737,7 +7805,10 @@ async def _notify_changed(
                 ):
                     # Чат недоступен — подписка снимается, доставка
                     # ему больше не нужна.
-                    unsubscribe_user(user_id)
+                    if target_key.startswith("staff:"):
+                        subscribe_teacher(user_id, int(target_key.split(":", 1)[1]), False)
+                    else:
+                        unsubscribe_user(user_id)
                     logger.info(
                         "Чат %s недоступен — подписка снята.", user_id
                     )
@@ -6761,7 +7832,7 @@ async def _notify_changed(
     return delivered, still_pending
 
 
-async def _check_date(bot: Bot, day: date) -> None:
+async def _check_date(bot: Bot, day: date, group_id: Optional[int] = None) -> None:
     """Проверка расписания на КОНКРЕТНУЮ дату.
 
     Сценарии:
@@ -6774,14 +7845,20 @@ async def _check_date(bot: Bot, day: date) -> None:
                                     повторим в следующем цикле.
     """
     date_key = day.isoformat()
+    group = get_group(group_id)
+    target_key = f"group:{group.id}"
+    state_key = date_key if group.id == GROUP_ID else f"{target_key}:{date_key}"
 
     if is_day_off(day):
         logger.info("Проверка %s: воскресенье, пропускаем.", date_key)
         return
 
-    subscribers = load_subscribers()
+    subscribers = load_subscribers(group.id)
+    should_prewarm = bool(subscribers) or cache_has_image(target_key, day)
     try:
-        schedule = await get_schedule(day)
+        schedule = (await get_schedule(day) if group.id == GROUP_ID
+                    else await get_schedule(day, group.id))
+        save_schedule_cache(schedule)
     except ScheduleUnavailable:
         # Ошибка загрузки/парсинга — не считается изменением и также не
         # завершает backfill/историю.
@@ -6815,7 +7892,7 @@ async def _check_date(bot: Bot, day: date) -> None:
     logger.info("Hash расписания %s: %s", date_key, signature)
 
     state = load_state()
-    old_state = state.get(date_key)
+    old_state = state.get(state_key)
     old_hash = old_state.get("hash") if old_state else None
 
     if old_hash == signature:
@@ -6835,7 +7912,7 @@ async def _check_date(bot: Bot, day: date) -> None:
                 date_key,
             )
         else:
-            old_schedule = schedule_from_storage(old_data, day)
+            old_schedule = schedule_from_storage(old_data, day, group=group.name)
             changes = compare_schedules(old_schedule, schedule)
             logger.info(
                 "Найдено изменений %s: %s", date_key, len(changes)
@@ -6848,6 +7925,9 @@ async def _check_date(bot: Bot, day: date) -> None:
         f"занятий: {count_lessons(schedule)}, изменений: {len(changes)}",
     )
 
+    if should_prewarm:
+        await get_cached_image(schedule)
+
     delivered, still_pending = await _notify_changed(
         bot,
         schedule,
@@ -6855,6 +7935,8 @@ async def _check_date(bot: Bot, day: date) -> None:
         signature,
         first_time,
         changes=changes,
+        target_key=target_key,
+        subscribers=subscribers,
     )
 
     # Состояние фиксируем только когда расписание реально ушло всем
@@ -6862,7 +7944,7 @@ async def _check_date(bot: Bot, day: date) -> None:
     # Если хоть один получатель не получил уведомление — состояние не
     # обновляется, и в следующем цикле отправка повторится только ему.
     if still_pending == 0:
-        state[date_key] = {
+        state[state_key] = {
             "hash": signature,
             "data": normalize_schedule(schedule),
         }
@@ -6878,6 +7960,47 @@ async def _check_date(bot: Bot, day: date) -> None:
             still_pending,
             delivered,
         )
+
+
+def load_monitored_staff_ids() -> list[int]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT DISTINCT staff_id FROM teacher_subscribers ORDER BY staff_id").fetchall()
+    return [int(row["staff_id"]) for row in rows]
+
+
+async def _check_staff_date(bot: Bot, staff_id: int, day: date) -> None:
+    if is_day_off(day):
+        return
+    subscribers = load_teacher_subscribers(staff_id)
+    if not subscribers:
+        return
+    target_key = f"staff:{staff_id}"
+    state_key = f"{target_key}:{day.isoformat()}"
+    try:
+        schedule = await get_staff_schedule(staff_id, day)
+        save_schedule_cache(schedule)
+    except ScheduleUnavailable:
+        return
+    if not schedule.lessons:
+        return
+    signature = schedule_signature(schedule)
+    state = load_state()
+    old_state = state.get(state_key)
+    if old_state and old_state.get("hash") == signature:
+        return
+    first_time = old_state is None
+    changes = []
+    if old_state and old_state.get("data") is not None:
+        old = schedule_from_storage(old_state["data"], day, group=schedule.group)
+        changes = compare_schedules(old, schedule)
+    await get_cached_image(schedule)
+    delivered, pending = await _notify_changed(
+        bot, schedule, day, signature, first_time, changes,
+        target_key=target_key, subscribers=subscribers,
+    )
+    if pending == 0:
+        state[state_key] = {"hash": signature, "data": normalize_schedule(schedule)}
+        save_state(state)
 
 
 # ============================================================
@@ -6898,7 +8021,11 @@ async def schedule_monitor(bot: Bot) -> None:
     )
 
     birthday_checked_dates: set[str] = set()
+    catalog_refreshed_at = time.monotonic()
     while True:
+        if time.monotonic() - catalog_refreshed_at >= GROUP_CATALOG_TTL:
+            await refresh_group_catalog()
+            catalog_refreshed_at = time.monotonic()
         # Разовый пересчёт изученного времени после миграции истории на
         # запись по подгруппам (срабатывает один раз, дальше — пустой флаг).
         try:
@@ -6915,18 +8042,27 @@ async def schedule_monitor(bot: Bot) -> None:
 
         # Каждый цикл даты вычисляются заново через Asia/Yekaterinburg.
         today = get_today()
-        for day, label in (
-            (today, "сегодня"),
-            (get_tomorrow(), "завтра"),
-        ):
-            try:
-                await _check_date(bot, day)
-            except Exception:
-                logger.exception(
-                    "Ошибка проверки расписания на %s (%s)",
-                    label,
-                    day.isoformat(),
-                )
+        days = (today, get_tomorrow())
+        semaphore = asyncio.Semaphore(MONITOR_CONCURRENCY)
+
+        async def guarded(check, *args):
+            async with semaphore:
+                try:
+                    await check(*args)
+                except Exception:
+                    logger.exception("Ошибка фоновой проверки: %s", args)
+
+        jobs = []
+        monitored_groups = [GROUP_ID] + [
+            group_id for group_id in sorted(GROUPS) if group_id != GROUP_ID
+        ]
+        for day in days:
+            for group_id in monitored_groups:
+                jobs.append(guarded(_check_date, bot, day, group_id))
+            for staff_id in load_monitored_staff_ids():
+                jobs.append(guarded(_check_staff_date, bot, staff_id, day))
+        if jobs:
+            await asyncio.gather(*jobs)
 
         if today.isoformat() not in birthday_checked_dates:
             try:
@@ -6949,7 +8085,9 @@ async def schedule_monitor(bot: Bot) -> None:
 COMMANDS = [
     BotCommand(command="today", description="Расписание на сегодня"),
     BotCommand(command="schedule", description="Расписание на завтра"),
-    BotCommand(command="date", description="Поиск расписания по дате"),
+    BotCommand(command="date", description="Расписание по дате"),
+    BotCommand(command="groups", description="Выбрать группу"),
+    BotCommand(command="teacher", description="Расписание преподавателя"),
     BotCommand(command="subscribe", description="Включить уведомления"),
     BotCommand(command="unsubscribe", description="Отключить уведомления"),
     BotCommand(command="status", description="Статус подписки"),
@@ -6973,8 +8111,8 @@ async def _setup_commands(bot: Bot) -> None:
 
 async def main() -> None:
     logger.info("=" * 60)
-    logger.info("Бот расписания группы %s", GROUP_NAME)
-    logger.info("Group ID: %s", GROUP_ID)
+    logger.info("Глобальный бот расписания: %s групп", len(GROUPS))
+    logger.info("Legacy Group ID: %s", GROUP_ID)
     logger.info("URL: %s", BASE_URL)
     logger.info("Check interval: %s сек (%s мин)", CHECK_INTERVAL, CHECK_INTERVAL // 60)
     logger.info("Timezone: %s (UTC+5)", TIMEZONE)
@@ -6985,6 +8123,8 @@ async def main() -> None:
             "или окружение."
         )
         return
+
+    await refresh_group_catalog()
 
     # Проверяем шрифты до старта бота.
     try:
