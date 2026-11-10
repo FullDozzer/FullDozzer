@@ -72,6 +72,9 @@ from aiogram.types import (
 from college import (
     FALLBACK_GROUPS,
     GroupInfo,
+    available_courses,
+    available_specialties,
+    group_specialty,
     groups_from_payload,
     groups_to_payload,
     parse_groups_payload,
@@ -1769,6 +1772,60 @@ def _migrate_lesson_history(conn: sqlite3.Connection) -> None:
         _meta_set(conn, "schema_version", str(SCHEMA_VERSION))
 
 
+def _migrate_user_settings(conn: sqlite3.Connection) -> None:
+    """Переводит user_settings на nullable group_id без DEFAULT 508
+    и переносит существующих подписчиков старой версии на legacy GROUP_ID.
+    """
+    _ensure_meta_table(conn)
+
+    columns = {
+        row["name"]: dict(row)
+        for row in conn.execute("PRAGMA table_info(user_settings)")
+    }
+    group_col = columns.get("group_id")
+    if group_col and (group_col.get("notnull") or group_col.get("dflt_value") is not None):
+        logger.info("Миграция user_settings: group_id поддерживает NULL без DEFAULT 508")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_settings_v2 (
+                chat_id INTEGER PRIMARY KEY,
+                group_id INTEGER,
+                staff_id INTEGER,
+                role TEXT NOT NULL DEFAULT 'student',
+                pending_action TEXT NOT NULL DEFAULT '',
+                display_name TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO user_settings_v2
+                (chat_id, group_id, staff_id, role, pending_action,
+                 display_name, username, updated_at)
+            SELECT chat_id, group_id, staff_id, role, pending_action,
+                   display_name, username, updated_at
+            FROM user_settings
+            """
+        )
+        conn.execute("DROP TABLE user_settings")
+        conn.execute("ALTER TABLE user_settings_v2 RENAME TO user_settings")
+
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO user_settings (chat_id, group_id, updated_at)
+        SELECT s.user_id, ?, COALESCE(NULLIF(s.created_at, ''), ?)
+        FROM subscribers s
+        LEFT JOIN user_settings u ON u.chat_id = s.user_id
+        WHERE u.chat_id IS NULL
+        """,
+        (GROUP_ID, stamp),
+    )
+    _meta_set(conn, "legacy_subscribers_migrated", "1")
+
+
 def init_db() -> None:
     try:
         with db_connect() as conn:
@@ -1916,12 +1973,12 @@ def init_db() -> None:
                 """
             )
 
-            # Персональный выбор студента/преподавателя. Старые подписчики
-            # без строки автоматически относятся к прежней GROUP_ID.
+            # Персональный выбор студента/преподавателя. У новых пользователей
+            # group_id = NULL до явного выбора; старые подписчики мигрируются.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_settings (
                     chat_id INTEGER PRIMARY KEY,
-                    group_id INTEGER NOT NULL DEFAULT 508,
+                    group_id INTEGER,
                     staff_id INTEGER,
                     role TEXT NOT NULL DEFAULT 'student',
                     pending_action TEXT NOT NULL DEFAULT '',
@@ -2005,6 +2062,7 @@ def init_db() -> None:
 
             # Миграция истории занятий на схему v2 выполняется в самом
             # конце: ей нужны уже созданные lesson_backfill_days/bot_meta.
+            _migrate_user_settings(conn)
             _migrate_lesson_history(conn)
             conn.execute(
                 """
@@ -2029,8 +2087,14 @@ def subscribe_user(
 ) -> bool:
     """Добавляет подписчика (ЛС или групповой чат).
 
-    True если добавлен, False если уже был.
+    True если добавлен, False если уже был или группа не выбрана.
     """
+    target_group_id = group_id
+    if target_group_id is None:
+        target_group_id = get_user_settings(user_id).get("group_id")
+    if target_group_id is None:
+        return False
+    target_group_id = int(target_group_id)
     created = now_local().strftime("%Y-%m-%d %H:%M:%S")
     added = False
     try:
@@ -2047,7 +2111,7 @@ def subscribe_user(
                     "UPDATE subscribers SET chat_type = ?, title = ? WHERE user_id = ?",
                     (chat_type, title or "", user_id),
                 )
-        set_user_group(user_id, int(group_id or GROUP_ID))
+        set_user_group(user_id, target_group_id)
         return added
     except Exception:
         logger.exception("Ошибка SQLite (subscribe)")
@@ -2074,7 +2138,8 @@ def load_subscribers(group_id: Optional[int] = None) -> list:
             rows = conn.execute(
                 "SELECT s.user_id FROM subscribers s "
                 "LEFT JOIN user_settings u ON u.chat_id = s.user_id "
-                "WHERE COALESCE(u.group_id, ?) = ? ORDER BY s.user_id",
+                "WHERE (CASE WHEN u.chat_id IS NULL THEN ? ELSE u.group_id END) = ? "
+                "ORDER BY s.user_id",
                 (GROUP_ID, selected_id),
             ).fetchall()
             return [int(row["user_id"]) for row in rows]
@@ -2104,7 +2169,7 @@ def get_user_settings(chat_id: int) -> dict:
     if row:
         return dict(row)
     return {
-        "chat_id": chat_id, "group_id": GROUP_ID, "staff_id": None,
+        "chat_id": chat_id, "group_id": None, "staff_id": None,
         "role": "student", "pending_action": "", "display_name": "",
         "username": "",
     }
@@ -2114,15 +2179,16 @@ def save_user_profile(user, chat_id: Optional[int] = None) -> None:
     if user is None:
         return
     stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    target_chat_id = chat_id if chat_id is not None else user.id
     with db_connect() as conn:
         conn.execute("""
             INSERT INTO user_settings
                 (chat_id, group_id, display_name, username, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, NULL, ?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
                 display_name = excluded.display_name,
                 username = excluded.username, updated_at = excluded.updated_at
-        """, (chat_id or user.id, GROUP_ID, user.full_name or "",
+        """, (target_chat_id, user.full_name or "",
               user.username or "", stamp))
 
 
@@ -2135,7 +2201,7 @@ def set_user_group(chat_id: int, group_id: int) -> None:
             ON CONFLICT(chat_id) DO UPDATE SET
                 group_id = excluded.group_id, role = 'student',
                 staff_id = NULL, updated_at = excluded.updated_at
-        """, (chat_id, group_id, stamp))
+        """, (chat_id, int(group_id), stamp))
 
 
 def set_user_staff(chat_id: int, staff_id: int) -> None:
@@ -2151,11 +2217,29 @@ def set_user_staff(chat_id: int, staff_id: int) -> None:
 
 
 def set_pending_action(chat_id: int, action: str = "") -> None:
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
     with db_connect() as conn:
-        conn.execute(
-            "UPDATE user_settings SET pending_action = ? WHERE chat_id = ?",
-            (action, chat_id),
-        )
+        conn.execute("""
+            INSERT INTO user_settings (chat_id, group_id, pending_action, updated_at)
+            VALUES (?, NULL, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                pending_action = excluded.pending_action,
+                updated_at = excluded.updated_at
+        """, (chat_id, action, stamp))
+
+
+def active_group_ids() -> list[int]:
+    with db_connect() as conn:
+        rows = conn.execute("""
+            SELECT DISTINCT group_id FROM (
+                SELECT group_id FROM user_settings WHERE group_id IS NOT NULL
+                UNION
+                SELECT ? AS group_id FROM subscribers s
+                LEFT JOIN user_settings u ON u.chat_id = s.user_id
+                WHERE u.chat_id IS NULL
+            ) ORDER BY group_id
+        """, (GROUP_ID,)).fetchall()
+    return [int(row["group_id"]) for row in rows if int(row["group_id"]) in GROUPS]
 
 
 def subscribe_teacher(chat_id: int, staff_id: int, enabled: bool = True) -> None:
@@ -5697,12 +5781,14 @@ def render_status_image(chat_id: int) -> Path:
     что бот использует сейчас.
     """
     try:
-        group = get_group(get_user_settings(chat_id)["group_id"])
-        forecast = get_study_forecast(group.name)
+        settings = get_user_settings(chat_id)
+        group_id = settings.get("group_id")
+        group = get_group(group_id) if group_id is not None else None
+        forecast = get_study_forecast(group.name) if group is not None else None
         runtime = get_runtime_stats()
         db_stats = _database_stats()
         created = subscriber_info(chat_id)
-        subscribers_total = len(load_subscribers(group.id))
+        subscribers_total = len(load_subscribers(group.id)) if group is not None else None
 
         # Шрифты
         font_label = get_font(24, bold=True)
@@ -5735,40 +5821,45 @@ def render_status_image(chat_id: int) -> Path:
         now = now_local()
 
         # ---------- карточка «Учёба» ----------
-        study_headline = study_badge_text(forecast)
-        if forecast.studied_minutes <= 0:
-            study_note = "Прогноз появится после первых завершённых занятий"
-        elif not forecast.remaining_minutes:
-            study_note = "Учебный год завершён"
+        if forecast is None:
+            study_headline = "Группа не выбрана"
+            study_note = "Выберите группу, чтобы видеть прогресс учёбы"
+            study_rows = []
         else:
-            study_note = ""
+            study_headline = study_badge_text(forecast)
+            if forecast.studied_minutes <= 0:
+                study_note = "Прогноз появится после первых завершённых занятий"
+            elif not forecast.remaining_minutes:
+                study_note = "Учебный год завершён"
+            else:
+                study_note = ""
 
-        study_rows = []
-        if forecast.remaining_minutes:
-            study_rows.append(
-                ("Прогноз на учебный год",
-                 f"≈ {format_academic_hours(forecast.total_minutes)}")
-            )
-            study_rows.append(
-                ("Осталось при текущем темпе",
-                 f"≈ {format_academic_hours(forecast.remaining_minutes)}")
-            )
-            if forecast.pace_minutes_per_day:
+            study_rows = []
+            if forecast.remaining_minutes:
                 study_rows.append(
-                    ("Темп",
-                     f"≈ {format_academic_hours(int(round(forecast.pace_minutes_per_day)))}"
-                     " в учебный день")
+                    ("Прогноз на учебный год",
+                     f"≈ {format_academic_hours(forecast.total_minutes)}")
                 )
-        study_rows.append(
-            ("Учебные дни (с 1 сентября по 30 июня)",
-             f"пройдено {forecast.elapsed_study_days}"
-             f" · осталось {forecast.remaining_study_days}")
-        )
-        if forecast.elapsed_study_days:
+                study_rows.append(
+                    ("Осталось при текущем темпе",
+                     f"≈ {format_academic_hours(forecast.remaining_minutes)}")
+                )
+                if forecast.pace_minutes_per_day:
+                    study_rows.append(
+                        ("Темп",
+                         f"≈ {format_academic_hours(int(round(forecast.pace_minutes_per_day)))}"
+                         " в учебный день")
+                    )
             study_rows.append(
-                ("Дней с занятиями",
-                 f"{forecast.active_days} из {forecast.elapsed_study_days}")
+                ("Учебные дни (с 1 сентября по 30 июня)",
+                 f"пройдено {forecast.elapsed_study_days}"
+                 f" · осталось {forecast.remaining_study_days}")
             )
+            if forecast.elapsed_study_days:
+                study_rows.append(
+                    ("Дней с занятиями",
+                     f"{forecast.active_days} из {forecast.elapsed_study_days}")
+                )
 
         # ---------- карточка «Ресурсы» ----------
         res_rows = [("Аптайм", format_uptime(runtime["uptime_seconds"]))]
@@ -5796,11 +5887,13 @@ def render_status_image(chat_id: int) -> Path:
 
         # ---------- карточка «Подписки» ----------
         sub_rows = []
-        if created:
+        if created and group is not None:
             sub_rows.append(("Этот чат", f"подписан · с {created}"))
         else:
             sub_rows.append(("Этот чат", "не подписан"))
-        sub_rows.append(("Всего подписок", str(subscribers_total)))
+        sub_rows.append(
+            ("Всего подписок", str(subscribers_total) if subscribers_total is not None else "—")
+        )
         sub_rows.append(
             ("Проверка изменений", f"каждые {CHECK_INTERVAL // 60} мин")
         )
@@ -5824,7 +5917,7 @@ def render_status_image(chat_id: int) -> Path:
             height += len(rows) * row_h + max(0, len(rows) - 1) * row_gap
             return height + card_bottom
 
-        show_bar = forecast.total_minutes > 0 and forecast.studied_minutes > 0
+        show_bar = bool(forecast and forecast.total_minutes > 0 and forecast.studied_minutes > 0)
         cards = [
             ("УЧЁБА", study_rows,
              {"big": study_headline, "note": study_note, "bar": show_bar}),
@@ -5838,7 +5931,7 @@ def render_status_image(chat_id: int) -> Path:
 
         # Сноска про академический час — та же, что на картинке
         # расписания: единая точка формирования study_note_lines().
-        note_lines = study_note_lines(forecast)
+        note_lines = study_note_lines(forecast) if forecast is not None else []
         font_note = get_font(21)
         note_gap = 34
         note_line_gap = 8
@@ -5866,7 +5959,7 @@ def render_status_image(chat_id: int) -> Path:
         draw.text((MARGIN + 20, 40), "СОСТОЯНИЕ БОТА",
                   font=font_label, fill=COL_ACCENT)
 
-        big_title = group.name
+        big_title = group.name if group is not None else "Группа не выбрана"
         big_font = font_group
         chip_text = "РАБОТАЕТ"
         chip_pad_x = 26
@@ -6027,13 +6120,14 @@ def staff_choice_keyboard(matches: list[StaffMember], target_day: date) -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def main_keyboard(is_subscribed: bool) -> InlineKeyboardMarkup:
+def main_keyboard(is_subscribed: bool, has_group: bool = True) -> InlineKeyboardMarkup:
+    group_button_text = "Сменить группу" if has_group else "Выбрать группу"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Сегодня", callback_data="today"),
          InlineKeyboardButton(text="Завтра", callback_data="schedule")],
         [InlineKeyboardButton(text="По дате", callback_data="date"),
          InlineKeyboardButton(text="О группе", callback_data="groupinfo")],
-        [InlineKeyboardButton(text="Сменить группу", callback_data="groups"),
+        [InlineKeyboardButton(text=group_button_text, callback_data="groups"),
          InlineKeyboardButton(text="Преподаватели", callback_data="teacher")],
         [InlineKeyboardButton(
             text="Уведомления: вкл." if is_subscribed else "Уведомления: выкл.",
@@ -6044,8 +6138,89 @@ def main_keyboard(is_subscribed: bool) -> InlineKeyboardMarkup:
     ])
 
 
-def group_catalog_keyboard(course: Optional[int] = None, form: str = "all",
-                           page: int = 0) -> InlineKeyboardMarkup:
+def _spec_token(specialty: str) -> str:
+    candidate = f"groups:spec:99:{specialty}:999"
+    if ":" not in specialty and not specialty.startswith("#") and len(candidate.encode("utf-8")) <= 64:
+        return specialty
+    return "#" + hashlib.sha1(specialty.encode("utf-8")).hexdigest()[:10]
+
+
+def _resolve_specialty_token(course: int, token: str) -> Optional[str]:
+    specs = available_specialties(GROUPS, course=course)
+    if token.startswith("#"):
+        digest = token[1:]
+        for spec in specs:
+            if hashlib.sha1(spec.encode("utf-8")).hexdigest()[:10] == digest:
+                return spec
+        return None
+    for spec in specs:
+        if spec.casefold() == token.casefold():
+            return spec
+    return None
+
+
+def group_course_keyboard(include_menu: bool = True) -> InlineKeyboardMarkup:
+    courses = available_courses(GROUPS)
+    rows = []
+    for offset in range(0, len(courses), 2):
+        chunk = courses[offset:offset + 2]
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{course} курс",
+                callback_data=f"groups:course:{course}",
+            )
+            for course in chunk
+        ])
+    footer = [InlineKeyboardButton(text="Преподаватели", callback_data="teacher")]
+    if include_menu:
+        footer.append(InlineKeyboardButton(text="Главное меню", callback_data="menu"))
+    rows.append(footer)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def group_specialty_keyboard(course: int) -> InlineKeyboardMarkup:
+    specs = available_specialties(GROUPS, course=course)
+    per_row = 2 if any(len(spec) > 8 for spec in specs) else 3
+    rows = []
+    for offset in range(0, len(specs), per_row):
+        chunk = specs[offset:offset + per_row]
+        rows.append([
+            InlineKeyboardButton(
+                text=spec,
+                callback_data=f"groups:spec:{course}:{_spec_token(spec)}:0",
+            )
+            for spec in chunk
+        ])
+    rows.append([InlineKeyboardButton(text="← Назад к курсам", callback_data="groups:courses")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def group_list_keyboard(course: int, specialty: str, page: int = 0) -> InlineKeyboardMarkup:
+    values = sorted_groups(GROUPS, course=course, specialty=specialty)
+    per_page = 8
+    pages = max(1, (len(values) + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    spec_token = _spec_token(specialty)
+    rows = []
+    for offset in range(page * per_page, min(len(values), (page + 1) * per_page), 2):
+        chunk = values[offset:offset + 2]
+        rows.append([
+            InlineKeyboardButton(text=item.name, callback_data=f"group:set:{item.id}")
+            for item in chunk
+        ])
+    if pages > 1:
+        rows.append([
+            InlineKeyboardButton(text="←", callback_data=f"groups:spec:{course}:{spec_token}:{max(0, page - 1)}"),
+            InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="groups:noop"),
+            InlineKeyboardButton(text="→", callback_data=f"groups:spec:{course}:{spec_token}:{min(pages - 1, page + 1)}"),
+        ])
+    rows.append([InlineKeyboardButton(text="← Назад к специальностям", callback_data=f"groups:course:{course}")])
+    rows.append([InlineKeyboardButton(text="← Назад к курсам", callback_data="groups:courses")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _legacy_group_catalog_keyboard(course: Optional[int] = None, form: str = "all",
+                                   page: int = 0) -> InlineKeyboardMarkup:
     correspondence = None if form == "all" else form == "correspondence"
     values = sorted_groups(GROUPS, course=course, correspondence=correspondence)
     per_page = 8
@@ -6062,14 +6237,20 @@ def group_catalog_keyboard(course: Optional[int] = None, form: str = "all",
             InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="groups:noop"),
             InlineKeyboardButton(text="→", callback_data=f"groups:list:{course or 0}:{form}:{min(pages - 1, page + 1)}"),
         ])
-    rows.append([InlineKeyboardButton(text="Все формы", callback_data=f"groups:list:{course or 0}:all:0"),
-                 InlineKeyboardButton(text="Очная", callback_data=f"groups:list:{course or 0}:fulltime:0"),
-                 InlineKeyboardButton(text="Заочная", callback_data=f"groups:list:{course or 0}:correspondence:0")])
-    rows.append([InlineKeyboardButton(text=f"{number} курс" if number else "Все курсы",
-                                      callback_data=f"groups:list:{number}:{form}:0")
-                 for number in (0, 1, 2, 3, 4)])
+    rows.append([InlineKeyboardButton(text="← Назад к курсам", callback_data="groups:courses")])
     rows.append([InlineKeyboardButton(text="Главное меню", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def group_catalog_keyboard(course: Optional[int] = None, form: str = "all",
+                           page: int = 0, specialty: Optional[str] = None) -> InlineKeyboardMarkup:
+    if form != "all":
+        return _legacy_group_catalog_keyboard(course=course, form=form, page=page)
+    if course is None:
+        return group_course_keyboard()
+    if specialty is None:
+        return group_specialty_keyboard(course)
+    return group_list_keyboard(course, specialty, page=page)
 
 
 def notification_keyboard(enabled: bool, staff_id: Optional[int] = None) -> InlineKeyboardMarkup:
@@ -6170,7 +6351,7 @@ async def _send_photo(destination, schedule: Schedule, reply_markup=None) -> boo
         kwargs = {"caption": caption}
         if reply_markup is not None:
             kwargs["reply_markup"] = reply_markup
-        if isinstance(destination, Message):
+        if _is_message_destination(destination):
             await destination.answer_photo(FSInputFile(path), **kwargs)
         else:
             await destination.message.answer_photo(FSInputFile(path), **kwargs)
@@ -6190,18 +6371,51 @@ async def _send_text(destination, text: str) -> None:
         logger.exception("Ошибка отправки текста")
 
 
-def _destination_chat_id(destination) -> int:
+def _destination_chat_id(destination) -> Optional[int]:
     chat = getattr(destination, "chat", None)
-    if chat is not None:
+    if chat is not None and getattr(chat, "id", None) is not None:
         return int(chat.id)
-    return int(destination.message.chat.id)
+    message = getattr(destination, "message", None)
+    msg_chat = getattr(message, "chat", None)
+    if msg_chat is not None and getattr(msg_chat, "id", None) is not None:
+        return int(msg_chat.id)
+    return None
 
 
-def _selected_group_id(destination) -> int:
-    try:
-        return int(get_user_settings(_destination_chat_id(destination))["group_id"])
-    except Exception:
+def _selected_group_id(destination) -> Optional[int]:
+    chat_id = _destination_chat_id(destination)
+    if chat_id is None:
+        # Не-Telegram объект без chat оставлен для legacy-интеграционных тестов.
         return GROUP_ID
+    group_id = get_user_settings(chat_id).get("group_id")
+    return int(group_id) if group_id is not None else None
+
+
+async def _prompt_group_selection(
+    destination,
+    prefix: str = "Сначала выберите группу.",
+) -> None:
+    text = f"<b>{html.escape(prefix)}</b>\n\n<b>Шаг 1 из 3 · Выберите курс:</b>"
+    markup = group_course_keyboard()
+    if _is_message_destination(destination):
+        await destination.answer(text, reply_markup=markup)
+    else:
+        await destination.message.answer(text, reply_markup=markup)
+
+
+async def _edit_or_answer(
+    callback: CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    msg = callback.message
+    if getattr(msg, "text", None) and hasattr(msg, "edit_text"):
+        try:
+            await msg.edit_text(text, reply_markup=reply_markup)
+            return
+        except Exception:
+            pass
+    await msg.answer(text, reply_markup=reply_markup)
 
 
 async def _schedule_for_destination(destination, day: date, group_id: int) -> Schedule:
@@ -6217,9 +6431,13 @@ async def _handle_today(destination):
     Никакого fallback на завтра/другую дату. Если расписания нет —
     сообщаем об этом.
     """
+    selected_group_id = _selected_group_id(destination)
+    if selected_group_id is None:
+        await _prompt_group_selection(destination)
+        return
     try:
         today = get_today()
-        group = get_group(_selected_group_id(destination))
+        group = get_group(selected_group_id)
         schedule = await _schedule_for_destination(destination, today, group.id)
         register_subjects_from_schedule(schedule)
         record_completed_lessons(schedule)
@@ -6253,9 +6471,13 @@ async def _handle_schedule(destination):
     Никакого fallback на сегодня/другую дату. Если расписания нет —
     сообщаем об этом.
     """
+    selected_group_id = _selected_group_id(destination)
+    if selected_group_id is None:
+        await _prompt_group_selection(destination)
+        return
     try:
         tomorrow = get_tomorrow()
-        group = get_group(_selected_group_id(destination))
+        group = get_group(selected_group_id)
         schedule = await _schedule_for_destination(destination, tomorrow, group.id)
         register_subjects_from_schedule(schedule)
         record_completed_lessons(schedule)
@@ -6285,7 +6507,11 @@ async def _handle_schedule(destination):
 
 async def _handle_date(destination, target: date):
     """Показывает расписание на конкретную дату (без подстановки «сегодня»)."""
-    group = get_group(_selected_group_id(destination))
+    selected_group_id = _selected_group_id(destination)
+    if selected_group_id is None:
+        await _prompt_group_selection(destination)
+        return
+    group = get_group(selected_group_id)
     try:
         if is_day_off(target):
             await _send_text(
@@ -6324,9 +6550,11 @@ async def _handle_date(destination, target: date):
 
 
 def _is_message_destination(destination) -> bool:
-    return isinstance(destination, Message) or (
-        hasattr(destination, "answer") and not isinstance(destination, CallbackQuery)
-    )
+    if isinstance(destination, Message):
+        return True
+    if isinstance(destination, CallbackQuery) or hasattr(destination, "message"):
+        return False
+    return hasattr(destination, "answer")
 
 
 async def _send_staff_schedule(
@@ -6431,15 +6659,29 @@ async def _handle_staff_request(destination, request: ScheduleTextRequest) -> No
                 text, reply_markup=staff_choice_keyboard(matches, target_day)
             )
         return
-    if isinstance(destination, (Message, CallbackQuery)):
-        set_user_staff(_destination_chat_id(destination), matches[0].staff_id)
+    chat_id = _destination_chat_id(destination)
+    if chat_id is not None:
+        set_user_staff(chat_id, matches[0].staff_id)
     await _send_staff_schedule(destination, matches[0], target_day)
 
 
 async def _status_text(chat_id: int) -> str:
     """Текстовый fallback картинки статуса (если PNG не сгенерировался)."""
     created = subscriber_info(chat_id)
-    group = get_group(get_user_settings(chat_id)["group_id"])
+    settings = get_user_settings(chat_id)
+    group_id = settings.get("group_id")
+    if group_id is None:
+        lines = [
+            "<b>Группа не выбрана</b>",
+            "—" * 18,
+            "Выберите группу: /groups",
+            f"Проверка изменений каждые {CHECK_INTERVAL // 60} мин.",
+            f"Часовой пояс: <b>{TIMEZONE}</b> (UTC+5)",
+            f"Аптайм: {format_uptime(time.monotonic() - _PROCESS_STARTED_MONOTONIC)}",
+        ]
+        return "\n".join(lines)
+
+    group = get_group(group_id)
     total = len(load_subscribers(group.id))
     forecast = get_study_forecast(group.name)
     lines = [
@@ -6471,11 +6713,15 @@ async def _status_text(chat_id: int) -> str:
 
 def _status_caption(chat_id: Optional[int] = None) -> str:
     """Короткая подпись к картинке статуса."""
-    group = get_group(get_user_settings(chat_id)["group_id"]) if chat_id is not None else get_group()
-    forecast = get_study_forecast(group.name)
-    lines = [f"<b>Статус бота</b> · <b>{html.escape(group.name)}</b>"]
-    if forecast.studied_minutes > 0:
-        lines.append(study_badge_text(forecast))
+    group_id = get_user_settings(chat_id).get("group_id") if chat_id is not None else GROUP_ID
+    if group_id is None:
+        lines = ["<b>Статус бота</b> · Группа не выбрана"]
+    else:
+        group = get_group(group_id)
+        forecast = get_study_forecast(group.name)
+        lines = [f"<b>Статус бота</b> · <b>{html.escape(group.name)}</b>"]
+        if forecast.studied_minutes > 0:
+            lines.append(study_badge_text(forecast))
     lines.append(
         "Аптайм: "
         f"{format_uptime(time.monotonic() - _PROCESS_STARTED_MONOTONIC)}"
@@ -6612,7 +6858,37 @@ async def cmd_start(message: Message):
     chat_id = message.chat.id
     save_user_profile(message.from_user, chat_id)
     set_pending_action(chat_id, "")
-    group = get_group(_selected_group_id(message))
+    selected_group_id = get_user_settings(chat_id).get("group_id")
+    is_help = (message.text or "").lstrip().lower().startswith("/help")
+    if is_help:
+        hint = (
+            "Группа ещё не выбрана — нажмите «Выбрать группу» или /groups.\n\n"
+            if selected_group_id is None
+            else ""
+        )
+        await message.answer(
+            f"{premium_title(BOT_NAME)}\n\n"
+            f"{hint}"
+            "Основные действия доступны кнопками главного меню.\n"
+            "«Выбрать группу» — пошаговый выбор: курс → специальность → группа.\n"
+            "«Преподаватели» — поиск по фамилии и отдельные уведомления.\n\n"
+            "Команды: /today, /schedule, /date, /groups, /teacher, /subscribe, /status.",
+            reply_markup=main_keyboard(
+                _is_subscribed(chat_id), has_group=selected_group_id is not None
+            ),
+        )
+        return
+
+    if selected_group_id is None:
+        text = (
+            f"{premium_title(BOT_NAME)}\n\n"
+            "Добро пожаловать! Для начала выберите вашу группу.\n\n"
+            "<b>Шаг 1 из 3 · Выберите курс:</b>"
+        )
+        await message.answer(text, reply_markup=group_course_keyboard(include_menu=False))
+        return
+
+    group = get_group(selected_group_id)
     text = (
         f"{premium_title(BOT_NAME)}\n\n"
         f"Группа: <b>{html.escape(group.name)}</b>\n"
@@ -6621,13 +6897,17 @@ async def cmd_start(message: Message):
         "По дате: <code>/date 10.11.2026</code>\n"
         "Текстом: «расписание на завтра»."
     )
-    await message.answer(text, reply_markup=main_keyboard(_is_subscribed(chat_id)))
+    await message.answer(text, reply_markup=main_keyboard(_is_subscribed(chat_id), has_group=True))
 
 
 @dp.message(BotCommandFilter("groups"))
 async def cmd_groups(message: Message):
     save_user_profile(message.from_user, message.chat.id)
-    await message.answer("<b>Выбор группы</b>", reply_markup=group_catalog_keyboard())
+    has_group = get_user_settings(message.chat.id).get("group_id") is not None
+    await message.answer(
+        "<b>Выбор группы</b>\nШаг 1 из 3 · Выберите курс:",
+        reply_markup=group_course_keyboard(include_menu=has_group),
+    )
 
 
 @dp.message(BotCommandFilter("teacher"))
@@ -6651,6 +6931,10 @@ async def cmd_schedule(message: Message):
 @dp.message(BotCommandFilter("date"))
 async def cmd_date(message: Message):
     """Поиск расписания по дате: /date 04.09.2026"""
+    if _selected_group_id(message) is None:
+        await _prompt_group_selection(message)
+        return
+
     parts = (message.text or "").split(maxsplit=1)
     argument = parts[1] if len(parts) > 1 else ""
 
@@ -6691,9 +6975,14 @@ async def cmd_subscribe(message: Message):
         )
         return
 
+    selected_group_id = _selected_group_id(message)
+    if selected_group_id is None:
+        await _prompt_group_selection(message)
+        return
+
     title = chat.title or chat.full_name or ""
 
-    selected_group = get_group(_selected_group_id(message))
+    selected_group = get_group(selected_group_id)
     if subscribe_user(chat.id, chat_type=chat.type, title=title, group_id=selected_group.id):
         where = "Этот чат" if is_group else "Вы"
         await message.answer(
@@ -7040,6 +7329,10 @@ async def cmd_text_schedule(message: Message):
         await _handle_staff_request(message, request)
         return
 
+    if _selected_group_id(message) is None:
+        await _prompt_group_selection(message)
+        return
+
     if request.error:
         await message.answer(SCHEDULE_TEXT_HELP)
         return
@@ -7105,9 +7398,59 @@ async def cb_groups_noop(callback: CallbackQuery):
 @dp.callback_query(F.data == "groups")
 async def cb_groups(callback: CallbackQuery):
     await callback.answer()
+    has_group = _selected_group_id(callback) is not None
     await callback.message.answer(
-        "<b>Выбор группы</b>\nФильтры: форма обучения и курс.",
-        reply_markup=group_catalog_keyboard(),
+        "<b>Выбор группы</b>\nШаг 1 из 3 · Выберите курс:",
+        reply_markup=group_course_keyboard(include_menu=has_group),
+    )
+
+
+@dp.callback_query(F.data == "groups:courses")
+async def cb_groups_courses(callback: CallbackQuery):
+    await callback.answer()
+    has_group = _selected_group_id(callback) is not None
+    await _edit_or_answer(
+        callback,
+        "<b>Выбор группы</b>\nШаг 1 из 3 · Выберите курс:",
+        group_course_keyboard(include_menu=has_group),
+    )
+
+
+@dp.callback_query(F.data.startswith("groups:course:"))
+async def cb_groups_course(callback: CallbackQuery):
+    try:
+        course = int(callback.data.rsplit(":", 1)[1])
+    except (ValueError, AttributeError):
+        await callback.answer("Курс не найден", show_alert=True)
+        return
+    if not available_specialties(GROUPS, course=course):
+        await callback.answer("Группы этого курса не найдены", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(
+        callback,
+        f"<b>Выбор группы · {course} курс</b>\nШаг 2 из 3 · Выберите специальность:",
+        group_specialty_keyboard(course),
+    )
+
+
+@dp.callback_query(F.data.startswith("groups:spec:"))
+async def cb_groups_spec(callback: CallbackQuery):
+    try:
+        _, _, raw_course, spec_token, raw_page = callback.data.split(":", 4)
+        course, page = int(raw_course), int(raw_page)
+        specialty = _resolve_specialty_token(course, spec_token)
+        if not specialty:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await callback.answer("Специальность не найдена", show_alert=True)
+        return
+    await callback.answer()
+    await _edit_or_answer(
+        callback,
+        f"<b>Выбор группы · {course} курс · {html.escape(specialty)}</b>\n"
+        "Шаг 3 из 3 · Выберите группу:",
+        group_list_keyboard(course, specialty, page=page),
     )
 
 
@@ -7158,25 +7501,39 @@ async def cb_group_set(callback: CallbackQuery):
             "Дальше данные обновляются автоматически, запросы будут примерно в 10 раз быстрее."
         )
     await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Расписание", callback_data="today"),
-         InlineKeyboardButton(text="О группе", callback_data="groupinfo")],
-        [InlineKeyboardButton(text="Главное меню", callback_data="menu")],
+        [InlineKeyboardButton(text="Сегодня", callback_data="today"),
+         InlineKeyboardButton(text="Завтра", callback_data="schedule")],
+        [InlineKeyboardButton(text="О группе", callback_data="groupinfo"),
+         InlineKeyboardButton(text="Главное меню", callback_data="menu")],
     ]))
 
 
 @dp.callback_query(F.data == "groupinfo")
 async def cb_group_info(callback: CallbackQuery):
     await callback.answer()
-    await _send_group_info(callback, get_group(_selected_group_id(callback)))
+    group_id = _selected_group_id(callback)
+    if group_id is None:
+        await _prompt_group_selection(callback)
+        return
+    await _send_group_info(callback, get_group(group_id))
 
 
 @dp.callback_query(F.data == "menu")
 async def cb_menu(callback: CallbackQuery):
     await callback.answer()
-    group = get_group(_selected_group_id(callback))
+    chat_id = callback.message.chat.id
+    group_id = _selected_group_id(callback)
+    if group_id is None:
+        await callback.message.answer(
+            f"{premium_title(BOT_NAME)}\nГруппа: <i>не выбрана</i>\n\n"
+            "Для просмотра расписания выберите группу или найдите преподавателя.",
+            reply_markup=main_keyboard(_is_subscribed(chat_id), has_group=False),
+        )
+        return
+    group = get_group(group_id)
     await callback.message.answer(
         f"{premium_title(BOT_NAME)}\nГруппа: <b>{html.escape(group.name)}</b>",
-        reply_markup=main_keyboard(_is_subscribed(callback.message.chat.id)),
+        reply_markup=main_keyboard(_is_subscribed(chat_id), has_group=True),
     )
 
 
@@ -7188,11 +7545,23 @@ async def cb_notifications(callback: CallbackQuery):
         enabled = teacher_subscription(callback.message.chat.id, staff_id)
         member = STAFF_BY_ID.get(staff_id)
         text = f"<b>Уведомления</b>\nПреподаватель: {member.full_name if member else staff_id}"
-    else:
-        enabled = _is_subscribed(callback.message.chat.id)
-        text = f"<b>Уведомления</b>\nГруппа: {get_group(settings['group_id']).name}\nНовое и изменённое расписание."
+        await callback.answer()
+        await callback.message.answer(text, reply_markup=notification_keyboard(enabled, staff_id))
+        return
+
+    group_id = settings.get("group_id")
+    if group_id is None:
+        await callback.answer()
+        await _prompt_group_selection(
+            callback,
+            prefix="Сначала выберите группу для уведомлений.",
+        )
+        return
+
+    enabled = _is_subscribed(callback.message.chat.id)
+    text = f"<b>Уведомления</b>\nГруппа: {get_group(group_id).name}\nНовое и изменённое расписание."
     await callback.answer()
-    await callback.message.answer(text, reply_markup=notification_keyboard(enabled, staff_id))
+    await callback.message.answer(text, reply_markup=notification_keyboard(enabled, None))
 
 
 @dp.callback_query(F.data == "teacher")
@@ -7292,6 +7661,12 @@ async def cb_subscribe(callback: CallbackQuery):
     await callback.answer()
     chat = callback.message.chat
     group_id = _selected_group_id(callback)
+    if group_id is None:
+        await _prompt_group_selection(
+            callback,
+            prefix="Сначала выберите группу для уведомлений.",
+        )
+        return
     if subscribe_user(
         chat.id, chat_type=chat.type, title=chat.title or "", group_id=group_id
     ):
@@ -7321,6 +7696,10 @@ async def cb_status(callback: CallbackQuery):
 @dp.callback_query(F.data == "date")
 async def cb_date(callback: CallbackQuery):
     save_user_profile(callback.from_user, callback.message.chat.id)
+    if _selected_group_id(callback) is None:
+        await callback.answer()
+        await _prompt_group_selection(callback)
+        return
     set_pending_action(callback.message.chat.id, "date")
     await callback.answer()
     await callback.message.answer(
@@ -7334,7 +7713,7 @@ async def cb_help(callback: CallbackQuery):
     await callback.message.answer(
         "<b>Помощь</b>\n\n"
         "Основные действия доступны кнопками главного меню.\n"
-        "«Сменить группу» — фильтры по курсу и форме обучения.\n"
+        "«Выбрать / Сменить группу» — пошаговый выбор: курс → специальность → группа.\n"
         "«Преподаватели» — поиск по фамилии и отдельные уведомления.\n\n"
         "Команды: /today, /schedule, /date, /groups, /teacher, /subscribe, /status."
     )
@@ -8026,19 +8405,22 @@ async def schedule_monitor(bot: Bot) -> None:
         if time.monotonic() - catalog_refreshed_at >= GROUP_CATALOG_TTL:
             await refresh_group_catalog()
             catalog_refreshed_at = time.monotonic()
+        active_groups = active_group_ids()
         # Разовый пересчёт изученного времени после миграции истории на
         # запись по подгруппам (срабатывает один раз, дальше — пустой флаг).
-        try:
-            await recalculate_study_history()
-        except Exception:
-            logger.exception("Ошибка разового пересчёта истории занятий")
+        if GROUP_ID in active_groups:
+            try:
+                await recalculate_study_history()
+            except Exception:
+                logger.exception("Ошибка разового пересчёта истории занятий")
 
-        # История запускается в существующем scheduler, а не во втором
-        # независимом фоне. Уже обработанные даты пропускаются по БД.
-        try:
-            await backfill_lesson_history()
-        except Exception:
-            logger.exception("Ошибка backfill истории занятий")
+        # История запускается только для реально выбранных / подписанных групп.
+        # Уже обработанные даты пропускаются по БД.
+        for gid in active_groups:
+            try:
+                await backfill_lesson_history(group_id=gid)
+            except Exception:
+                logger.exception("Ошибка backfill истории занятий (%s)", gid)
 
         # Каждый цикл даты вычисляются заново через Asia/Yekaterinburg.
         today = get_today()
@@ -8053,11 +8435,8 @@ async def schedule_monitor(bot: Bot) -> None:
                     logger.exception("Ошибка фоновой проверки: %s", args)
 
         jobs = []
-        monitored_groups = [GROUP_ID] + [
-            group_id for group_id in sorted(GROUPS) if group_id != GROUP_ID
-        ]
         for day in days:
-            for group_id in monitored_groups:
+            for group_id in active_groups:
                 jobs.append(guarded(_check_date, bot, day, group_id))
             for staff_id in load_monitored_staff_ids():
                 jobs.append(guarded(_check_staff_date, bot, staff_id, day))

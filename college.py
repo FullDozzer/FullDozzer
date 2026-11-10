@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import date
+import re
 from typing import Optional
 
 
@@ -194,11 +195,122 @@ FALLBACK_GROUPS = {
 }
 
 
-def sorted_groups(groups: dict[int, GroupInfo], course: Optional[int] = None,
-                  correspondence: Optional[bool] = None) -> list[GroupInfo]:
+SPECIALTY_BY_ID: dict[int, str] = {
+    28: "ЭС",
+    29: "БС",
+    30: "ЭП",
+    37: "ЭП",
+    52: "ЭП",
+    51: "ОМ",
+    47: "РМ",
+    53: "РМ",
+    31: "СТ",
+}
+
+SPECIALTY_ORDER: tuple[str, ...] = ("ЭС", "БС", "ЭП", "ОМ", "РМ", "СТ")
+_SPEC_PREFIX_RE = re.compile(r"^([A-Za-zА-Яа-яЁё]+)")
+
+
+def extract_specialty_from_name(name: str, is_correspondence: bool = False) -> str:
+    clean = str(name or "").strip()
+    if clean.lower().startswith("гр."):
+        clean = clean[3:].strip()
+    match = _SPEC_PREFIX_RE.match(clean)
+    if not match:
+        return clean or "Другое"
+    prefix = match.group(1)
+    # Очные и заочные группы одной специальности: ЭСз -> ЭС, БСз -> БС, ЭПз -> ЭП, ООз -> ОО.
+    if len(prefix) >= 2 and prefix.endswith("з"):
+        if is_correspondence or prefix[-2].isupper():
+            prefix = prefix[:-1]
+    return prefix.upper() if prefix.islower() else prefix
+
+
+def _infer_specialty_by_id(groups: dict[int, GroupInfo]) -> dict[int, str]:
+    by_id: dict[int, list[GroupInfo]] = {}
+    for group in groups.values():
+        if group.specialty_id > 0 and group.specialty_id not in SPECIALTY_BY_ID:
+            by_id.setdefault(group.specialty_id, []).append(group)
+    result: dict[int, str] = {}
+    for sid, members in by_id.items():
+        fulltime = [m for m in members if not m.is_correspondence]
+        candidates = fulltime or members
+        codes = [
+            extract_specialty_from_name(m.name, m.is_correspondence)
+            for m in sorted(candidates, key=lambda item: (item.course, item.name))
+        ]
+        if codes:
+            result[sid] = max(dict.fromkeys(codes), key=codes.count)
+    return result
+
+
+def _group_specialty_with_map(group: GroupInfo, inferred: dict[int, str]) -> str:
+    if group.specialty_id in SPECIALTY_BY_ID:
+        return SPECIALTY_BY_ID[group.specialty_id]
+    if group.specialty_id > 0 and group.specialty_id in inferred:
+        return inferred[group.specialty_id]
+    return extract_specialty_from_name(group.name, group.is_correspondence)
+
+
+def group_specialty(
+    group: GroupInfo,
+    groups: Optional[dict[int, GroupInfo]] = None,
+) -> str:
+    inferred = _infer_specialty_by_id(groups) if (groups and group.specialty_id > 0) else {}
+    return _group_specialty_with_map(group, inferred)
+
+
+def available_courses(groups: dict[int, GroupInfo]) -> list[int]:
+    courses = sorted({group.course for group in groups.values() if group.course > 0})
+    return courses or [1, 2, 3, 4]
+
+
+def available_specialties(
+    groups: dict[int, GroupInfo],
+    course: Optional[int] = None,
+) -> list[str]:
+    inferred = _infer_specialty_by_id(groups)
+    specs = {
+        _group_specialty_with_map(group, inferred)
+        for group in groups.values()
+        if course is None or group.course == course
+    }
+    order_index = {name: idx for idx, name in enumerate(SPECIALTY_ORDER)}
+    return sorted(
+        specs,
+        key=lambda name: (order_index.get(name, len(SPECIALTY_ORDER)), name.casefold()),
+    )
+
+
+def _natural_name_key(name: str) -> tuple:
+    parts = re.split(r"(\d+)", name.casefold())
+    return tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in parts if p)
+
+
+def sorted_groups(
+    groups: dict[int, GroupInfo],
+    course: Optional[int] = None,
+    correspondence: Optional[bool] = None,
+    specialty: Optional[str] = None,
+) -> list[GroupInfo]:
     values = groups.values()
     if course is not None:
         values = (group for group in values if group.course == course)
     if correspondence is not None:
         values = (group for group in values if group.is_correspondence == correspondence)
-    return sorted(values, key=lambda group: (group.course, group.name.casefold(), group.id))
+    if specialty is not None:
+        inferred = _infer_specialty_by_id(groups)
+        target = specialty.casefold()
+        values = (
+            group for group in values
+            if _group_specialty_with_map(group, inferred).casefold() == target
+        )
+    return sorted(
+        values,
+        key=lambda group: (
+            group.course,
+            group.is_correspondence,
+            _natural_name_key(group.name),
+            group.id,
+        ),
+    )

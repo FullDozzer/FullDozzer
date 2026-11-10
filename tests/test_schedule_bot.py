@@ -154,6 +154,9 @@ class DBTestCase(unittest.TestCase):
             conn.execute("DELETE FROM schedule_state")
             conn.execute("DELETE FROM schedule_notifications")
             conn.execute("DELETE FROM subscribers")
+            conn.execute("DELETE FROM user_settings")
+            conn.execute("DELETE FROM teacher_subscribers")
+            conn.execute("DELETE FROM study_jobs")
 
     def insert_user(self, user_id, created_at):
         with bot.db_connect() as conn:
@@ -695,7 +698,7 @@ class TestMonitoring(DBTestCase):
         self.addCleanup(self.render_patch.stop)
 
     def test_first_appearance_sends_and_baseline_saved(self):
-        bot.subscribe_user(1001)
+        bot.subscribe_user(1001, group_id=bot.GROUP_ID)
         run(bot._check_date(self.bot, self.day))
         self.assertEqual(len(self.bot.sent), 1)
         kind, user_id, caption = self.bot.sent[0]
@@ -708,14 +711,14 @@ class TestMonitoring(DBTestCase):
         self.assertIn(self.day.isoformat(), bot.load_state())
 
     def test_no_repeat_when_unchanged(self):
-        bot.subscribe_user(1001)
+        bot.subscribe_user(1001, group_id=bot.GROUP_ID)
         run(bot._check_date(self.bot, self.day))
         run(bot._check_date(self.bot, self.day))
         run(bot._check_date(self.bot, self.day))
         self.assertEqual(len(self.bot.sent), 1)
 
     def test_change_notifies_today_only_label(self):
-        bot.subscribe_user(1001)
+        bot.subscribe_user(1001, group_id=bot.GROUP_ID)
         run(bot._check_date(self.bot, self.day))
         self.current_schedule[0] = make_schedule(self.day, "Физика")
         run(bot._check_date(self.bot, self.day))
@@ -726,7 +729,7 @@ class TestMonitoring(DBTestCase):
         self.assertEqual(len(self.bot.sent), 2)
 
     def test_empty_and_error_do_not_change_state(self):
-        bot.subscribe_user(1001)
+        bot.subscribe_user(1001, group_id=bot.GROUP_ID)
         run(bot._check_date(self.bot, self.day))
         saved = bot.load_state()[self.day.isoformat()]
         # Пустое расписание
@@ -744,7 +747,7 @@ class TestMonitoring(DBTestCase):
         self.assertEqual(len(self.bot.sent), 1)
 
     def test_tomorrow_checked_independently(self):
-        bot.subscribe_user(1001)
+        bot.subscribe_user(1001, group_id=bot.GROUP_ID)
         # Фиксируем «сейчас»: тест не должен зависеть от перехода через
         # полночь между получением tomorrow и проверкой даты монитором.
         with mock.patch.object(
@@ -763,8 +766,8 @@ class TestMonitoring(DBTestCase):
         self.assertIn(bot.format_date_full(tomorrow), self.bot.sent[0][2])
 
     def test_partial_delivery_retries_only_pending(self):
-        bot.subscribe_user(1001)
-        bot.subscribe_user(1002)
+        bot.subscribe_user(1001, group_id=bot.GROUP_ID)
+        bot.subscribe_user(1002, group_id=bot.GROUP_ID)
         fail_bot = FakeBot(fail_users={1002})
         run(bot._check_date(fail_bot, self.day))
         # Доставлено только 1001, состояние НЕ обновлено
@@ -787,7 +790,7 @@ class TestMonitoring(DBTestCase):
     def test_recovery_when_state_missing_but_delivered(self):
         # Эмуляция сбоя: записи о доставке есть, а baseline потерян
         # (например, процесс упал между записью и сохранением состояния).
-        bot.subscribe_user(1001)
+        bot.subscribe_user(1001, group_id=bot.GROUP_ID)
         run(bot._check_date(self.bot, self.day))
         with bot.db_connect() as conn:
             conn.execute("DELETE FROM schedule_state")
@@ -801,7 +804,7 @@ class TestMonitoring(DBTestCase):
 
     def test_monitor_full_cycle_both_dates(self):
         """Один цикл монитора: сегодня и завтра без дублей."""
-        bot.subscribe_user(1001)
+        bot.subscribe_user(1001, group_id=bot.GROUP_ID)
         fake_bot = FakeBot()
 
         class StopLoop(Exception):
@@ -2983,6 +2986,7 @@ class TestFooterSignatureRemoved(StudyDBTestCase):
         self.assertEqual(bot._LAST_RENDER["problems"], [])
 
     def test_status_image_has_no_footer_signature(self):
+        bot.set_user_group(987654, bot.GROUP_ID)
         path = bot.render_status_image(chat_id=987654)
         try:
             self.assertEqual(
@@ -3426,6 +3430,7 @@ class TestStatusImage(DBTestCase):
         self.assertEqual(bot.format_uptime(2 * 86400 + 4 * 3600), "2 д 4 ч")
 
     def test_renders_png_in_schedule_style(self):
+        bot.set_user_group(987654, bot.GROUP_ID)
         bot.record_completed_lesson(
             bot.GROUP_NAME, date(2026, 9, 7), "I", "08:30", "09:50",
             "НГПО", duration=320,
@@ -3460,6 +3465,7 @@ class TestStatusImage(DBTestCase):
             path.unlink(missing_ok=True)
 
     def test_send_status_photo_and_fallbacks(self):
+        bot.set_user_group(987654, bot.GROUP_ID)
         # Обычная отправка: фото с подписью.
         message = self.FakeStatusMessage()
         run(bot._send_status(message))
@@ -3490,10 +3496,24 @@ class TestStatusImage(DBTestCase):
         self.assertEqual(len(message.photos), 1)
 
     def test_status_text_includes_study_and_uptime(self):
+        bot.set_user_group(42, bot.GROUP_ID)
         text = run(bot._status_text(chat_id=42))
         self.assertIn("подписок", text)
         self.assertIn("Аптайм", text)
         self.assertIn(bot.TIMEZONE, text)
+
+    def test_status_without_selected_group_does_not_default_to_legacy_group(self):
+        text = run(bot._status_text(chat_id=777111))
+        self.assertIn("Группа не выбрана", text)
+        self.assertNotIn(bot.GROUP_NAME, text)
+        caption = bot._status_caption(chat_id=777111)
+        self.assertIn("Группа не выбрана", caption)
+        self.assertNotIn(bot.GROUP_NAME, caption)
+        path = bot.render_status_image(chat_id=777111)
+        try:
+            self.assertTrue(path.exists())
+        finally:
+            path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
