@@ -98,13 +98,61 @@ Y  = X + R
 
 ```bash
 .venv/bin/python scripts/make_sample_announcement.py   # samples/announcement.png + превью 390 px
-.venv/bin/python scripts/send_announcement.py          # dry-run: рендер и подпись, без отправки
-.venv/bin/python scripts/send_announcement.py --chat @channel   # проверка на одном адресате
+.venv/bin/python scripts/send_announcement.py          # отчёт доставки, ничего не отправляет
+.venv/bin/python scripts/send_announcement.py --preview
 ```
 
-`scripts/send_announcement.py` не рассылает всем: он отправляет карточку
-одному адресату из `--chat`. Массовая отправка идёт через штатную рассылку
-(модерация → оплата → доставка подписчикам), см. раздел ниже.
+### Разовая доставка: только существующие подписчики, ровно один раз
+
+Анонс отправляется автоматически при старте бота, но только если явно
+включён флаг. Получатели не вычисляются на лету — они фиксируются снимком.
+
+```dotenv
+ANNOUNCEMENT_BROADCAST=1   # без этого флага анонс не уходит вообще
+BOT_USERNAME=mellowagent   # для строки «Открыть бота» в подписи
+```
+
+| Гарантия | Как обеспечена |
+| --- | --- |
+| Только уже существующие подписчики | Снимок `broadcast_recipients()` пишется в `announcement_deliveries` один раз, момент — `bot_meta.announcement_snapshot_at`. Кто зарегистрировался позже, в снимок не попадает. |
+| Ровно одна отправка на чат | `PRIMARY KEY (announcement, chat_id)` + статус `delivering` ставится **до** запроса к Telegram. Рестарт, падение и второй запуск дублей не дают. |
+| Никаких рассылок по новым группам/чатам | Список чатов берётся только из снимка, живая база не читается. |
+| Выключено по умолчанию | Без `ANNOUNCEMENT_BROADCAST=1` не создаётся ни задача, ни снимок. |
+
+Порядок:
+
+```bash
+# 1. До старта бота — зафиксировать, кто считается «существующим».
+.venv/bin/python scripts/send_announcement.py --freeze-only
+
+# 2. Проверить карточку и подпись глазами.
+.venv/bin/python scripts/send_announcement.py --preview
+
+# 3. Включить флаг и запустить бота. Анонс уйдёт один раз в фоне.
+ANNOUNCEMENT_BROADCAST=1 .venv/bin/python bot.py
+
+# или, без перезапуска бота:
+.venv/bin/python scripts/send_announcement.py --send
+
+# 4. Проверить отчёт.
+.venv/bin/python scripts/send_announcement.py
+```
+
+`--freeze-only` до первого запуска бота полезен, если нужно жёстко
+зафиксировать «существующих» на конкретный момент. Если пропустить этот
+шаг, снимок сделается автоматически при первом запуске с флагом.
+
+Сознательный компромисс: чат, у которого попытка уже была (`delivering`
+или `failed`), автоматически не переотправляется — «ровно один раз» важнее,
+чем догнать единичный сетевой сбой. Догнать можно вручную:
+
+```bash
+.venv/bin/python scripts/send_announcement.py --retry-failed
+```
+
+Это возвращает в очередь **только** статус `failed`; `sent` и `delivering`
+не трогаются никогда. Отчёт по статусам (`queued`, `delivering`, `sent`,
+`failed`) печатает обычный запуск скрипта без флагов.
 
 ## Редактирование экранов
 

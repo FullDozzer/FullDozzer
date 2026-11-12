@@ -2396,6 +2396,37 @@ def init_db() -> None:
                 conn.execute("DELETE FROM schedule_cache WHERE target_key LIKE 'staff:%'")
                 _meta_set(conn, "staff_groups_cache_version", "2")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_broadcasts_status ON broadcasts(status, id)")
+
+            # Разовая доставка анонса. Получатели фиксируются СНИМКОМ на
+            # старте: кто был подписчиком до запуска — тот и получает, новые
+            # пользователи в этот снимок не попадают. UNIQUE(announcement,
+            # chat_id) гарантирует ровно одну отправку на чат даже при
+            # повторном запуске, падении и рестарте бота.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS announcement_deliveries (
+                    announcement TEXT NOT NULL,
+                    chat_id      INTEGER NOT NULL,
+                    status       TEXT NOT NULL DEFAULT 'queued',
+                    reason       TEXT NOT NULL DEFAULT '',
+                    attempts     INTEGER NOT NULL DEFAULT 0,
+                    updated_at   TEXT NOT NULL,
+                    PRIMARY KEY (announcement, chat_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS announcement_runs (
+                    announcement TEXT PRIMARY KEY,
+                    started_at   TEXT NOT NULL,
+                    finished_at  TEXT NOT NULL DEFAULT '',
+                    recipients   INTEGER NOT NULL DEFAULT 0,
+                    delivered    INTEGER NOT NULL DEFAULT 0,
+                    failed       INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
         logger.info("База данных готова: %s", DB_PATH)
     except Exception:
         logger.exception("Ошибка инициализации SQLite")
@@ -7540,7 +7571,7 @@ def render_announcement_image(username: str = "") -> Path:
 
 async def send_announcement_card(bot: Bot, chat_id: int,
                                  username: str = "") -> bool:
-    """Отправить карточку анонса в чат. Пустой username — подпись без ссылки."""
+    """Отправить карточку анонса в конкретный чат (ручной тест)."""
     try:
         path = render_announcement_image(username)
         await bot.send_photo(chat_id, FSInputFile(str(path)),
@@ -7549,6 +7580,222 @@ async def send_announcement_card(bot: Bot, chat_id: int,
     except Exception as error:
         logger.warning("Карточка анонса не отправлена %s: %s", chat_id, error)
         return False
+
+
+# ------------------------------------------------------------
+# АВТОРАССЫЛКА АНОНСА: только существующие подписчики, ровно один раз
+# ------------------------------------------------------------
+#
+# Правила, которые обеспечивает этот блок:
+#
+#   * снимок получателей берётся ОДИН раз — в момент первого запуска
+#     (ANNOUNCE_SNAPSHOT_AT в bot_meta). Снимок наполняется штатной
+#     функцией broadcast_recipients(): все, кто уже есть в user_settings /
+#     subscribers. Кто зарегистрировался после снимка — в выборку не
+#     попадает и анонса не получит;
+#   * ровно одна отправка на чат — статус 'sent'/'delivering' фиксируется
+#     в announcement_deliveries, PRIMARY KEY(announcement, chat_id) не даёт
+#     записать дубль. Повторный запуск/рестарт/падение не отправляет
+#     второй раз: 'delivering' уже считается «отдано Telegram»;
+#   * включение — только явным флагом ANNOUNCEMENT_BROADCAST=1, иначе
+#     ничего не происходит вообще (ни отправки, ни записи в БД).
+
+ANNOUNCEMENT_KEY = "global_v1"
+ANNOUNCEMENT_SNAPSHOT_META = "announcement_snapshot_at"
+ANNOUNCEMENT_CHUNK = 25          # сколько чатов берём за один проход
+ANNOUNCEMENT_DELAY = 0.05        # пауза между отправками, сек
+
+
+def announcement_enabled() -> bool:
+    return os.getenv("ANNOUNCEMENT_BROADCAST", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def announcement_snapshot_at() -> str:
+    """Момент снимка получателей; '' — снимок ещё не делался."""
+    with db_connect() as conn:
+        return _meta_get(conn, ANNOUNCEMENT_SNAPSHOT_META, "")
+
+
+def freeze_announcement_recipients(stamp: Optional[str] = None) -> int:
+    """Зафиксировать получателей анонса. Возвращает размер снимка.
+
+    Вызывается ровно один раз: повторный вызов видит уже сохранённый
+    снимок и ничего не добавляет — новые подписчики не попадут никогда.
+    """
+    if announcement_snapshot_at():
+        return announcement_snapshot_size()
+    frozen_at = stamp or now_local().strftime("%Y-%m-%d %H:%M:%S")
+    recipients = broadcast_recipients()
+    with db_connect() as conn:
+        for chat_id in recipients:
+            conn.execute(
+                "INSERT OR IGNORE INTO announcement_deliveries"
+                " (announcement, chat_id, status, updated_at)"
+                " VALUES (?, ?, 'queued', ?)",
+                (ANNOUNCEMENT_KEY, int(chat_id), frozen_at),
+            )
+        _meta_set(conn, ANNOUNCEMENT_SNAPSHOT_META, frozen_at)
+        conn.execute(
+            "INSERT OR IGNORE INTO announcement_runs"
+            " (announcement, started_at, recipients) VALUES (?, ?, ?)",
+            (ANNOUNCEMENT_KEY, frozen_at, len(recipients)),
+        )
+    logger.info("Анонс: снимок получателей %s чатов (%s)",
+                len(recipients), frozen_at)
+    return len(recipients)
+
+
+def announcement_snapshot_size() -> int:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM announcement_deliveries WHERE announcement = ?",
+            (ANNOUNCEMENT_KEY,),
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def pending_announcement_recipients(limit: int = ANNOUNCEMENT_CHUNK) -> list[int]:
+    """Кому ещё не отправлено. Берём ТОЛЬКО снимок, не живую базу."""
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM announcement_deliveries"
+            " WHERE announcement = ? AND status = 'queued'"
+            " ORDER BY chat_id LIMIT ?",
+            (ANNOUNCEMENT_KEY, int(limit)),
+        ).fetchall()
+    return [int(row["chat_id"]) for row in rows]
+
+
+def _mark_announcement(chat_id: int, status: str, reason: str = "") -> None:
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE announcement_deliveries"
+            " SET status = ?, reason = ?, attempts = attempts + 1, updated_at = ?"
+            " WHERE announcement = ? AND chat_id = ?",
+            (status, reason, stamp, ANNOUNCEMENT_KEY, int(chat_id)),
+        )
+
+
+def release_failed_announcements() -> int:
+    """Вернуть в очередь только явные отказы Telegram ('failed').
+
+    'sent' и 'delivering' не трогаются никогда: это и есть гарантия
+    «одна отправка на чат». Возвращает число возвращённых в очередь.
+    """
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    with db_connect() as conn:
+        cursor = conn.execute(
+            "UPDATE announcement_deliveries SET status = 'queued', updated_at = ?"
+            " WHERE announcement = ? AND status = 'failed'",
+            (stamp, ANNOUNCEMENT_KEY),
+        )
+        return int(cursor.rowcount)
+
+
+def announcement_report() -> dict:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM announcement_deliveries"
+            " WHERE announcement = ? GROUP BY status",
+            (ANNOUNCEMENT_KEY,),
+        ).fetchall()
+    report = {row["status"]: int(row["n"]) for row in rows}
+    report["total"] = sum(report.values())
+    return report
+
+
+async def run_announcement(bot: Bot, username: str = "",
+                           chunk: int = ANNOUNCEMENT_CHUNK) -> dict:
+    """Дослать анонс тем, кому ещё не отправлено. Идемпотентно.
+
+    Повторный вызов безопасен и НЕ создаёт дублей: статус ставится в
+    'delivering' ПЕРЕД запросом к Telegram, поэтому даже если процесс упадёт
+    между вызовом и ответом API, второй раз сообщение не уйдёт.
+
+    Осознанный компромисс: чат, у которого попытка уже была ('delivering'
+    или 'failed'), автоматически не переотправляется — «ровно один раз»
+    важнее, чем догнать единичный сетевой сбой. Догнать вручную можно
+    скриптом с --retry-failed (только для статусов 'failed', никогда для
+    'sent'/'delivering').
+    """
+    if not announcement_enabled():
+        return {"skipped": "disabled", **announcement_report()}
+    freeze_announcement_recipients()
+    handle = username or touch_announcement(bot) or _announcement_username()
+    path = render_announcement_image(handle)
+    caption = announce_caption(handle)
+    sent = 0
+    failed = 0
+    for chat_id in pending_announcement_recipients(chunk):
+        _mark_announcement(chat_id, "delivering")
+        try:
+            await bot.send_photo(chat_id, FSInputFile(str(path)),
+                                 caption=caption)
+            _mark_announcement(chat_id, "sent")
+            sent += 1
+        except Exception as error:                  # noqa: BLE001
+            failed += 1
+            _mark_announcement(chat_id, "failed", str(error)[:200])
+            logger.warning("Анонс не доставлен %s: %s", chat_id, error)
+        await asyncio.sleep(ANNOUNCEMENT_DELAY)
+    _finish_announcement_run()
+    report = announcement_report()
+    logger.info("Анонс: отправлено %s, ошибок %s, всего %s",
+                sent, failed, report["total"])
+    return {"delivered": sent, "errors": failed, **report}
+
+
+def _finish_announcement_run() -> None:
+    report = announcement_report()
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    done = report.get("queued", 0) == 0
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE announcement_runs SET finished_at = ?, delivered = ?,"
+            " failed = ? WHERE announcement = ?",
+            (stamp if done else "", report.get("sent", 0),
+             report.get("failed", 0), ANNOUNCEMENT_KEY),
+        )
+
+
+def touch_announcement(bot: Bot) -> str:
+    """Username бота для подписи.
+
+    Читаем только уже известное значение: сетевой getMe здесь не нужен,
+    поэтому отправка не зависит от доступности Telegram на момент рендера.
+    """
+    username = (os.getenv("BOT_USERNAME", "").strip()
+                or str(getattr(bot, "username", "") or "").strip())
+    if not username and BOT_USERNAME_ALIASES:
+        username = next(iter(BOT_USERNAME_ALIASES))
+    return username
+
+
+async def _announcement_task(bot: Bot) -> None:
+    """Фоновая досылка: идёт, пока есть 'queued', потом выключается сама."""
+    while True:
+        if not announcement_enabled():
+            return
+        report = announcement_report()
+        if not report.get("queued"):
+            return
+        await run_announcement(bot, touch_announcement(bot))
+        await asyncio.sleep(1.0)
+
+
+def start_announcement_task(bot: Bot):
+    """Запустить одноразовую доставку при старте. Повторный старт — no-op."""
+    if not announcement_enabled():
+        return None
+    task = getattr(start_announcement_task, "_task", None)
+    if task is not None and not task.done():
+        return task
+    task = asyncio.create_task(_announcement_task(bot))
+    start_announcement_task._task = task
+    return task
 
 
 # ============================================================
@@ -10437,14 +10684,26 @@ async def main() -> None:
                 "Первичный парсинг всех групп продолжается в фоне; запускаем polling."
             )
 
+    # Разовая доставка анонса существующим подписчикам. Включается только
+    # ANNOUNCEMENT_BROADCAST=1; получатели фиксируются снимком на этом шаге,
+    # поэтому пользователи, пришедшие позже, анонса не получат никогда.
+    announcement_task = start_announcement_task(bot)
+
     try:
         await dp.start_polling(bot)
     finally:
         monitor_task.cancel()
+        if announcement_task is not None:
+            announcement_task.cancel()
         try:
             await monitor_task
         except asyncio.CancelledError:
             pass
+        if announcement_task is not None:
+            try:
+                await announcement_task
+            except asyncio.CancelledError:
+                pass
         await bot.session.close()
 
 

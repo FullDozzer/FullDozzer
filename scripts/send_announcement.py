@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Тестовая отправка карточки анонса «бот теперь для всего колледжа».
+"""Разовая доставка анонса «бот теперь для всего колледжа».
 
-Запуск:
-    python scripts/send_announcement.py --dry-run
-    python scripts/send_announcement.py --chat 123456789
-    python scripts/send_announcement.py --username mellowagent --chat @channel
+Правила доставки определены в bot.py (announcement_*): получатели — снимок
+существующих подписчиков на момент запуска, каждому чату — ровно одно
+сообщение, повторный запуск ничего не дублирует.
 
---dry-run (по умолчанию) только рендерит картинку и печатает подпись —
-ничего и никуда не отправляется. Реальная отправка требует в .env
-BOT_TOKEN, а --chat указывает, кому именно уходит тест (себе, в канал
-или в тестовую группу). Массовой рассылки в этом скрипте нет специально:
-сначала проверяем карточку на одном адресате.
+Команды (по умолчанию — status, ничего не отправляет):
 
-Каталог samples/ обновлять не нужно: файл рендерится в DATA_DIR/images,
-а копия для репозитория делается скриптом make_sample_announcement.py.
+    python scripts/send_announcement.py
+        Отчёт: сколько в снимке, сколько отправлено, сколько сбоев.
+
+    python scripts/send_announcement.py --freeze-only
+        Только зафиксировать снимок получателей. Полезно сделать это ДО
+        запуска бота, чтобы «существующие» определялись этим моментом.
+
+    python scripts/send_announcement.py --send
+        Доставить анонс тем, кому ещё не отправлено. Требует
+        ANNOUNCEMENT_BROADCAST=1 и BOT_TOKEN. Запускается один раз —
+        повторные запуски безопасны.
+
+    python scripts/send_announcement.py --retry-failed
+        Вернуть в очередь только явные отказы Telegram ('failed') и
+        доставить. Статусы 'sent'/'delivering' не трогаются никогда.
+
+    python scripts/send_announcement.py --preview
+        Отрендерить карточку и напечатать подпись, без отправки.
 """
 
 import argparse
@@ -29,57 +40,83 @@ sys.path.insert(0, str(_ROOT))
 from aiogram import Bot  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
 from aiogram.enums import ParseMode  # noqa: E402
-from aiogram.types import FSInputFile  # noqa: E402
 
 import bot  # noqa: E402
 
 
-async def send(token: str, chat_id: str, username: str) -> bool:
-    api = Bot(token=token,
-              default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    try:
-        path = bot.render_announcement_image(username)
-        await api.send_photo(chat_id, FSInputFile(str(path)),
-                             caption=bot.announce_caption(username))
-        print(f"Отправлено в {chat_id}: {path}")
-        return True
-    finally:
-        await api.session.close()
+def print_status() -> None:
+    snapshot_at = bot.announcement_snapshot_at()
+    print(f"Снимок получателей: {snapshot_at or 'ещё не сделан'}")
+    print(f"Размер снимка: {bot.announcement_snapshot_size()}")
+    report = bot.announcement_report()
+    for status in ("queued", "delivering", "sent", "failed"):
+        print(f"  {status:11} {report.get(status, 0)}")
+    print(f"  {'всего':11} {report.get('total', 0)}")
+    print(f"Флаг ANNOUNCEMENT_BROADCAST: "
+          f"{'включён' if bot.announcement_enabled() else 'выключен'}")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--chat", default="",
-                        help="куда отправить тест: id, @channel или @username")
-    parser.add_argument("--username", default=os.getenv("BOT_USERNAME", "mellowagent"),
-                        help="username бота для подписи и подвала карточки")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="только собрать карточку и подпись")
-    args = parser.parse_args()
-
-    bot.init_db()
-    path = bot.render_announcement_image(args.username)
-    caption = bot.announce_caption(args.username)
+def preview(username: str) -> None:
+    path = bot.render_announcement_image(username)
+    caption = bot.announce_caption(username)
     print(f"Карточка: {path}")
-    print(f"Подпись: {len(caption)} символов")
+    print(f"Подпись: {len(caption)} символов (лимит 1024)")
     print("-" * 60)
     print(caption)
     print("-" * 60)
 
-    if args.dry_run or not args.chat:
-        if not args.dry_run:
-            print("--chat не указан: ограничиваюсь dry-run.")
-        return 0
 
+async def deliver(retry_failed: bool) -> int:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
         print("BOT_TOKEN не задан — отправка невозможна.")
         return 2
+    if not bot.announcement_enabled():
+        print("ANNOUNCEMENT_BROADCAST не включён — отправка отменена.\n"
+              "Поставьте ANNOUNCEMENT_BROADCAST=1, если это осознанное решение.")
+        return 2
+
+    api = Bot(token=token,
+              default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     try:
-        asyncio.run(send(token, args.chat, args.username))
-    except Exception as error:                       # noqa: BLE001
-        print(f"Не удалось отправить: {error}")
-        return 1
+        if retry_failed:
+            released = bot.release_failed_announcements()
+            print(f"Возвращено в очередь из 'failed': {released}")
+        result = await bot.run_announcement(api, bot.touch_announcement(api))
+    finally:
+        await api.session.close()
+    print(f"Отправлено сейчас: {result['delivered']}, "
+          f"ошибок: {result['errors']}")
+    print_status()
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--username", default=os.getenv("BOT_USERNAME", ""),
+                        help="username бота для подписи и подвала карточки")
+    parser.add_argument("--preview", action="store_true",
+                        help="только карточка и подпись")
+    parser.add_argument("--freeze-only", action="store_true",
+                        help="только зафиксировать снимок получателей")
+    parser.add_argument("--send", action="store_true",
+                        help="доставить анонс (только один раз)")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="переотправить только явные отказы Telegram")
+    args = parser.parse_args()
+
+    bot.init_db()
+    if args.preview:
+        preview(args.username or bot.BOT_NAME)
+        return 0
+    if args.freeze_only:
+        print(f"Получателей в снимке: {bot.freeze_announcement_recipients()}")
+        print_status()
+        return 0
+    if args.send or args.retry_failed:
+        return asyncio.run(deliver(args.retry_failed))
+    print_status()
     return 0
 
 
