@@ -2396,6 +2396,37 @@ def init_db() -> None:
                 conn.execute("DELETE FROM schedule_cache WHERE target_key LIKE 'staff:%'")
                 _meta_set(conn, "staff_groups_cache_version", "2")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_broadcasts_status ON broadcasts(status, id)")
+
+            # Разовая доставка анонса. Получатели фиксируются СНИМКОМ на
+            # старте: кто был подписчиком до запуска — тот и получает, новые
+            # пользователи в этот снимок не попадают. UNIQUE(announcement,
+            # chat_id) гарантирует ровно одну отправку на чат даже при
+            # повторном запуске, падении и рестарте бота.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS announcement_deliveries (
+                    announcement TEXT NOT NULL,
+                    chat_id      INTEGER NOT NULL,
+                    status       TEXT NOT NULL DEFAULT 'queued',
+                    reason       TEXT NOT NULL DEFAULT '',
+                    attempts     INTEGER NOT NULL DEFAULT 0,
+                    updated_at   TEXT NOT NULL,
+                    PRIMARY KEY (announcement, chat_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS announcement_runs (
+                    announcement TEXT PRIMARY KEY,
+                    started_at   TEXT NOT NULL,
+                    finished_at  TEXT NOT NULL DEFAULT '',
+                    recipients   INTEGER NOT NULL DEFAULT 0,
+                    delivered    INTEGER NOT NULL DEFAULT 0,
+                    failed       INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
         logger.info("База данных готова: %s", DB_PATH)
     except Exception:
         logger.exception("Ошибка инициализации SQLite")
@@ -7330,6 +7361,444 @@ def workload_period_keyboard(period: str = DEFAULT_LOAD_PERIOD) -> InlineKeyboar
 
 
 # ============================================================
+# КАРТОЧКА АНОНСА: «бот теперь для всего колледжа»
+# ============================================================
+#
+# Текст анонса живёт в одном месте: рендер карточки и подпись к ней
+# берут данные отсюда, поэтому картинка и сообщение не расходятся.
+
+ANNOUNCE_KICKER = "ОБНОВЛЕНИЕ"
+ANNOUNCE_TITLE = "Теперь для всего колледжа"
+ANNOUNCE_SUBTITLE = (
+    "Бот расписаний переходит от локального решения для одной группы "
+    "к глобальной версии для всех групп колледжа."
+)
+
+# (иконка Lucide, заголовок, пояснение). Пункты с пояснением занимают две
+# строки, без — одну. Иконки только из assets/icons (вендоренный Lucide).
+ANNOUNCE_FEATURES = (
+    ("book-open", "Все группы колледжа", "73 группы: любая специальность и курс"),
+    ("id-card", "Информационные карточки групп", "форма, бюджет, база, семестры"),
+    ("trophy", "Топ преподавателей группы", "по изученным часам — /top"),
+    ("chart-column", "График нагрузки", "недели за месяц, 3, 6 и 12 месяцев"),
+    ("zap", "Оптимизация рендеринга", ""),
+    ("sparkles", "QoL-улучшения", ""),
+    ("battery-charging", "Мощности в 4 раза больше", ""),
+    ("bell", "Уведомления преподавателям", "о новом расписании"),
+)
+
+ANNOUNCE_CALL_TITLE = "Нужна ваша помощь"
+ANNOUNCE_CALL_BODY = (
+    "Будем благодарны, если вы распространите информацию о боте среди "
+    "одногруппников, знакомых и преподавателей. Чем больше пользователей — "
+    "тем лучше!"
+)
+
+ANNOUNCE_FOOTER = "Расписание, топ и график нагрузки — для каждой группы"
+
+
+def announce_caption(username: str = "") -> str:
+    """Подпись к карточке анонса (HTML parse mode, как в остальном боте)."""
+    handle = f"@{username.lstrip('@')}" if username else ""
+    lines = [
+        premium_title("Бот расписаний — теперь для всего колледжа"),
+        "",
+        ANNOUNCE_SUBTITLE,
+        "",
+        premium_title("Что нового?"),
+    ]
+    for _icon, title, note in ANNOUNCE_FEATURES:
+        lines.append(f"• <b>{html.escape(title)}</b>"
+                     + (f" — {html.escape(note)}" if note else ""))
+    lines += ["", premium_title(ANNOUNCE_CALL_TITLE), ANNOUNCE_CALL_BODY]
+    if handle:
+        lines += ["", f"Открыть бота: {html.escape(handle)}"]
+    return "\n".join(lines)
+
+
+def _stack_lines(ops: list, pen: Pen, lines: list, x: float, y: float,
+                 width: float, fill: str, *, uid: str) -> float:
+    """Построчно нарисовать уже перенесённые строки; вернуть занятую высоту.
+
+    Многострочность считается заранее через ``Pen.wrap``: ``_text_op``
+    фитит одну строку и мог бы поставить «…» там, где перенос уже есть.
+    """
+    for index, line in enumerate(lines):
+        line_y = y + index * pen.line_h()
+        ops.append(_text_op(pen, (x, line_y, x + width, line_y + pen.line_h()),
+                            line, fill, min_size=pen.size,
+                            uid=f"{uid}{index}"))
+    return pen.line_h() * len(lines)
+
+
+def render_announcement_image(username: str = "") -> Path:
+    """PNG-карточка анонса в палитре и типографике расписания (1080 px).
+
+    Высота — по контенту: пункты с пояснением выше, чем без. Ничего не
+    обрезается: текст переносится заранее и меряется тем же Pen, что и
+    рендер, а холст растёт под фактическое число строк.
+    """
+    W = SCHEDULE_WIDTH
+    M = 52                                  # safe area
+    CARD_X0, CARD_X1 = M, W - M
+    CARD_W = CARD_X1 - CARD_X0
+    INNER = 44                              # отступ внутри карточки
+    LEFT = CARD_X0 + INNER
+    RIGHT = CARD_X1 - INNER
+    TEXT_W = RIGHT - LEFT
+
+    pen_kicker = _pen(24, "bold")
+    pen_title = _pen(56, "bold")
+    pen_sub = _pen(28, "regular")
+    pen_item = _pen(31, "semibold")
+    pen_note = _pen(23, "regular")
+    pen_call_title = _pen(36, "bold")
+    pen_call = _pen(29, "regular")
+    pen_foot = _pen(23, "regular")
+
+    # --- переносы (единственный источник правды о числе строк) ---
+    title_lines = pen_title.wrap(ANNOUNCE_TITLE, TEXT_W)
+    sub_lines = pen_sub.wrap(ANNOUNCE_SUBTITLE, TEXT_W)
+    call_lines = pen_call.wrap(ANNOUNCE_CALL_BODY, TEXT_W - 60)
+    feature_rows = [{
+        "icon": icon,
+        "title": title,
+        "note_lines": pen_note.wrap(note, TEXT_W - 76) if note else [],
+    } for icon, title, note in ANNOUNCE_FEATURES]
+
+    # --- вертикальный поток ---
+    ICON_BOX = 52
+    BADGE = 92
+    TOP = M + INNER
+    y = TOP + BADGE + 26
+    title_y = y
+    y += pen_title.line_h() * len(title_lines) + 12
+    sub_y = y
+    y += pen_sub.line_h() * len(sub_lines) + 26
+    rule_y = y
+    y += 34
+    features_top = y
+    for row in feature_rows:
+        row["height"] = (max(ICON_BOX, pen_item.line_h())
+                         + pen_note.line_h() * len(row["note_lines"]) + 16)
+        y += row["height"]
+    y = y - 16 + 26
+    call_top = y
+    call_title_y = call_top + 28
+    call_body_y = call_title_y + pen_call_title.line_h() + 10
+    call_bottom = (call_body_y + pen_call.line_h() * len(call_lines) + 30)
+    y = call_bottom + 26
+    foot_y = y
+    y += pen_foot.line_h() * 2 + 10 + INNER + M
+    H = int(round(y))
+
+    canvas = SupersampleCanvas(W, H, S_BG)
+    ops: list = list(_decor_ops(W, H))
+
+    # --- карточка ---
+    ops.append(_shadow_op((CARD_X0, M, CARD_X1, H - M), 44, blur=26, dy=10,
+                          alpha=52))
+    ops.append(_rect_op((CARD_X0, M, CARD_X1, H - M), 44, S_CARD, S_BORDER,
+                        1.0, kind="card", uid="ann:card"))
+
+    # --- шапка: ракета в лавандовой плашке + кикер ---
+    ops.append(_rect_op((LEFT, TOP, LEFT + BADGE, TOP + BADGE), 28,
+                        S_PURPLE_L, S_PURPLE_B, 1.0, kind="icon",
+                        uid="ann:badge"))
+    ops += _icon_ops("rocket", LEFT + (BADGE - 56) / 2,
+                     TOP + (BADGE - 56) / 2, 56, S_PURPLE,
+                     uid="ann:badge:icon")
+    kicker_y = TOP + (BADGE - pen_kicker.line_h()) / 2
+    ops.append(_text_op(pen_kicker, (LEFT + BADGE + 26, kicker_y,
+                                     RIGHT, kicker_y + pen_kicker.line_h()),
+                        f"ИНК · {ANNOUNCE_KICKER}", S_PURPLE, spacing=1.6,
+                        uid="ann:kicker"))
+    _stack_lines(ops, pen_title, title_lines, LEFT, title_y, TEXT_W, S_INK,
+                 uid="ann:title")
+    _stack_lines(ops, pen_sub, sub_lines, LEFT, sub_y, TEXT_W, S_MUTED,
+                 uid="ann:sub")
+    ops.append(_line_op(CARD_X0, rule_y, CARD_X1, rule_y, S_BORDER, 1.0,
+                        uid="ann:rule"))
+
+    # --- список нововведений ---
+    row_y = features_top
+    for index, row in enumerate(feature_rows):
+        ops.append(_rect_op((LEFT, row_y, LEFT + ICON_BOX,
+                             row_y + ICON_BOX), 16, S_PURPLE_L,
+                            uid=f"ann:f{index}:bg"))
+        ops += _icon_ops(row["icon"], LEFT + 11, row_y + 11, 30, S_PURPLE,
+                         uid=f"ann:f{index}:icon")
+        text_x = LEFT + ICON_BOX + 24
+        text_w = RIGHT - text_x
+        ops.append(_text_op(pen_item, (text_x, row_y + 4, text_x + text_w,
+                                       row_y + 4 + pen_item.line_h()),
+                            row["title"], S_INK, uid=f"ann:f{index}:title"))
+        _stack_lines(ops, pen_note, row["note_lines"], text_x,
+                     row_y + 4 + pen_item.line_h() - 4, text_w, S_MUTED,
+                     uid=f"ann:f{index}:note")
+        row_y += row["height"]
+
+    # --- призыв: лавандовая плашка во всю ширину карточки ---
+    ops.append(_rect_op((LEFT, call_top, RIGHT, call_bottom), 28, S_PURPLE_L,
+                        S_PURPLE_B, 1.0, kind="card", uid="ann:call"))
+    ops += _icon_ops("megaphone", LEFT + 30, call_title_y + 2, 34, S_PURPLE,
+                     uid="ann:call:icon")
+    ops.append(_text_op(pen_call_title,
+                        (LEFT + 82, call_title_y, RIGHT - 30,
+                         call_title_y + pen_call_title.line_h()),
+                        ANNOUNCE_CALL_TITLE, S_INK, uid="ann:call:title"))
+    _stack_lines(ops, pen_call, call_lines, LEFT + 30, call_body_y,
+                 TEXT_W - 60, S_INK, uid="ann:call:body")
+
+    # --- подвал ---
+    ops.append(_text_op(pen_foot, (LEFT, foot_y, RIGHT,
+                                   foot_y + pen_foot.line_h()),
+                        ANNOUNCE_FOOTER, S_MUTED, uid="ann:foot1"))
+    handle = f"@{username.lstrip('@')}" if username else BOT_NAME
+    ops.append(_text_op(pen_foot,
+                        (LEFT, foot_y + pen_foot.line_h() + 10, RIGHT,
+                         foot_y + pen_foot.line_h() * 2 + 10),
+                        handle, S_PURPLE, uid="ann:foot2"))
+
+    draw_ops(canvas, ops)
+    image = canvas.finish()
+
+    target = IMAGE_DIR / "announcement_global_v1.png"
+    image.save(target, "PNG", optimize=True, compress_level=9)
+    logger.info("Карточка анонса сохранена: %s (%sx%s)", target, W, H)
+    return target
+
+
+async def send_announcement_card(bot: Bot, chat_id: int,
+                                 username: str = "") -> bool:
+    """Отправить карточку анонса в конкретный чат (ручной тест)."""
+    try:
+        path = render_announcement_image(username)
+        await bot.send_photo(chat_id, FSInputFile(str(path)),
+                             caption=announce_caption(username))
+        return True
+    except Exception as error:
+        logger.warning("Карточка анонса не отправлена %s: %s", chat_id, error)
+        return False
+
+
+# ------------------------------------------------------------
+# АВТОРАССЫЛКА АНОНСА: только существующие подписчики, ровно один раз
+# ------------------------------------------------------------
+#
+# Правила, которые обеспечивает этот блок:
+#
+#   * снимок получателей берётся ОДИН раз — в момент первого запуска
+#     (ANNOUNCE_SNAPSHOT_AT в bot_meta). Снимок наполняется штатной
+#     функцией broadcast_recipients(): все, кто уже есть в user_settings /
+#     subscribers. Кто зарегистрировался после снимка — в выборку не
+#     попадает и анонса не получит;
+#   * ровно одна отправка на чат — статус 'sent'/'delivering' фиксируется
+#     в announcement_deliveries, PRIMARY KEY(announcement, chat_id) не даёт
+#     записать дубль. Повторный запуск/рестарт/падение не отправляет
+#     второй раз: 'delivering' уже считается «отдано Telegram»;
+#   * включение — только явным флагом ANNOUNCEMENT_BROADCAST=1, иначе
+#     ничего не происходит вообще (ни отправки, ни записи в БД).
+
+ANNOUNCEMENT_KEY = "global_v1"
+ANNOUNCEMENT_SNAPSHOT_META = "announcement_snapshot_at"
+ANNOUNCEMENT_CHUNK = 25          # сколько чатов берём за один проход
+ANNOUNCEMENT_DELAY = 0.05        # пауза между отправками, сек
+
+
+def announcement_enabled() -> bool:
+    return os.getenv("ANNOUNCEMENT_BROADCAST", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def announcement_snapshot_at() -> str:
+    """Момент снимка получателей; '' — снимок ещё не делался."""
+    with db_connect() as conn:
+        return _meta_get(conn, ANNOUNCEMENT_SNAPSHOT_META, "")
+
+
+def freeze_announcement_recipients(stamp: Optional[str] = None) -> int:
+    """Зафиксировать получателей анонса. Возвращает размер снимка.
+
+    Вызывается ровно один раз: повторный вызов видит уже сохранённый
+    снимок и ничего не добавляет — новые подписчики не попадут никогда.
+    """
+    if announcement_snapshot_at():
+        return announcement_snapshot_size()
+    frozen_at = stamp or now_local().strftime("%Y-%m-%d %H:%M:%S")
+    recipients = broadcast_recipients()
+    with db_connect() as conn:
+        for chat_id in recipients:
+            conn.execute(
+                "INSERT OR IGNORE INTO announcement_deliveries"
+                " (announcement, chat_id, status, updated_at)"
+                " VALUES (?, ?, 'queued', ?)",
+                (ANNOUNCEMENT_KEY, int(chat_id), frozen_at),
+            )
+        _meta_set(conn, ANNOUNCEMENT_SNAPSHOT_META, frozen_at)
+        conn.execute(
+            "INSERT OR IGNORE INTO announcement_runs"
+            " (announcement, started_at, recipients) VALUES (?, ?, ?)",
+            (ANNOUNCEMENT_KEY, frozen_at, len(recipients)),
+        )
+    logger.info("Анонс: снимок получателей %s чатов (%s)",
+                len(recipients), frozen_at)
+    return len(recipients)
+
+
+def announcement_snapshot_size() -> int:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM announcement_deliveries WHERE announcement = ?",
+            (ANNOUNCEMENT_KEY,),
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def pending_announcement_recipients(limit: int = ANNOUNCEMENT_CHUNK) -> list[int]:
+    """Кому ещё не отправлено. Берём ТОЛЬКО снимок, не живую базу."""
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT chat_id FROM announcement_deliveries"
+            " WHERE announcement = ? AND status = 'queued'"
+            " ORDER BY chat_id LIMIT ?",
+            (ANNOUNCEMENT_KEY, int(limit)),
+        ).fetchall()
+    return [int(row["chat_id"]) for row in rows]
+
+
+def _mark_announcement(chat_id: int, status: str, reason: str = "") -> None:
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE announcement_deliveries"
+            " SET status = ?, reason = ?, attempts = attempts + 1, updated_at = ?"
+            " WHERE announcement = ? AND chat_id = ?",
+            (status, reason, stamp, ANNOUNCEMENT_KEY, int(chat_id)),
+        )
+
+
+def release_failed_announcements() -> int:
+    """Вернуть в очередь только явные отказы Telegram ('failed').
+
+    'sent' и 'delivering' не трогаются никогда: это и есть гарантия
+    «одна отправка на чат». Возвращает число возвращённых в очередь.
+    """
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    with db_connect() as conn:
+        cursor = conn.execute(
+            "UPDATE announcement_deliveries SET status = 'queued', updated_at = ?"
+            " WHERE announcement = ? AND status = 'failed'",
+            (stamp, ANNOUNCEMENT_KEY),
+        )
+        return int(cursor.rowcount)
+
+
+def announcement_report() -> dict:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS n FROM announcement_deliveries"
+            " WHERE announcement = ? GROUP BY status",
+            (ANNOUNCEMENT_KEY,),
+        ).fetchall()
+    report = {row["status"]: int(row["n"]) for row in rows}
+    report["total"] = sum(report.values())
+    return report
+
+
+async def run_announcement(bot: Bot, username: str = "",
+                           chunk: int = ANNOUNCEMENT_CHUNK) -> dict:
+    """Дослать анонс тем, кому ещё не отправлено. Идемпотентно.
+
+    Повторный вызов безопасен и НЕ создаёт дублей: статус ставится в
+    'delivering' ПЕРЕД запросом к Telegram, поэтому даже если процесс упадёт
+    между вызовом и ответом API, второй раз сообщение не уйдёт.
+
+    Осознанный компромисс: чат, у которого попытка уже была ('delivering'
+    или 'failed'), автоматически не переотправляется — «ровно один раз»
+    важнее, чем догнать единичный сетевой сбой. Догнать вручную можно
+    скриптом с --retry-failed (только для статусов 'failed', никогда для
+    'sent'/'delivering').
+    """
+    if not announcement_enabled():
+        return {"skipped": "disabled", **announcement_report()}
+    freeze_announcement_recipients()
+    handle = username or touch_announcement(bot) or _announcement_username()
+    path = render_announcement_image(handle)
+    caption = announce_caption(handle)
+    sent = 0
+    failed = 0
+    for chat_id in pending_announcement_recipients(chunk):
+        _mark_announcement(chat_id, "delivering")
+        try:
+            await bot.send_photo(chat_id, FSInputFile(str(path)),
+                                 caption=caption)
+            _mark_announcement(chat_id, "sent")
+            sent += 1
+        except Exception as error:                  # noqa: BLE001
+            failed += 1
+            _mark_announcement(chat_id, "failed", str(error)[:200])
+            logger.warning("Анонс не доставлен %s: %s", chat_id, error)
+        await asyncio.sleep(ANNOUNCEMENT_DELAY)
+    _finish_announcement_run()
+    report = announcement_report()
+    logger.info("Анонс: отправлено %s, ошибок %s, всего %s",
+                sent, failed, report["total"])
+    return {"delivered": sent, "errors": failed, **report}
+
+
+def _finish_announcement_run() -> None:
+    report = announcement_report()
+    stamp = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    done = report.get("queued", 0) == 0
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE announcement_runs SET finished_at = ?, delivered = ?,"
+            " failed = ? WHERE announcement = ?",
+            (stamp if done else "", report.get("sent", 0),
+             report.get("failed", 0), ANNOUNCEMENT_KEY),
+        )
+
+
+def touch_announcement(bot: Bot) -> str:
+    """Username бота для подписи.
+
+    Читаем только уже известное значение: сетевой getMe здесь не нужен,
+    поэтому отправка не зависит от доступности Telegram на момент рендера.
+    """
+    username = (os.getenv("BOT_USERNAME", "").strip()
+                or str(getattr(bot, "username", "") or "").strip())
+    if not username and BOT_USERNAME_ALIASES:
+        username = next(iter(BOT_USERNAME_ALIASES))
+    return username
+
+
+async def _announcement_task(bot: Bot) -> None:
+    """Фоновая досылка: идёт, пока есть 'queued', потом выключается сама."""
+    while True:
+        if not announcement_enabled():
+            return
+        report = announcement_report()
+        if not report.get("queued"):
+            return
+        await run_announcement(bot, touch_announcement(bot))
+        await asyncio.sleep(1.0)
+
+
+def start_announcement_task(bot: Bot):
+    """Запустить одноразовую доставку при старте. Повторный старт — no-op."""
+    if not announcement_enabled():
+        return None
+    task = getattr(start_announcement_task, "_task", None)
+    if task is not None and not task.done():
+        return task
+    task = asyncio.create_task(_announcement_task(bot))
+    start_announcement_task._task = task
+    return task
+
+
+# ============================================================
 # КЛАВИАТУРА
 # ============================================================
 
@@ -10215,14 +10684,26 @@ async def main() -> None:
                 "Первичный парсинг всех групп продолжается в фоне; запускаем polling."
             )
 
+    # Разовая доставка анонса существующим подписчикам. Включается только
+    # ANNOUNCEMENT_BROADCAST=1; получатели фиксируются снимком на этом шаге,
+    # поэтому пользователи, пришедшие позже, анонса не получат никогда.
+    announcement_task = start_announcement_task(bot)
+
     try:
         await dp.start_polling(bot)
     finally:
         monitor_task.cancel()
+        if announcement_task is not None:
+            announcement_task.cancel()
         try:
             await monitor_task
         except asyncio.CancelledError:
             pass
+        if announcement_task is not None:
+            try:
+                await announcement_task
+            except asyncio.CancelledError:
+                pass
         await bot.session.close()
 
 
