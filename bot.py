@@ -7597,17 +7597,11 @@ def _photo_caption(schedule: Schedule) -> str:
 
 
 async def _send_photo(destination, schedule: Schedule, reply_markup=None) -> bool:
-    """PNG расписания из кэша — с умным очищением чата.
-
-    Прошлый ответ бота того же типа (предыдущее расписание, топ, график)
-    РЕДАКТИРУЕТСЯ: у пользователя один актуальный экран, а не лента
-    картинок. Если предыдущий ответ был текстом, он удаляется.
-    """
+    """PNG расписания из кэша."""
     try:
         path = await get_cached_image(schedule)
         caption = _photo_caption(schedule)
-        ok = await deliver(destination, photo=path, caption=caption,
-                           reply_markup=reply_markup, edit=_deliver_edits(destination))
+        ok = await _send_photo_file(destination, path, caption, reply_markup)
         chat_id = _destination_chat_id(destination)
         if ok and chat_id is not None and schedule.lessons:
             record_schedule_notification(
@@ -7622,10 +7616,21 @@ async def _send_photo(destination, schedule: Schedule, reply_markup=None) -> boo
         return False
 
 
-async def _send_text(destination, text: str) -> bool:
-    """Текстовый экран с очищением чата (см. deliver)."""
+def _answer_target(destination):
+    """Куда отправлять ответ: Message — сам, CallbackQuery — его сообщение."""
+    if isinstance(destination, Message):
+        return destination
+    message = getattr(destination, "message", None)
+    if message is not None:
+        return message
+    return destination
+
+
+async def _send_text(destination, text: str, reply_markup=None) -> bool:
+    """Текстовый ответ (см. deliver): кнопки правят экран, команда — новое сообщение."""
     try:
-        return await deliver(destination, text=text, edit=_deliver_edits(destination))
+        return await deliver(destination, text=text, reply_markup=reply_markup,
+                             edit=_deliver_edits(destination))
     except Exception:
         logger.exception("Ошибка отправки текста")
         return False
@@ -7658,30 +7663,6 @@ async def _prompt_group_selection(
     text = f"<b>{html.escape(prefix)}</b>\n\n<b>Шаг 1 из 3 · Выберите курс:</b>"
     await deliver(destination, text=text, reply_markup=group_course_keyboard(),
                   edit=_deliver_edits(destination))
-
-
-async def _edit_or_answer(
-    callback: CallbackQuery,
-    text: str,
-    reply_markup: InlineKeyboardMarkup,
-) -> None:
-    """Экран выбора группы: шаг меняет тот же экран, а не плодит новые.
-
-    Правка идёт «мимо» deliver, поэтому сообщение нужно запомнить: иначе
-    следующий ответ бота не узнает о нём и оставит висеть в чате.
-    """
-    msg = callback.message
-    if getattr(msg, "text", None) and hasattr(msg, "edit_text"):
-        try:
-            await msg.edit_text(text, reply_markup=reply_markup)
-        except Exception:
-            logger.debug("Не удалось переключить шаг выбора группы",
-                         exc_info=True)
-        else:
-            remember_bot_message(_destination_chat_id(callback),
-                                 getattr(msg, "message_id", None), "text")
-            return
-    await _edit_or_send_text(callback, text, reply_markup)
 
 
 async def _schedule_for_destination(destination, day: date, group_id: int) -> Schedule:
@@ -7828,11 +7809,7 @@ async def _send_staff_schedule(
     member: StaffMember,
     target_day: date,
 ) -> bool:
-    """Получает и отправляет staff-расписание с навигацией.
-
-    Нужна ли правка прошлого экрана, решает deliver(): при навигации
-    кнопками экран остаётся на месте, при новой команде — обновляется.
-    """
+    """Получает и отправляет staff-расписание с навигацией."""
     try:
         schedule = await get_staff_schedule_cached(member.staff_id, target_day)
         keyboard = staff_keyboard(member.staff_id, target_day)
@@ -7843,14 +7820,12 @@ async def _send_staff_schedule(
                 f"{format_date_full(target_day)}\n\n"
                 "Занятий нет или расписание ещё не опубликовано."
             )
-            await _edit_or_send_text(destination, text, keyboard)
+            await _send_text(destination, text, keyboard)
             return True
 
         path = await get_cached_image(schedule)
         try:
             caption = _photo_caption(schedule)
-            # Навигация кнопками правит тот же экран (см. deliver),
-            # новая команда — присылает свежий внизу и убирает старый.
             await _send_photo_file(destination, path, caption, keyboard)
             chat_id = _destination_chat_id(destination)
             if chat_id is not None and schedule.lessons:
@@ -7905,11 +7880,7 @@ def analytics_image_path(kind: str, group_name: str, *,
 
 async def _send_photo_file(destination, path: Path, caption: str,
                            reply_markup=None) -> bool:
-    """Отправить готовый PNG (график, топ) с очищением чата.
-
-    Смена периода графика кнопками — это правка того же сообщения:
-    «график» не размножается на каждый клик.
-    """
+    """Отправить готовый PNG (график, топ) (см. deliver)."""
     try:
         return await deliver(destination, photo=path, caption=caption,
                              reply_markup=reply_markup,
@@ -7946,7 +7917,7 @@ async def _handle_top(destination) -> None:
 
     if path is not None and await _send_photo_file(destination, path, caption):
         return
-    await _edit_or_send_text(destination, caption)
+    await _send_text(destination, caption)
 
 
 async def _handle_load_chart(destination,
@@ -7974,7 +7945,7 @@ async def _handle_load_chart(destination,
                                                    markup):
         return
     # Без картинки остаётся текст, но выбор периода должен быть доступен.
-    await _edit_or_send_text(destination, caption, markup)
+    await _send_text(destination, caption, markup)
 
 
 async def _handle_staff_request(destination, request: ScheduleTextRequest) -> None:
@@ -7999,7 +7970,7 @@ async def _handle_staff_request(destination, request: ScheduleTextRequest) -> No
         return
     target_day = request.date or get_tomorrow()
     if len(matches) > 1:
-        await _edit_or_send_text(
+        await _send_text(
             destination,
             "👨‍🏫 <b>Выберите преподавателя:</b>",
             staff_choice_keyboard(matches, target_day),
@@ -8105,72 +8076,48 @@ async def _send_status(destination) -> None:
 
 
 # ============================================================
-# УМНОЕ ОЧИЩЕНИЕ ЧАТА
+# РЕДАКТИРОВАНИЕ ЭКРАНОВ (без удаления сообщений)
 # ============================================================
-# Правила (осознанно разные для разных сообщений):
+# Бот НЕ удаляет никакие сообщения: ни команды пользователя, ни свои
+# прошлые ответы. История чата остаётся как есть.
 #
-#   * ПРЕДЫДУЩИЙ ОТВЕТ БОТА того же типа (текст → текст, картинка →
-#     картинка) НЕ УДАЛЯЕТСЯ, а РЕДАКТИРУЕТСЯ. Пользователь видит один
-#     актуальный экран: расписание сменяется расписанием, график — графиком
-#     при смене периода, меню — меню. Чат не «прыгает», история не растёт.
+# Единственное, что бот делает — ПРАВИТ свой прошлый экран при листании
+# кнопками (callback): если тип ответа совпал (текст → текст,
+# картинка → картинка), сообщение редактируется на месте
+# (editMessageText / editMessageMedia), а не отправляется новое.
+# Новая команда (Message) всегда получает НОВОЕ сообщение внизу —
+# старый экран при этом не трогается.
 #
-#   * Если тип ответа меняется (меню-текст → картинка расписания или
-#     наоборот), редактирование невозможно в принципе, поэтому старое
-#     сообщение бота УДАЛЯЕТСЯ, а новое отправляется.
-#
-#   * КОМАНДА ПОЛЬЗОВАТЕЛЯ (`/today`, «топ», «график за год», нажатая
-#     кнопка) удаляется ПОСЛЕ успешной доставки ответа: в чате остаётся
-#     ровно один ответ бота и ничего лишнего. Если ответ не ушёл —
-#     команда остаётся, чтобы её можно было повторить.
-#
-#   * Ничего не трогаем, если бот не может этого сделать: в группах
-#     удаление требует прав администратора, редактирование — нет.
-#     Любая ошибка Telegram (нет прав, сообщение старше 48 часов, уже
-#     удалено) только пишется в debug-лог и не ломает сценарий.
-#
-#   * Служебные ветки (модерация рассылки, оплата) не очищаются: там
-#     удаление сообщений ломает пошаговый сценарий.
+# Для правки бот помнит id своих последних ответов на чат
+# (не больше CHAT_HISTORY_LIMIT, не дольше CHAT_HISTORY_TTL).
+# Любая ошибка Telegram (нет прав, «message is not modified» и т.д.)
+# только пишется в debug-лог и не ломает сценарий.
 
-CHAT_CLEANUP = os.getenv("CHAT_CLEANUP", "1").strip().lower() not in (
-    "0", "false", "no", "off"
-)
-# Сколько помним id сообщений чата и как долго (Telegram всё равно не даёт
-# удалять сообщения старше 48 часов).
 CHAT_HISTORY_LIMIT = 8
 CHAT_HISTORY_TTL = int(os.getenv("CHAT_HISTORY_TTL", str(6 * 3600)))
 
-# chat_id -> {"commands": [(message_id, ts)], "bot": [(message_id, kind, ts)]}
+# chat_id -> [(message_id, kind, ts)]
 _CHAT_SESSIONS: dict = {}
 
 
-def _cleanup_enabled() -> bool:
-    return bool(CHAT_CLEANUP)
-
-
-def _chat_session(chat_id: Optional[int]) -> Optional[dict]:
-    """Состояние чата: последние команды и последние ответы бота."""
-    if chat_id is None or not _cleanup_enabled():
+def _chat_session(chat_id: Optional[int]) -> Optional[list]:
+    """История ответов бота в чате: [(message_id, kind, ts)]."""
+    if chat_id is None:
         return None
     now = time.time()
-    session = _CHAT_SESSIONS.get(chat_id)
-    if session is None:
-        session = {"commands": [], "bot": []}
-        _CHAT_SESSIONS[chat_id] = session
-    session["commands"] = [
-        (message_id, stamp) for message_id, stamp in session["commands"]
+    history = _CHAT_SESSIONS.get(chat_id)
+    if history is None:
+        history = []
+        _CHAT_SESSIONS[chat_id] = history
+    history[:] = [
+        (message_id, kind, stamp) for message_id, kind, stamp in history
         if now - stamp <= CHAT_HISTORY_TTL
     ][-CHAT_HISTORY_LIMIT:]
-    session["bot"] = [
-        (message_id, kind, stamp) for message_id, kind, stamp in session["bot"]
-        if now - stamp <= CHAT_HISTORY_TTL
-    ][-CHAT_HISTORY_LIMIT:]
-    return session
+    return history
 
 
-def _cleanup_bot(destination):
-    """Bot для удаления/редактирования. None — значит, трогать нельзя."""
-    if not _cleanup_enabled():
-        return None
+def _edit_bot(destination):
+    """Bot для редактирования. None — значит, править нельзя."""
     bot = getattr(destination, "bot", None)
     if bot is None:
         bot = getattr(getattr(destination, "message", None), "bot", None)
@@ -8191,44 +8138,13 @@ def _looks_like_message(event) -> bool:
     )
 
 
-def remember_user_command(destination, message: Optional[Message] = None) -> None:
-    """Запомнить команду пользователя, чтобы удалить её после ответа."""
-    message = message if message is not None else destination
-    if not _looks_like_message(message):
-        return
-    if getattr(message, "from_user", None) is None:
-        return
-    # Сообщения самого бота и пересланное чужое не трогаем.
-    if getattr(message.from_user, "is_bot", False):
-        return
-    chat_id = getattr(getattr(message, "chat", None), "id", None)
-    message_id = getattr(message, "message_id", None)
-    session = _chat_session(chat_id)
-    if session is None or message_id is None:
-        return
-    session["commands"].append((int(message_id), time.time()))
-
-
 def remember_bot_message(chat_id: Optional[int], message_id: Optional[int],
                          kind: str = "text") -> None:
-    """Запомнить ответ бота: следующий ответ отредактирует или удалит его."""
-    session = _chat_session(chat_id)
-    if session is None or message_id is None:
+    """Запомнить ответ бота: следующий ответ кнопками отредактирует его."""
+    history = _chat_session(chat_id)
+    if history is None or message_id is None:
         return
-    session["bot"].append((int(message_id), kind, time.time()))
-
-
-async def _delete_message(bot, chat_id: Optional[int],
-                          message_id: Optional[int]) -> bool:
-    if bot is None or chat_id is None or message_id is None:
-        return False
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=int(message_id))
-        return True
-    except Exception as error:      # нет прав / старше 48 ч / уже удалено
-        logger.debug("Не удалось удалить сообщение %s в %s: %s",
-                     message_id, chat_id, error)
-        return False
+    history.append((int(message_id), kind, time.time()))
 
 
 async def _edit_message(bot, chat_id: Optional[int], message_id: Optional[int],
@@ -8274,10 +8190,7 @@ async def _send_answer(destination, *, text: Optional[str],
     """Новая отправка. Возвращает (message_id, kind, отправлено ли)."""
     kind = "photo" if photo is not None else "text"
     try:
-        if _is_message_destination(destination):
-            target = destination
-        else:
-            target = destination.message
+        target = _answer_target(destination)
         if photo is not None:
             sent = await target.answer_photo(
                 FSInputFile(photo), caption=caption or "",
@@ -8295,25 +8208,23 @@ async def _send_answer(destination, *, text: Optional[str],
 
 async def deliver(destination, *, text: Optional[str] = None,
                   photo: Optional[Path] = None, caption: str = "",
-                  reply_markup=None, edit: bool = False,
-                  cleanup_command: bool = True) -> bool:
-    """Единая точка отправки ответа с умным очищением чата.
+                  reply_markup=None, edit: bool = False) -> bool:
+    """Единая точка отправки ответа.
 
     ``text`` — текстовый экран, ``photo``+``caption`` — картинка.
     При ``edit=True`` (только для callback-ов, см. ``_deliver_edits``)
-    прошлый ответ бота правится на месте, если совпал тип; иначе он
-    удаляется и отправляется новое сообщение. Команда пользователя,
-    вызвавшая ответ, удаляется после успешной доставки (если бот имеет на
-    это право).
+    прошлый ответ бота правится на месте, если совпал тип; иначе
+    отправляется новое сообщение. НИЧЕГО НЕ УДАЛЯЕТСЯ: ни прошлый
+    экран, ни команда пользователя.
     """
     chat_id = _destination_chat_id(destination)
-    bot = _cleanup_bot(destination)
-    session = _chat_session(chat_id)
+    bot = _edit_bot(destination)
+    history = _chat_session(chat_id)
     kind = "photo" if photo is not None else "text"
 
     previous = None
-    if session and session["bot"]:
-        message_id, previous_kind, _stamp = session["bot"][-1]
+    if history:
+        message_id, previous_kind, _stamp = history[-1]
         previous = (message_id, previous_kind)
 
     delivered = False
@@ -8324,7 +8235,7 @@ async def deliver(destination, *, text: Optional[str] = None,
         )
         if delivered:
             # Экран остался тем же сообщением — просто продлеваем его жизнь.
-            session["bot"][-1] = (previous[0], kind, time.time())
+            history[-1] = (previous[0], kind, time.time())
 
     if not delivered:
         message_id, kind, delivered = await _send_answer(
@@ -8333,24 +8244,8 @@ async def deliver(destination, *, text: Optional[str] = None,
         )
         if not delivered:
             return False
-        # Старый экран другого типа (или тот, который не удалось
-        # отредактировать) больше не нужен.
-        if previous is not None:
-            await _delete_message(bot, chat_id, previous[0])
-            if session:
-                session["bot"] = [entry for entry in session["bot"]
-                                  if entry[0] != previous[0]]
+        # Прошлый экран НЕ удаляем — он остаётся в истории чата.
         remember_bot_message(chat_id, message_id, kind)
-
-    if cleanup_command and session and session["commands"]:
-        # Удаляем только последнюю команду — ту, на которую сейчас ответили.
-        # Более старые записи остались от сообщений, которые мы НЕ отвечали
-        # (например, пользователь просто поздоровался), и удалять их нельзя.
-        message_id, stamp = session["commands"][-1]
-        # Не вышло (нет прав, старше 48 ч) — всё равно забываем: повторно
-        # это сообщение уже не удалить, а память не должна копиться.
-        await _delete_message(bot, chat_id, message_id)
-        session["commands"] = session["commands"][:-1]
     return True
 
 
@@ -8358,9 +8253,8 @@ def _deliver_edits(destination) -> bool:
     """Можно ли ПРАВИТЬ прошлый ответ вместо нового сообщения.
 
     Да — когда пользователь листает кнопками (callback): экран остаётся на
-    месте, чат не «прыгает», история не растёт. Нет — когда пришла новая
-    команда: ответ должен появиться внизу и быть замеченным, поэтому
-    старый экран удаляется, а новый отправляется.
+    месте, чат не «прыгает». Нет — когда пришла новая команда: ответ
+    появляется внизу как новое сообщение.
     """
     if isinstance(destination, CallbackQuery):
         return True
@@ -8373,13 +8267,33 @@ def _deliver_edits(destination) -> bool:
 
 
 async def _edit_or_send_text(destination, text: str, reply_markup=None) -> bool:
-    """Текст с очищением чата — короткая обёртка над deliver().
-
-    Экран листается кнопками — правим на месте; пришла новая команда —
-    прошлый экран удаляется, а ответ появляется внизу.
-    """
+    """Текст: кнопки — правка на месте, новая команда — новое сообщение."""
     return await deliver(destination, text=text, reply_markup=reply_markup,
                          edit=_deliver_edits(destination))
+
+
+async def _edit_or_answer(
+    callback: CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    """Экран выбора группы: шаг меняет тот же экран, а не плодит новые.
+
+    Правка идёт «мимо» deliver, поэтому сообщение нужно запомнить: иначе
+    следующий ответ бота не узнает о нём и оставит висеть в чате.
+    """
+    msg = callback.message
+    if getattr(msg, "text", None) and hasattr(msg, "edit_text"):
+        try:
+            await msg.edit_text(text, reply_markup=reply_markup)
+        except Exception:
+            logger.debug("Не удалось переключить шаг выбора группы",
+                         exc_info=True)
+        else:
+            remember_bot_message(_destination_chat_id(callback),
+                                 getattr(msg, "message_id", None), "text")
+            return
+    await _edit_or_send_text(callback, text, reply_markup)
 
 
 # ============================================================
@@ -8430,35 +8344,6 @@ class AntiSpamMiddleware(BaseMiddleware):
             return None
         return await handler(event, data)
 
-
-class ChatCleanupMiddleware(BaseMiddleware):
-    """Помнит команду пользователя, чтобы убрать её после ответа бота.
-
-    Сообщения, которые отправлены ботом, пересланные чужие сообщения и
-    служебные сценарии (модерация рассылки, оплата, ввод даты, поиск
-    преподавателя) не удаляются: там сообщение — часть диалога.
-    """
-
-    SERVICE_PENDING = ("broadcast_compose", "date", "teacher_search")
-
-    async def __call__(self, handler, event, data):
-        if _cleanup_enabled() and _looks_like_message(event):
-            chat = getattr(event, "chat", None)
-            actor = getattr(event, "from_user", None)
-            if (chat is not None and actor is not None
-                    and not getattr(actor, "is_bot", False)):
-                pending = ""
-                try:
-                    pending = get_user_settings(chat.id).get("pending_action", "")
-                except Exception:
-                    logger.exception("Не удалось прочитать состояние чата")
-                if pending not in self.SERVICE_PENDING:
-                    remember_user_command(event)
-        return await handler(event, data)
-
-
-_cleanup_middleware = ChatCleanupMiddleware()
-dp.message.outer_middleware(_cleanup_middleware)
 
 _spam_middleware = AntiSpamMiddleware()
 dp.message.outer_middleware(_spam_middleware)
@@ -8513,9 +8398,9 @@ async def cmd_start(message: Message):
             if selected_group_id is None
             else ""
         )
-        await deliver(
+        await _send_text(
             message,
-            text=(
+            (
                 f"{premium_title(BOT_NAME)}\n\n"
                 f"{hint}"
                 "Основные действия доступны кнопками главного меню.\n"
@@ -8527,28 +8412,28 @@ async def cmd_start(message: Message):
                 "Без слэша: «расписание на завтра», «топ», "
                 "«график за 3 месяца»."
             ),
-            reply_markup=main_keyboard(
+            main_keyboard(
                 _is_subscribed(chat_id), has_group=selected_group_id is not None
             ),
         )
         return
 
     if selected_group_id is None:
-        await deliver(
+        await _send_text(
             message,
-            text=(
+            (
                 f"{premium_title(BOT_NAME)}\n\n"
                 "Добро пожаловать! Для начала выберите вашу группу.\n\n"
                 "<b>Шаг 1 из 3 · Выберите курс:</b>"
             ),
-            reply_markup=group_course_keyboard(include_menu=False),
+            group_course_keyboard(include_menu=False),
         )
         return
 
     group = get_group(selected_group_id)
-    await deliver(
+    await _send_text(
         message,
-        text=(
+        (
             f"{premium_title(BOT_NAME)}\n\n"
             f"Группа: <b>{html.escape(group.name)}</b>\n"
             f"{group.form} · {group.study} · {group.course} курс\n\n"
@@ -8556,7 +8441,7 @@ async def cmd_start(message: Message):
             "По дате: <code>/date 10.11.2026</code>\n"
             "Текстом: «расписание на завтра»."
         ),
-        reply_markup=main_keyboard(_is_subscribed(chat_id), has_group=True),
+        main_keyboard(_is_subscribed(chat_id), has_group=True),
     )
 
 
@@ -8564,10 +8449,10 @@ async def cmd_start(message: Message):
 async def cmd_groups(message: Message):
     save_user_profile(message.from_user, message.chat.id)
     has_group = get_user_settings(message.chat.id).get("group_id") is not None
-    await deliver(
+    await _send_text(
         message,
-        text="<b>Выбор группы</b>\nШаг 1 из 3 · Выберите курс:",
-        reply_markup=group_course_keyboard(include_menu=has_group),
+        "<b>Выбор группы</b>\nШаг 1 из 3 · Выберите курс:",
+        group_course_keyboard(include_menu=has_group),
     )
 
 
@@ -8575,8 +8460,7 @@ async def cmd_groups(message: Message):
 async def cmd_teacher(message: Message):
     save_user_profile(message.from_user, message.chat.id)
     set_pending_action(message.chat.id, "teacher_search")
-    await deliver(message,
-                  text="<b>Преподаватель</b>\nОтправьте фамилию или ФИО.")
+    await _send_text(message, "<b>Преподаватель</b>\nОтправьте фамилию или ФИО.")
 
 
 @dp.message(BotCommandFilter("today"))
@@ -8647,9 +8531,9 @@ async def cmd_subscribe(message: Message):
     selected_group = get_group(selected_group_id)
     if subscribe_user(chat.id, chat_type=chat.type, title=title, group_id=selected_group.id):
         where = "Этот чат" if is_group else "Вы"
-        await deliver(
+        await _send_text(
             message,
-            text=(
+            (
                 f"<b>Уведомления включены</b>\n\n"
                 f"{where} будет получать обновлённое расписание "
                 f"при его изменении.\n\n"
@@ -8657,7 +8541,7 @@ async def cmd_subscribe(message: Message):
             ),
         )
     else:
-        await deliver(message, text="Уведомления уже включены.")
+        await _send_text(message, "Уведомления уже включены.")
 
 
 @dp.message(BotCommandFilter("unsubscribe"))
@@ -8672,12 +8556,12 @@ async def cmd_unsubscribe(message: Message):
         return
 
     if unsubscribe_user(chat.id):
-        await deliver(message, text="<b>Уведомления отключены</b>")
+        await _send_text(message, "<b>Уведомления отключены</b>")
     else:
-        await deliver(
+        await _send_text(
             message,
-            text=("Этот чат не был подписан на уведомления."
-                  if is_group else "Вы не были подписаны на уведомления."),
+            ("Этот чат не был подписан на уведомления."
+             if is_group else "Вы не были подписаны на уведомления."),
         )
 
 
@@ -9079,8 +8963,7 @@ async def _send_group_info(destination, group: GroupInfo) -> None:
          InlineKeyboardButton(text="Сменить группу", callback_data="groups")],
         [InlineKeyboardButton(text="Главное меню", callback_data="menu")],
     ])
-    await deliver(destination, photo=path, caption=caption,
-                  reply_markup=keyboard, edit=_deliver_edits(destination))
+    await _send_photo_file(destination, path, caption, keyboard)
 
 
 @dp.callback_query(F.data == "groups:noop")
@@ -9092,7 +8975,7 @@ async def cb_groups_noop(callback: CallbackQuery):
 async def cb_groups(callback: CallbackQuery):
     await callback.answer()
     has_group = _selected_group_id(callback) is not None
-    await _edit_or_send_text(
+    await _send_text(
         callback,
         "<b>Выбор группы</b>\nШаг 1 из 3 · Выберите курс:",
         group_course_keyboard(include_menu=has_group),
@@ -9218,7 +9101,7 @@ async def cb_menu(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     group_id = _selected_group_id(callback)
     if group_id is None:
-        await _edit_or_send_text(
+        await _send_text(
             callback,
             f"{premium_title(BOT_NAME)}\nГруппа: <i>не выбрана</i>\n\n"
             "Для просмотра расписания выберите группу или найдите преподавателя.",
@@ -9226,7 +9109,7 @@ async def cb_menu(callback: CallbackQuery):
         )
         return
     group = get_group(group_id)
-    await _edit_or_send_text(
+    await _send_text(
         callback,
         f"{premium_title(BOT_NAME)}\nГруппа: <b>{html.escape(group.name)}</b>",
         main_keyboard(_is_subscribed(chat_id), has_group=True),
@@ -9242,7 +9125,7 @@ async def cb_notifications(callback: CallbackQuery):
         member = STAFF_BY_ID.get(staff_id)
         text = f"<b>Уведомления</b>\nПреподаватель: {member.full_name if member else staff_id}"
         await callback.answer()
-        await _edit_or_send_text(callback, text,
+        await _send_text(callback, text,
                                  notification_keyboard(enabled, staff_id))
         return
 
@@ -9258,7 +9141,7 @@ async def cb_notifications(callback: CallbackQuery):
     enabled = _is_subscribed(callback.message.chat.id)
     text = f"<b>Уведомления</b>\nГруппа: {get_group(group_id).name}\nНовое и изменённое расписание."
     await callback.answer()
-    await _edit_or_send_text(callback, text,
+    await _send_text(callback, text,
                              notification_keyboard(enabled, None))
 
 
@@ -9267,7 +9150,7 @@ async def cb_teacher(callback: CallbackQuery):
     save_user_profile(callback.from_user, callback.message.chat.id)
     set_pending_action(callback.message.chat.id, "teacher_search")
     await callback.answer()
-    await _edit_or_send_text(
+    await _send_text(
         callback, "<b>Расписание преподавателя</b>\nОтправьте фамилию или ФИО."
     )
 
@@ -9284,7 +9167,7 @@ async def cb_teacher_notify(callback: CallbackQuery):
     set_user_staff(callback.message.chat.id, staff_id)
     subscribe_teacher(callback.message.chat.id, staff_id, enabled)
     await callback.answer("Уведомления включены" if enabled else "Уведомления отключены")
-    await _edit_or_send_text(
+    await _send_text(
         callback,
         f"<b>{member.full_name}</b>\n" +
         ("Новое и изменённое расписание будет приходить в этот чат." if enabled
@@ -9369,12 +9252,12 @@ async def cb_subscribe(callback: CallbackQuery):
     if subscribe_user(
         chat.id, chat_type=chat.type, title=chat.title or "", group_id=group_id
     ):
-        await _edit_or_send_text(
+        await _send_text(
             callback,
             f"<b>Уведомления включены</b>\nГруппа: {get_group(group_id).name}",
         )
     else:
-        await _edit_or_send_text(
+        await _send_text(
             callback,
             f"Уведомления уже включены\nГруппа: {get_group(group_id).name}",
         )
@@ -9387,9 +9270,9 @@ async def cb_unsubscribe(callback: CallbackQuery):
         return
     await callback.answer()
     if unsubscribe_user(callback.message.chat.id):
-        await _edit_or_send_text(callback, "<b>Уведомления отключены</b>")
+        await _send_text(callback, "<b>Уведомления отключены</b>")
     else:
-        await _edit_or_send_text(callback, "Этот чат не был подписан.")
+        await _send_text(callback, "Этот чат не был подписан.")
 
 
 @dp.callback_query(F.data == "status")
@@ -9427,7 +9310,7 @@ async def cb_date(callback: CallbackQuery):
         return
     set_pending_action(callback.message.chat.id, "date")
     await callback.answer()
-    await _edit_or_send_text(
+    await _send_text(
         callback,
         "<b>Расписание по дате</b>\nОтправьте дату: 10.11.2026, "
         "4 сентября или «завтра».",
@@ -9437,7 +9320,7 @@ async def cb_date(callback: CallbackQuery):
 @dp.callback_query(F.data == "help")
 async def cb_help(callback: CallbackQuery):
     await callback.answer()
-    await _edit_or_send_text(
+    await _send_text(
         callback,
         "<b>Помощь</b>\n\n"
         "Основные действия доступны кнопками главного меню.\n"
