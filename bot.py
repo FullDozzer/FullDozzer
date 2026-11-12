@@ -7330,6 +7330,228 @@ def workload_period_keyboard(period: str = DEFAULT_LOAD_PERIOD) -> InlineKeyboar
 
 
 # ============================================================
+# КАРТОЧКА АНОНСА: «бот теперь для всего колледжа»
+# ============================================================
+#
+# Текст анонса живёт в одном месте: рендер карточки и подпись к ней
+# берут данные отсюда, поэтому картинка и сообщение не расходятся.
+
+ANNOUNCE_KICKER = "ОБНОВЛЕНИЕ"
+ANNOUNCE_TITLE = "Теперь для всего колледжа"
+ANNOUNCE_SUBTITLE = (
+    "Бот расписаний переходит от локального решения для одной группы "
+    "к глобальной версии для всех групп колледжа."
+)
+
+# (иконка Lucide, заголовок, пояснение). Пункты с пояснением занимают две
+# строки, без — одну. Иконки только из assets/icons (вендоренный Lucide).
+ANNOUNCE_FEATURES = (
+    ("book-open", "Все группы колледжа", "73 группы: любая специальность и курс"),
+    ("id-card", "Информационные карточки групп", "форма, бюджет, база, семестры"),
+    ("trophy", "Топ преподавателей группы", "по изученным часам — /top"),
+    ("chart-column", "График нагрузки", "недели за месяц, 3, 6 и 12 месяцев"),
+    ("zap", "Оптимизация рендеринга", ""),
+    ("sparkles", "QoL-улучшения", ""),
+    ("battery-charging", "Мощности в 4 раза больше", ""),
+    ("bell", "Уведомления преподавателям", "о новом расписании"),
+)
+
+ANNOUNCE_CALL_TITLE = "Нужна ваша помощь"
+ANNOUNCE_CALL_BODY = (
+    "Будем благодарны, если вы распространите информацию о боте среди "
+    "одногруппников, знакомых и преподавателей. Чем больше пользователей — "
+    "тем лучше!"
+)
+
+ANNOUNCE_FOOTER = "Расписание, топ и график нагрузки — для каждой группы"
+
+
+def announce_caption(username: str = "") -> str:
+    """Подпись к карточке анонса (HTML parse mode, как в остальном боте)."""
+    handle = f"@{username.lstrip('@')}" if username else ""
+    lines = [
+        premium_title("Бот расписаний — теперь для всего колледжа"),
+        "",
+        ANNOUNCE_SUBTITLE,
+        "",
+        premium_title("Что нового?"),
+    ]
+    for _icon, title, note in ANNOUNCE_FEATURES:
+        lines.append(f"• <b>{html.escape(title)}</b>"
+                     + (f" — {html.escape(note)}" if note else ""))
+    lines += ["", premium_title(ANNOUNCE_CALL_TITLE), ANNOUNCE_CALL_BODY]
+    if handle:
+        lines += ["", f"Открыть бота: {html.escape(handle)}"]
+    return "\n".join(lines)
+
+
+def _stack_lines(ops: list, pen: Pen, lines: list, x: float, y: float,
+                 width: float, fill: str, *, uid: str) -> float:
+    """Построчно нарисовать уже перенесённые строки; вернуть занятую высоту.
+
+    Многострочность считается заранее через ``Pen.wrap``: ``_text_op``
+    фитит одну строку и мог бы поставить «…» там, где перенос уже есть.
+    """
+    for index, line in enumerate(lines):
+        line_y = y + index * pen.line_h()
+        ops.append(_text_op(pen, (x, line_y, x + width, line_y + pen.line_h()),
+                            line, fill, min_size=pen.size,
+                            uid=f"{uid}{index}"))
+    return pen.line_h() * len(lines)
+
+
+def render_announcement_image(username: str = "") -> Path:
+    """PNG-карточка анонса в палитре и типографике расписания (1080 px).
+
+    Высота — по контенту: пункты с пояснением выше, чем без. Ничего не
+    обрезается: текст переносится заранее и меряется тем же Pen, что и
+    рендер, а холст растёт под фактическое число строк.
+    """
+    W = SCHEDULE_WIDTH
+    M = 52                                  # safe area
+    CARD_X0, CARD_X1 = M, W - M
+    CARD_W = CARD_X1 - CARD_X0
+    INNER = 44                              # отступ внутри карточки
+    LEFT = CARD_X0 + INNER
+    RIGHT = CARD_X1 - INNER
+    TEXT_W = RIGHT - LEFT
+
+    pen_kicker = _pen(24, "bold")
+    pen_title = _pen(56, "bold")
+    pen_sub = _pen(28, "regular")
+    pen_item = _pen(31, "semibold")
+    pen_note = _pen(23, "regular")
+    pen_call_title = _pen(36, "bold")
+    pen_call = _pen(29, "regular")
+    pen_foot = _pen(23, "regular")
+
+    # --- переносы (единственный источник правды о числе строк) ---
+    title_lines = pen_title.wrap(ANNOUNCE_TITLE, TEXT_W)
+    sub_lines = pen_sub.wrap(ANNOUNCE_SUBTITLE, TEXT_W)
+    call_lines = pen_call.wrap(ANNOUNCE_CALL_BODY, TEXT_W - 60)
+    feature_rows = [{
+        "icon": icon,
+        "title": title,
+        "note_lines": pen_note.wrap(note, TEXT_W - 76) if note else [],
+    } for icon, title, note in ANNOUNCE_FEATURES]
+
+    # --- вертикальный поток ---
+    ICON_BOX = 52
+    BADGE = 92
+    TOP = M + INNER
+    y = TOP + BADGE + 26
+    title_y = y
+    y += pen_title.line_h() * len(title_lines) + 12
+    sub_y = y
+    y += pen_sub.line_h() * len(sub_lines) + 26
+    rule_y = y
+    y += 34
+    features_top = y
+    for row in feature_rows:
+        row["height"] = (max(ICON_BOX, pen_item.line_h())
+                         + pen_note.line_h() * len(row["note_lines"]) + 16)
+        y += row["height"]
+    y = y - 16 + 26
+    call_top = y
+    call_title_y = call_top + 28
+    call_body_y = call_title_y + pen_call_title.line_h() + 10
+    call_bottom = (call_body_y + pen_call.line_h() * len(call_lines) + 30)
+    y = call_bottom + 26
+    foot_y = y
+    y += pen_foot.line_h() * 2 + 10 + INNER + M
+    H = int(round(y))
+
+    canvas = SupersampleCanvas(W, H, S_BG)
+    ops: list = list(_decor_ops(W, H))
+
+    # --- карточка ---
+    ops.append(_shadow_op((CARD_X0, M, CARD_X1, H - M), 44, blur=26, dy=10,
+                          alpha=52))
+    ops.append(_rect_op((CARD_X0, M, CARD_X1, H - M), 44, S_CARD, S_BORDER,
+                        1.0, kind="card", uid="ann:card"))
+
+    # --- шапка: ракета в лавандовой плашке + кикер ---
+    ops.append(_rect_op((LEFT, TOP, LEFT + BADGE, TOP + BADGE), 28,
+                        S_PURPLE_L, S_PURPLE_B, 1.0, kind="icon",
+                        uid="ann:badge"))
+    ops += _icon_ops("rocket", LEFT + (BADGE - 56) / 2,
+                     TOP + (BADGE - 56) / 2, 56, S_PURPLE,
+                     uid="ann:badge:icon")
+    kicker_y = TOP + (BADGE - pen_kicker.line_h()) / 2
+    ops.append(_text_op(pen_kicker, (LEFT + BADGE + 26, kicker_y,
+                                     RIGHT, kicker_y + pen_kicker.line_h()),
+                        f"ИНК · {ANNOUNCE_KICKER}", S_PURPLE, spacing=1.6,
+                        uid="ann:kicker"))
+    _stack_lines(ops, pen_title, title_lines, LEFT, title_y, TEXT_W, S_INK,
+                 uid="ann:title")
+    _stack_lines(ops, pen_sub, sub_lines, LEFT, sub_y, TEXT_W, S_MUTED,
+                 uid="ann:sub")
+    ops.append(_line_op(CARD_X0, rule_y, CARD_X1, rule_y, S_BORDER, 1.0,
+                        uid="ann:rule"))
+
+    # --- список нововведений ---
+    row_y = features_top
+    for index, row in enumerate(feature_rows):
+        ops.append(_rect_op((LEFT, row_y, LEFT + ICON_BOX,
+                             row_y + ICON_BOX), 16, S_PURPLE_L,
+                            uid=f"ann:f{index}:bg"))
+        ops += _icon_ops(row["icon"], LEFT + 11, row_y + 11, 30, S_PURPLE,
+                         uid=f"ann:f{index}:icon")
+        text_x = LEFT + ICON_BOX + 24
+        text_w = RIGHT - text_x
+        ops.append(_text_op(pen_item, (text_x, row_y + 4, text_x + text_w,
+                                       row_y + 4 + pen_item.line_h()),
+                            row["title"], S_INK, uid=f"ann:f{index}:title"))
+        _stack_lines(ops, pen_note, row["note_lines"], text_x,
+                     row_y + 4 + pen_item.line_h() - 4, text_w, S_MUTED,
+                     uid=f"ann:f{index}:note")
+        row_y += row["height"]
+
+    # --- призыв: лавандовая плашка во всю ширину карточки ---
+    ops.append(_rect_op((LEFT, call_top, RIGHT, call_bottom), 28, S_PURPLE_L,
+                        S_PURPLE_B, 1.0, kind="card", uid="ann:call"))
+    ops += _icon_ops("megaphone", LEFT + 30, call_title_y + 2, 34, S_PURPLE,
+                     uid="ann:call:icon")
+    ops.append(_text_op(pen_call_title,
+                        (LEFT + 82, call_title_y, RIGHT - 30,
+                         call_title_y + pen_call_title.line_h()),
+                        ANNOUNCE_CALL_TITLE, S_INK, uid="ann:call:title"))
+    _stack_lines(ops, pen_call, call_lines, LEFT + 30, call_body_y,
+                 TEXT_W - 60, S_INK, uid="ann:call:body")
+
+    # --- подвал ---
+    ops.append(_text_op(pen_foot, (LEFT, foot_y, RIGHT,
+                                   foot_y + pen_foot.line_h()),
+                        ANNOUNCE_FOOTER, S_MUTED, uid="ann:foot1"))
+    handle = f"@{username.lstrip('@')}" if username else BOT_NAME
+    ops.append(_text_op(pen_foot,
+                        (LEFT, foot_y + pen_foot.line_h() + 10, RIGHT,
+                         foot_y + pen_foot.line_h() * 2 + 10),
+                        handle, S_PURPLE, uid="ann:foot2"))
+
+    draw_ops(canvas, ops)
+    image = canvas.finish()
+
+    target = IMAGE_DIR / "announcement_global_v1.png"
+    image.save(target, "PNG", optimize=True, compress_level=9)
+    logger.info("Карточка анонса сохранена: %s (%sx%s)", target, W, H)
+    return target
+
+
+async def send_announcement_card(bot: Bot, chat_id: int,
+                                 username: str = "") -> bool:
+    """Отправить карточку анонса в чат. Пустой username — подпись без ссылки."""
+    try:
+        path = render_announcement_image(username)
+        await bot.send_photo(chat_id, FSInputFile(str(path)),
+                             caption=announce_caption(username))
+        return True
+    except Exception as error:
+        logger.warning("Карточка анонса не отправлена %s: %s", chat_id, error)
+        return False
+
+
+# ============================================================
 # КЛАВИАТУРА
 # ============================================================
 

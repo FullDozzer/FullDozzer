@@ -24,6 +24,20 @@ ICON_FILES = {
     "user": "user",
     "cap": "graduation-cap",
     "graduation-cap": "graduation-cap",
+    # Карточка анонса: те же правила — только вендоренные SVG Lucide.
+    "calendar-days": "calendar-days",
+    "users": "users",
+    "book-open": "book-open",
+    "id-card": "id-card",
+    "trophy": "trophy",
+    "chart-column": "chart-column",
+    "zap": "zap",
+    "sparkles": "sparkles",
+    "sliders-horizontal": "sliders-horizontal",
+    "battery-charging": "battery-charging",
+    "bell": "bell",
+    "megaphone": "megaphone",
+    "rocket": "rocket",
 }
 
 _NUM = re.compile(r"[+-]?(?:\d*\.\d+|\d+)(?:[eE][+-]?\d+)?")
